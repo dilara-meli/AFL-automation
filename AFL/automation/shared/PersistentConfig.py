@@ -5,6 +5,7 @@ import copy
 import warnings
 import threading
 from collections.abc import MutableMapping
+from json import JSONDecodeError
 
 class PersistentConfig(MutableMapping):
     ''' A dictionary-like class that serializes changes to disk
@@ -92,10 +93,26 @@ class PersistentConfig(MutableMapping):
         
         need_update=False
         if self.path.exists():
-            with open(self.path,'r') as f:
-                self.history = json.load(f)
-            key = self._get_sorted_history_keys()[-1] #use latest key
-            self.config = copy.deepcopy(self.history[key])
+            try:
+                with open(self.path,'r') as f:
+                    self.history = json.load(f)
+                key = self._get_sorted_history_keys()[-1] #use latest key
+                self.config = copy.deepcopy(self.history[key])
+            except (JSONDecodeError, ValueError, IndexError, TypeError) as exc:
+                backup_path = self.path.with_suffix(self.path.suffix + f".corrupt.{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}")
+                try:
+                    self.path.replace(backup_path)
+                except OSError:
+                    backup_path = None
+                warnings.warn(
+                    f"PersistentConfig could not read {self.path}: {exc}. "
+                    + (f"Backed up corrupt file to {backup_path}. " if backup_path is not None else "")
+                    + "Reinitializing config from defaults and overrides.",
+                    RuntimeWarning,
+                )
+                self.config = {}
+                self.history = {self._get_datetime_key():{}}
+                need_update=True
         else:
             self.config = {}
             self.history = {self._get_datetime_key():{}}
