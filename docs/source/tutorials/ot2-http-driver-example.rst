@@ -2,9 +2,11 @@
 OT-2 HTTP Driver End-to-End Example
 =====================================
 
-This tutorial walks through a complete OT-2 workflow using the AFL-automation Opentrons driver stack. By the end, you will have connected to a robot, loaded pipettes and labware, prepared a sample from stock solutions, mixed it on a heater-shaker, moved it to a temperature module, and shut the system down cleanly.
+This tutorial walks through a complete OT-2 workflow using the AFL-automation Opentrons driver stack. It is based on the repository notebook for preparing samples with ``OT2Prepare`` and demonstrates how to set up the robot, define stocks and targets, and execute a preparation protocol that includes both shaking and temperature control.
 
-This page is based on the repository example notebook and is meant to be read as a full worked example rather than a task-specific reference.
+By the end, you will have connected to a robot, loaded pipettes and labware, prepared a sample from stock solutions, mixed it on a heater-shaker, moved it to a temperature module, and shut the system down cleanly.
+
+This page is meant to be read as a full worked example rather than a task-specific reference.
 
 What You Will Do
 ----------------
@@ -19,13 +21,26 @@ In this tutorial, you will:
 - shake the sample and move it to a temperature-controlled location
 - deactivate modules and reset the robot at the end
 
+Connection and Robot Requirements
+---------------------------------
+
+This tutorial requires a direct Ethernet connection between the OT-2 and the control computer running the notebook or script. That connection may be provided through USB-B Ethernet or through a LAN connection, but the control computer must be able to reach the OT-2 over the network.
+
+Before you begin, confirm that your robot meets at least these requirements:
+
+- firmware version ``v1.1.0-25e5cea`` or newer
+- supported Protocol API versions from ``v2.0`` through ``v2.28``
+
+You will also need the OT-2 IP address. You can find it in the Opentrons app under the network settings for the robot. Update the ``robot_ip`` field in the driver initialization below with that address. The port should remain ``31950`` unless you have changed it on your system.
+
 Prerequisites
 -------------
 
 Before you begin, make sure you have:
 
 - installed AFL-automation with Opentrons support
-- network access to the OT-2 HTTP API
+- an Ethernet connection between the OT-2 and the control computer running this tutorial
+- the OT-2 IP address from the Opentrons app network settings
 - local copies of any custom labware JSON files used in the workflow
 - a physical deck layout that matches the slots and modules used below
 
@@ -39,6 +54,8 @@ Step 1: Create the Driver
 -------------------------
 
 Start by creating an ``OT2Prepare`` instance and pointing it at the robot. This tutorial uses the preparation-oriented wrapper because it combines deck control with stock and sample preparation logic.
+
+Replace the example ``robot_ip`` value below with the IP address of your own OT-2.
 
 .. code-block:: python
 
