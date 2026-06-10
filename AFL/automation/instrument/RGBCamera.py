@@ -24,26 +24,21 @@ class RGBCamera(Driver):
     """
     
     defaults = {}
-    defaults["camera_interface"] = "usb"
     defaults["camera_index"] = 0
     defaults["save_path"] = "/home/afl642/rgb_images/"
     defaults["px_crop"] = [220, 350]
     defaults["py_crop"] = [120, 250]
-    defaults["hough_radii"] = 65
+    defaults["hough_radii"] = 40
 
-    def __init__(self, camera=None, overrides=None):
+    def __init__(self, overrides=None):
         """
         Initialize RGBCamera driver.
 
         Parameters
         ----------
-        camera : object, optional
-            Camera object (e.g., USBCamera instance). If None, one will be
-            created when using the USB interface.
         overrides : dict, optional
             Configuration overrides for PersistentConfig.
         """
-        self.camera = camera
         self._opencv_capture = None
         Driver.__init__(
             self,
@@ -51,12 +46,6 @@ class RGBCamera(Driver):
             defaults=self.gather_defaults(),
             overrides=overrides,
         )
-
-        if self.camera is None and self.config["camera_interface"] == "usb":
-            from AFL.automation.instrument.USBCamera import USBCamera
-
-            camera_index = self.config.get("camera_index", 0)
-            self.camera = USBCamera(camid=camera_index)
 
     def _collect_image(self, **kwargs):
         """
@@ -67,60 +56,36 @@ class RGBCamera(Driver):
         tuple
             `(collected, img)` where `collected` indicates success.
         """
-        interface = self.config["camera_interface"]
+        try:
+            cv2_module = lazy.load("cv2", require="AFL-automation[vision]")
+        except Exception as exc:
+            raise ImportError(
+                "opencv-python is required for camera_interface='opencv'. "
+                f"Install with: pip install AFL-automation[vision]. Error: {exc}"
+            )
 
-        if interface == "usb":
-            if self.camera is None:
-                from AFL.automation.instrument.USBCamera import USBCamera
+        if "camera_index" not in self.config:
+            raise ValueError("camera_index must be set in config when camera_interface='opencv'")
 
-                camera_index = self.config.get("camera_index", 0)
-                self.camera = USBCamera(camid=camera_index)
-            return self.camera.collect(**kwargs)
+        camera_index = self.config["camera_index"]
+        if self._opencv_capture is None:
+            self._opencv_capture = cv2_module.VideoCapture(camera_index)
 
-        if interface == "opencv":
-            try:
-                cv2_module = lazy.load("cv2", require="AFL-automation[vision]")
-            except Exception as exc:
-                raise ImportError(
-                    "opencv-python is required for camera_interface='opencv'. "
-                    f"Install with: pip install AFL-automation[vision]. Error: {exc}"
-                )
-
-            if "camera_index" not in self.config:
-                raise ValueError("camera_index must be set in config when camera_interface='opencv'")
-
-            camera_index = self.config["camera_index"]
-            if self._opencv_capture is None:
-                self._opencv_capture = cv2_module.VideoCapture(camera_index)
-
-            return self._opencv_capture.read()
-
-        raise ValueError(
-            f"Unsupported camera_interface: '{interface}'. "
-            "Supported values are: 'usb', 'opencv'"
-        )
+        return self._opencv_capture.read()
 
     def _reset_camera(self):
         """Reset the configured camera connection."""
-        interface = self.config["camera_interface"]
-
-        if interface == "usb":
-            if self.camera is not None:
-                self.camera.camera_reset()
-            return
-
-        if interface == "opencv":
-            if self._opencv_capture is not None:
-                self._opencv_capture.release()
-            try:
-                cv2_module = lazy.load("cv2", require="AFL-automation[vision]")
-            except Exception as exc:
-                raise ImportError(
-                    "opencv-python is required for camera_interface='opencv'. "
-                    f"Install with: pip install AFL-automation[vision]. Error: {exc}"
-                )
-            camera_index = self.config.get("camera_index", 0)
-            self._opencv_capture = cv2_module.VideoCapture(camera_index)
+        if self._opencv_capture is not None:
+            self._opencv_capture.release()
+        try:
+            cv2_module = lazy.load("cv2", require="AFL-automation[vision]")
+        except Exception as exc:
+            raise ImportError(
+                "opencv-python is required for camera_interface='opencv'. "
+                f"Install with: pip install AFL-automation[vision]. Error: {exc}"
+            )
+        camera_index = self.config.get("camera_index", 0)
+        self._opencv_capture = cv2_module.VideoCapture(camera_index)
 
     def _process_image(self, img, px_crop=None, py_crop=None, hough_radii=None):
         """
@@ -368,15 +333,15 @@ class RGBCamera(Driver):
 
         return ds
 
-
 _DEFAULT_CUSTOM_CONFIG = {
     "_classname": "AFL.automation.instrument.RGBCamera.RGBCamera",
-    "_args": [
-        {
-            "_classname": "AFL.automation.instrument.USBCamera.USBCamera",
-            "_args": ["http://afl-video:8081/103/current"],
-        }
-    ],
+    "overrides": {
+        "camera_index": 0,
+        "px_crop": [220, 350],
+        "py_crop": [120, 250],
+        "hough_radii": 40,
+        "save_path": "/home/afl642/rgb_images/"
+    }
 }
 _DEFAULT_CUSTOM_PORT = 5095
 
