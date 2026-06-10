@@ -27,9 +27,9 @@ class RGBCamera(Driver):
     defaults["camera_interface"] = "usb"
     defaults["camera_index"] = 0
     defaults["save_path"] = "/home/afl642/rgb_images/"
-    defaults["row_crop"] = [0, 479]
-    defaults["col_crop"] = [0, 479]
-    defaults["hough_radii"] = 98
+    defaults["px_crop"] = [220, 350]
+    defaults["py_crop"] = [120, 250]
+    defaults["hough_radii"] = 65
 
     def __init__(self, camera=None, overrides=None):
         """
@@ -122,7 +122,7 @@ class RGBCamera(Driver):
             camera_index = self.config.get("camera_index", 0)
             self._opencv_capture = cv2_module.VideoCapture(camera_index)
 
-    def _process_image(self, img, row_crop=None, col_crop=None, hough_radii=None):
+    def _process_image(self, img, px_crop=None, py_crop=None, hough_radii=None):
         """
         Crop the image, locate the circular sample region, and compute masked RGB averages.
 
@@ -130,10 +130,10 @@ class RGBCamera(Driver):
         ----------
         img : np.ndarray
             Input image in BGR format (from OpenCV).
-        row_crop : list, optional
-            Row range [start, end] for cropping. If None, uses full image.
-        col_crop : list, optional
-            Column range [start, end] for cropping. If None, uses full image.
+        px_crop : list, optional
+            Pixel range [start, end] for cropping along the x-axis. If None, uses full image.
+        py_crop : list, optional
+            Pixel range [start, end] for cropping along the y-axis. If None, uses full image.
         hough_radii : int or list, optional
             Radius or radii to use for Hough circle detection.
 
@@ -143,14 +143,14 @@ class RGBCamera(Driver):
             Processed image payload including cropped image, mask, center, radius,
             and average RGB values computed inside the mask.
         """
-        if row_crop is None:
-            row_crop = [0, img.shape[0]]
-        if col_crop is None:
-            col_crop = [0, img.shape[1]]
+        if px_crop is None:
+            px_crop = [0, img.shape[1]]
+        if py_crop is None:
+            py_crop = [0, img.shape[0]]
         if hough_radii is None:
             hough_radii = self.config.get("hough_radii", 98)
 
-        cropped_img = img[row_crop[0] : row_crop[1], col_crop[0] : col_crop[1], :]
+        cropped_img = img[py_crop[0] : py_crop[1], px_crop[0] : px_crop[1], :]
         gray_img = img_as_ubyte(rgb2gray(cropped_img))
 
         radii = list(np.atleast_1d(hough_radii))
@@ -161,7 +161,7 @@ class RGBCamera(Driver):
         if len(cx) == 0 or len(cy) == 0 or len(detected_radii) == 0:
             raise RuntimeError(
                 "Failed to locate sample region with Hough circle detection. "
-                "Adjust row_crop, col_crop, or hough_radii."
+                "Adjust px_crop, py_crop, or hough_radii."
             )
 
         cx = int(cx[0])
@@ -254,11 +254,11 @@ class RGBCamera(Driver):
         xarray.Dataset
             Dataset with average RGB values, image, and metadata.
         """
-        row_crop = self.config.get("row_crop", [0, 479])
-        col_crop = self.config.get("col_crop", [0, 479])
+        px_crop = self.config.get("px_crop", [0, 479])
+        py_crop = self.config.get("py_crop", [0, 479])
         hough_radii = self.config.get("hough_radii", 98)
 
-        print(f"Capturing RGB image (crops: rows {row_crop}, cols {col_crop})")
+        print(f"Capturing RGB image (crops: px {px_crop}, py {py_crop})")
         print(f"Using hough_radii={hough_radii}")
 
         print("Attempting to collect camera image")
@@ -285,8 +285,8 @@ class RGBCamera(Driver):
 
         processed = self._process_image(
             img,
-            row_crop=row_crop,
-            col_crop=col_crop,
+            px_crop=px_crop,
+            py_crop=py_crop,
             hough_radii=hough_radii,
         )
         avg_rgb = processed["avg_rgb"]
@@ -298,22 +298,61 @@ class RGBCamera(Driver):
             "width": processed["cropped_img"].shape[1],
         }
 
+        ds = self._build_dataset(
+            name=name,
+            avg_rgb=avg_rgb,
+            measurement_img=processed["cropped_img"],
+            mask=processed["mask"],
+            cx=processed["cx"],
+            cy=processed["cy"],
+            radius=processed["radius"],
+            img_metadata=img_metadata,
+        )
         if plotting:
             try:
+                import numpy as np
                 import matplotlib.pyplot as plt
+                from matplotlib.patches import Circle, Rectangle
 
-                fig, ax = plt.subplots(1, 2, figsize=(12, 6))
-                img_rgb = processed["cropped_img"][:, :, ::-1]
-                ax[0].imshow(img_rgb)
-                ax[0].set_title("Captured Image")
-                ax[0].axis("off")
-
-                ax[1].imshow(img_rgb)
-                ax[1].imshow(np.where(processed["mask"], 0.0, np.nan), alpha=0.35)
-                ax[1].set_title(
-                    f"Masked RGB: R={avg_rgb['R']:.1f}, G={avg_rgb['G']:.1f}, B={avg_rgb['B']:.1f}"
+                fig, axs = plt.subplots(1, 2, figsize=(6*2, 6*1))
+                axs[0].imshow(img)
+                axs[0].add_patch(
+                    Rectangle(
+                        (px_crop[0], py_crop[0]),                  # (x, y)
+                        px_crop[1] - px_crop[0],                  # width
+                        py_crop[1] - py_crop[0],                  # height
+                        edgecolor="red",
+                        facecolor="none",
+                        linewidth=2)
                 )
-                ax[1].axis("off")
+                axs[0].set_xlim(0, img.shape[1])
+                axs[0].set_ylim(img.shape[0], 0)  # keep image-style orientation
+                axs[0].set_title("Captured image with crop region", pad=20)
+                axs[0].axis("off")
+
+                img_rgb = ds["img_bgr"].values[:, :, ::-1]
+                cx, cy = ds.attrs["located_center"]
+                radius = ds.attrs["mask_radius"]
+
+                rgb = ds["avg_rgb"].values / 255.0
+                color_block = np.ones((20, 40, 3)) * rgb
+
+                axs[1].imshow(img_rgb)
+                axs[1].add_patch(Circle((cx, cy), radius, edgecolor="red", facecolor="none", linewidth=2))
+                axs[1].axis("off")
+
+                axs[1].set_title(
+                    f"Detected circle\nRGB = [{ds['avg_rgb'][0].item():.1f}, {ds['avg_rgb'][1].item():.1f}, {ds['avg_rgb'][2].item():.1f}]",
+                    pad=20,
+                )
+
+                swatch_ax = axs[1].inset_axes([0.4, 1.02, 0.2, 0.08])  # [x0, y0, width, height] in axes coords
+                swatch_ax.imshow(color_block)
+                swatch_ax.set_xticks([])
+                swatch_ax.set_yticks([])
+                for spine in swatch_ax.spines.values():
+                    spine.set_edgecolor("black")
+                    spine.set_linewidth(1)
 
                 save_path = pathlib.Path(self.config.get("save_path", "./"))
                 save_path.mkdir(parents=True, exist_ok=True)
@@ -327,17 +366,6 @@ class RGBCamera(Driver):
             except Exception as e:
                 print(f"Warning: Could not save plot: {e}")
 
-        ds = self._build_dataset(
-            name=name,
-            avg_rgb=avg_rgb,
-            measurement_img=processed["cropped_img"],
-            mask=processed["mask"],
-            cx=processed["cx"],
-            cy=processed["cy"],
-            radius=processed["radius"],
-            img_metadata=img_metadata,
-        )
-
         return ds
 
 
@@ -346,11 +374,11 @@ _DEFAULT_CUSTOM_CONFIG = {
     "_args": [
         {
             "_classname": "AFL.automation.instrument.USBCamera.USBCamera",
-            "_args": [0],
+            "_args": ["http://afl-video:8081/103/current"],
         }
     ],
 }
-_DEFAULT_CUSTOM_PORT = 5002
+_DEFAULT_CUSTOM_PORT = 5095
 
 if __name__ == "__main__":
     from AFL.automation.shared.launcher import *
