@@ -1314,6 +1314,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         to_top=True,
         to_center=False,
         to_top_z_offset=0,
+        source_z_offset=0,
         fast_mixing=False,
         touch_tip=False,
         **kwargs,
@@ -1580,7 +1581,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     "wellName": source_well["wellName"],
                     "wellLocation": {
                         "origin": source_position,
-                        "offset": {"x": 0, "y": 0, "z": 0},
+                        "offset": {"x": 0, "y": 0, "z": source_z_offset},
                     },
                     "flowRate": self.pipette_info[pipette_mount]['aspirate_flow_rate'],
                 },
@@ -2187,6 +2188,71 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             self.log_error(f"Error getting RPM: {str(e)}")
             return f"Error: {str(e)}"
         
+    def set_tempmodule_temperature(
+        self,
+        module_id,
+        temperature_c,
+        wait = True,
+        ):
+        self.log_info(f"Setting temperature module to {temperature_c}°C")
+        if module_id is None:
+            module_id = self._find_module_by_type("tempdeck")
+        self._execute_atomic_command(
+            "temperatureModule/setTargetTemperature",
+            params={"moduleId": module_id, "celsius": float(temperature_c)},
+            wait_until_complete=wait,
+        )
+        data = self.get_tempmodule_status(log=False)
+        while abs(data.get("currentTemp")-data.get("targetTemp")) > 1.0:
+            time.sleep(5)
+            data = self.get_tempmodule_status(log=False)
+            self.log_debug(f"Waiting for temperature to stabilize... "
+                            f"(Current: {data.get('currentTemp')}°C, Target: {data.get('targetTemp')}°C)")
+
+        return data.get("currentTemp"), data.get("targetTemp")
+
+    def deactivate_tempmodule(self, module_id, timeout_s=120, wait=True):
+        if module_id is None:
+            module_id = self._find_module_by_type("tempdeck")
+        return self._execute_atomic_command(
+            "temperatureModule/deactivate",
+            params={"moduleId": module_id},
+            wait_until_complete=wait,
+            timeout=timeout_s,
+        )
+    
+    def get_tempmodule_status(self, log=True):
+        response = requests.get(
+            url=f"{self.base_url}/modules",
+            headers=self.headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        modules = response.json().get("modules", [])
+        for m in modules:
+            if m.get("name") == "tempdeck":
+                temp_module = m 
+                data = temp_module.get("data", {})
+                status = temp_module.get("status", "unknown")
+                current_temp = data.get("currentTemp")
+                target_temp = data.get("targetTemp")
+
+                current_temp_str = f"{current_temp:g}°C" if current_temp is not None else "None"
+                target_temp_str = f"{target_temp:g}°C" if target_temp is not None else "None"
+
+                if log:
+                    self.log_info(
+                            f"Current status: {status} "
+                            f"(Current temperature : {current_temp_str},"
+                            f" Target temperature: {target_temp_str})"
+                        )
+
+            else:
+                data = {}
+
+        return data 
+
     def _create_run(self):
         """Create a run on the robot for executing commands"""
         self.log_info("Creating a new run for commands")
