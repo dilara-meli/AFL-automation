@@ -38,117 +38,16 @@ def _sanitize_filename_component(value):
     return ''.join(character if character.isalnum() or character in ('-', '_') else '_' for character in text)
 
 
-def _measurement_export_columns(measurement_type, data, prefer_raw=False):
+def _measurement_payload_from_data(measurement_type, data):
     time_values = list(data.get('time', []))
-    current_values = list(data.get('current', []))
     voltage_values = list(data.get('potential', []))
+    current_values = list(data.get('current', []))
 
     if measurement_type == 'cyclic_voltammetry':
         if not voltage_values:
             voltage_values = list(data.get('vf', []))
         if not current_values:
             current_values = list(data.get('im', []))
-    elif measurement_type == 'chronoamperometry':
-        if not voltage_values:
-            voltage_values = list(data.get('vf', []))
-        if not current_values:
-            current_values = list(data.get('im', []))
-    elif measurement_type == 'sine_wave':
-        if not voltage_values:
-            voltage_values = list(data.get('vf', []))
-        if not current_values:
-            current_values = list(data.get('im', []))
-    elif measurement_type == 'differential_pulse_voltammetry':
-        if prefer_raw:
-            voltage_values = list(data.get('vf', []))
-            current_values = list(data.get('im', []))
-        else:
-            if not voltage_values:
-                voltage_values = list(data.get('potential', []))
-            if not current_values:
-                current_values = list(data.get('current', []))
-
-    return time_values, voltage_values, current_values
-
-
-def _write_raw_measurement_text_export(measurement_type, instrument_name, process_name, timestamp, data):
-    time_values, voltage_values, current_values = _measurement_export_columns(measurement_type, data, prefer_raw=True)
-    point_total = min(len(time_values), len(voltage_values), len(current_values))
-    if point_total <= 0:
-        _log_worker_event('measurement_export_skipped', measurement_type=measurement_type, reason='missing_time_voltage_current')
-        return None
-
-    os.makedirs(GAMRY_EXPORT_DIRECTORY, exist_ok=True)
-    timestamp_text = timestamp.replace(':', '').replace('-', '').replace('+', '_').replace('.', '_')
-    filename = (
-        f"{_sanitize_filename_component(measurement_type)}_{_sanitize_filename_component(instrument_name)}_"
-        f"{_sanitize_filename_component(process_name)}_{timestamp_text}.txt"
-    )
-    export_path = os.path.join(GAMRY_EXPORT_DIRECTORY, filename)
-    with open(export_path, 'w', encoding='utf-8') as handle:
-        handle.write('time_s\tvoltage_v\tcurrent_a\n')
-        for index in range(point_total):
-            handle.write(
-                f"{float(time_values[index]):.12g}\t"
-                f"{float(voltage_values[index]):.12g}\t"
-                f"{float(current_values[index]):.12g}\n"
-            )
-    _log_worker_event('measurement_export_written', measurement_type=measurement_type, path=export_path, point_count=point_total)
-    return export_path
-
-
-def _write_measurement_text_export(measurement_type, instrument_name, process_name, timestamp, data):
-    time_values, voltage_values, current_values = _measurement_export_columns(measurement_type, data)
-    point_total = min(len(time_values), len(voltage_values), len(current_values))
-    if point_total <= 0:
-        _log_worker_event('measurement_export_skipped', measurement_type=measurement_type, reason='missing_time_voltage_current')
-        return None
-
-    os.makedirs(GAMRY_EXPORT_DIRECTORY, exist_ok=True)
-    timestamp_text = timestamp.replace(':', '').replace('-', '').replace('+', '_').replace('.', '_')
-    filename = (
-        f"{_sanitize_filename_component(measurement_type)}_{_sanitize_filename_component(instrument_name)}_"
-        f"{_sanitize_filename_component(process_name)}_{timestamp_text}.txt"
-    )
-    export_path = os.path.join(GAMRY_EXPORT_DIRECTORY, filename)
-    with open(export_path, 'w', encoding='utf-8') as handle:
-        handle.write('time_s\tvoltage_v\tcurrent_a\n')
-        for index in range(point_total):
-            handle.write(
-                f"{float(time_values[index]):.12g}\t"
-                f"{float(voltage_values[index]):.12g}\t"
-                f"{float(current_values[index]):.12g}\n"
-            )
-    _log_worker_event('measurement_export_written', measurement_type=measurement_type, path=export_path, point_count=point_total)
-    return export_path
-
-
-def _load_measurement_text_export(export_path):
-    time_values = []
-    voltage_values = []
-    current_values = []
-    with open(export_path, 'r', encoding='utf-8', newline='') as handle:
-        reader = csv.DictReader(handle, delimiter='\t')
-        expected_columns = {'time_s', 'voltage_v', 'current_a'}
-        if reader.fieldnames is None or set(reader.fieldnames) != expected_columns:
-            raise ValueError(f'Measurement text export has unexpected columns: {reader.fieldnames}')
-        for row in reader:
-            time_values.append(float(row['time_s']))
-            voltage_values.append(float(row['voltage_v']))
-            current_values.append(float(row['current_a']))
-    return {
-        'time_s': time_values,
-        'voltage_v': voltage_values,
-        'current_a': current_values,
-    }
-
-
-def _measurement_payload_from_text_export(measurement_type, export_trace):
-    time_values = list(export_trace.get('time_s', []))
-    voltage_values = list(export_trace.get('voltage_v', []))
-    current_values = list(export_trace.get('current_a', []))
-
-    if measurement_type == 'cyclic_voltammetry':
         return {
             'x_key': 'potential',
             'y_key': 'current',
@@ -161,6 +60,10 @@ def _measurement_payload_from_text_export(measurement_type, export_trace):
             },
         }
     if measurement_type == 'chronoamperometry':
+        if not voltage_values:
+            voltage_values = list(data.get('vf', []))
+        if not current_values:
+            current_values = list(data.get('im', []))
         return {
             'x_key': 'time',
             'y_key': 'current',
@@ -173,6 +76,10 @@ def _measurement_payload_from_text_export(measurement_type, export_trace):
             },
         }
     if measurement_type == 'sine_wave':
+        if not voltage_values:
+            voltage_values = list(data.get('vf', []))
+        if not current_values:
+            current_values = list(data.get('im', []))
         return {
             'x_key': 'time',
             'y_key': 'current',
@@ -182,23 +89,21 @@ def _measurement_payload_from_text_export(measurement_type, export_trace):
                 'time': time_values,
                 'potential': voltage_values,
                 'current': current_values,
-                'applied_signal': voltage_values,
+                'applied_signal': list(data.get('applied_signal', voltage_values)),
             },
         }
-    raise ValueError(f'Unsupported measurement type for text export payload: {measurement_type}')
+    raise ValueError(f'Unsupported measurement type for payload: {measurement_type}')
 
 
-def _build_measurement_result_from_text_export(
+def _build_measurement_result_from_data(
     measurement_type,
     instrument_name,
     process_name,
     timestamp,
     parameters,
-    export_path,
+    data,
 ):
-    export_trace = _load_measurement_text_export(export_path)
-    payload = _measurement_payload_from_text_export(measurement_type, export_trace)
-    parameters['text_export_path'] = export_path
+    payload = _measurement_payload_from_data(measurement_type, data)
     return {
         'mode': 'run_measurement',
         'measurement_type': measurement_type,
@@ -214,7 +119,7 @@ def _build_measurement_result_from_text_export(
     }
 
 
-def _calculate_dpv_differential_current(raw_export_path, cycle_time, pulse_time, points_to_average=3):
+def _calculate_dpv_differential_current(data, cycle_time, pulse_time, points_to_average=3):
     if cycle_time <= 0:
         raise ValueError('DPV cycle time must be positive')
     if pulse_time <= 0:
@@ -224,10 +129,9 @@ def _calculate_dpv_differential_current(raw_export_path, cycle_time, pulse_time,
     if points_to_average <= 0:
         raise ValueError('DPV averaging point count must be positive')
 
-    raw_trace = _load_measurement_text_export(raw_export_path)
-    time_values = raw_trace['time_s']
-    voltage_values = raw_trace['voltage_v']
-    current_values = raw_trace['current_a']
+    time_values = list(data.get('time', []))
+    voltage_values = list(data.get('vf', data.get('potential', [])))
+    current_values = list(data.get('im', data.get('current', [])))
     point_total = min(len(time_values), len(voltage_values), len(current_values))
     if point_total <= 0:
         return {
@@ -271,37 +175,6 @@ def _calculate_dpv_differential_current(raw_export_path, cycle_time, pulse_time,
         'point_count': len(differential_voltage),
         'skipped_cycles': skipped_cycles,
     }
-
-
-def _write_dpv_differential_text_export(raw_export_path, instrument_name, process_name, timestamp, cycle_time, pulse_time):
-    differential_trace = _calculate_dpv_differential_current(raw_export_path, cycle_time, pulse_time)
-    point_total = min(len(differential_trace['voltage_v']), len(differential_trace['diff_current_a']))
-    if point_total <= 0:
-        _log_worker_event('dpv_differential_export_skipped', path=raw_export_path, reason='missing_differential_points')
-        return None, differential_trace
-
-    raw_path = os.path.abspath(raw_export_path)
-    export_directory = os.path.dirname(raw_path)
-    raw_name = os.path.splitext(os.path.basename(raw_path))[0]
-    filename = f'{raw_name}_diff.txt'
-    export_path = os.path.join(export_directory, filename)
-    with open(export_path, 'w', encoding='utf-8') as handle:
-        handle.write('voltage_v\tdiff_current_a\n')
-        for index in range(point_total):
-            handle.write(
-                f"{float(differential_trace['voltage_v'][index]):.12g}\t"
-                f"{float(differential_trace['diff_current_a'][index]):.12g}\n"
-            )
-    _log_worker_event(
-        'dpv_differential_export_written',
-        path=export_path,
-        raw_export_path=raw_export_path,
-        point_count=point_total,
-        skipped_cycles=differential_trace['skipped_cycles'],
-        cycle_time=cycle_time,
-        pulse_time=pulse_time,
-    )
-    return export_path, differential_trace
 
 
 def _summarize_dpv_timing(data, expected_cycle_count, expected_cycle_time):
@@ -710,22 +583,13 @@ def collect_cv(
             time.sleep(scan_delay)
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
         raw_data = _curve_data_to_lists(curve.acq_data())
-        export_path = _write_measurement_text_export(
-            measurement_type='cyclic_voltammetry',
-            instrument_name=instrument_name,
-            process_name=process_name,
-            timestamp=timestamp,
-            data=raw_data,
-        )
-        if export_path is None:
-            raise RuntimeError('Failed to write cyclic voltammetry text export')
-        return _build_measurement_result_from_text_export(
+        return _build_measurement_result_from_data(
             measurement_type='cyclic_voltammetry',
             instrument_name=instrument_name,
             process_name=process_name,
             timestamp=timestamp,
             parameters=parameters,
-            export_path=export_path,
+            data=raw_data,
         )
     finally:
         if signal is not None:
@@ -781,22 +645,13 @@ def collect_chronoamperometry(tkp, instrument_name, process_name, parameters):
             time.sleep(0.1)
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
         raw_data = _curve_data_to_lists(curve.acq_data())
-        export_path = _write_measurement_text_export(
-            measurement_type='chronoamperometry',
-            instrument_name=instrument_name,
-            process_name=process_name,
-            timestamp=timestamp,
-            data=raw_data,
-        )
-        if export_path is None:
-            raise RuntimeError('Failed to write chronoamperometry text export')
-        return _build_measurement_result_from_text_export(
+        return _build_measurement_result_from_data(
             measurement_type='chronoamperometry',
             instrument_name=instrument_name,
             process_name=process_name,
             timestamp=timestamp,
             parameters=normalized,
-            export_path=export_path,
+            data=raw_data,
         )
     finally:
         try:
@@ -877,22 +732,13 @@ def collect_sine(tkp, instrument_name, process_name, parameters):
         normalized['total_points'] = total_points
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
         raw_data = _curve_data_to_lists(curve.acq_data())
-        export_path = _write_measurement_text_export(
-            measurement_type='sine_wave',
-            instrument_name=instrument_name,
-            process_name=process_name,
-            timestamp=timestamp,
-            data=raw_data,
-        )
-        if export_path is None:
-            raise RuntimeError('Failed to write sine-wave text export')
-        return _build_measurement_result_from_text_export(
+        return _build_measurement_result_from_data(
             measurement_type='sine_wave',
             instrument_name=instrument_name,
             process_name=process_name,
             timestamp=timestamp,
             parameters=normalized,
-            export_path=export_path,
+            data=raw_data,
         )
     finally:
         if signal is not None:
@@ -1032,7 +878,6 @@ def collect_dpv(tkp, instrument_name, process_name, parameters):
         normalized['drop_knock_duration'] = drop_knock_duration
         normalized['drop_knock_polarity'] = drop_knock_polarity
         raw_data = _curve_data_to_lists(curve.acq_data())
-        raw_export_data = dict(raw_data)
         _log_worker_event(
             'dpv_raw_data',
             keys=sorted(raw_data.keys()),
@@ -1040,36 +885,24 @@ def collect_dpv(tkp, instrument_name, process_name, parameters):
         )
         derived_trace = _derive_dpv_trace(raw_data, cycle_time, normalized['pulse_time'])
         if derived_trace is not None:
-            raw_data.update(derived_trace)
             _log_worker_event('dpv_derived_trace', point_count=len(derived_trace.get('current', [])))
-            timing_summary = _summarize_dpv_timing(raw_data, max_cycles, cycle_time)
+            timing_summary = _summarize_dpv_timing(derived_trace, max_cycles, cycle_time)
             normalized.update(timing_summary)
             _log_worker_event('dpv_timing_summary', **timing_summary)
+            normalized['dpv_diff_point_count'] = int(len(derived_trace.get('current', [])))
+            normalized['dpv_diff_skipped_cycles'] = int(max(0, max_cycles - len(derived_trace.get('current', []))))
+            dpv_data = derived_trace
         else:
             _log_worker_event('dpv_derived_trace_empty')
-        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        export_path = _write_raw_measurement_text_export(
-            measurement_type='differential_pulse_voltammetry',
-            instrument_name=instrument_name,
-            process_name=process_name,
-            timestamp=timestamp,
-            data=raw_export_data,
-        )
-        if export_path is None:
-            raise RuntimeError('Failed to write DPV raw text export')
-        normalized['text_export_path'] = export_path
-        diff_export_path, differential_trace = _write_dpv_differential_text_export(
-            raw_export_path=export_path,
-            instrument_name=instrument_name,
-            process_name=process_name,
-            timestamp=timestamp,
-            cycle_time=normalized['sample_period'],
-            pulse_time=normalized['pulse_time'],
-        )
-        if diff_export_path is not None:
-            normalized['dpv_diff_export_path'] = diff_export_path
+            differential_trace = _calculate_dpv_differential_current(raw_data, normalized['sample_period'], normalized['pulse_time'])
             normalized['dpv_diff_point_count'] = int(differential_trace['point_count'])
             normalized['dpv_diff_skipped_cycles'] = int(differential_trace['skipped_cycles'])
+            dpv_data = {
+                'potential': differential_trace['voltage_v'],
+                'current': differential_trace['diff_current_a'],
+                'cycle_index': differential_trace['cycle_index'],
+            }
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
         return {
             'mode': 'run_measurement',
             'measurement_type': 'differential_pulse_voltammetry',
@@ -1081,7 +914,7 @@ def collect_dpv(tkp, instrument_name, process_name, parameters):
             'process_name': process_name,
             'timestamp': timestamp,
             'parameters': normalized,
-            'data': raw_data,
+            'data': dpv_data,
         }
     except Exception as exc:
         _log_worker_event('dpv_exception', error_type=exc.__class__.__name__, message=str(exc), traceback=traceback.format_exc())

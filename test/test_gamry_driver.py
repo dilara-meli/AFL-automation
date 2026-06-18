@@ -1,4 +1,6 @@
+import importlib
 import pathlib
+import tempfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -6,17 +8,16 @@ import pytest
 
 from AFL.automation.instrument.gamry import GamryDriver
 from AFL.automation.instrument.gamry_worker import (
-    _build_measurement_result_from_text_export,
+    _build_measurement_result_from_data,
     _calculate_dpv_differential_current,
     _derive_dpv_trace,
     _predict_dpv_point_count,
     _summarize_dpv_timing,
     _validate_voltage_limit,
-    _write_dpv_differential_text_export,
-    _write_measurement_text_export,
     collect_dpv,
 )
 from AFL.automation.APIServer.APIServer import APIServer
+from AFL.automation.APIServer.data import DataTiled
 from AFL.automation.APIServer.data.DataPacket import DataPacket
 
 
@@ -304,8 +305,6 @@ def test_collect_dpv_allocates_curve_with_small_buffer_margin(monkeypatch):
     monkeypatch.setattr('AFL.automation.instrument.gamry_worker.initialize_pstat', lambda *args, **kwargs: None)
     monkeypatch.setattr('AFL.automation.instrument.gamry_worker._curve_data_to_lists', lambda data: {'time': [], 'vf': [], 'im': []})
     monkeypatch.setattr('AFL.automation.instrument.gamry_worker._derive_dpv_trace', lambda *args, **kwargs: None)
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker._write_measurement_text_export', lambda **kwargs: None)
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker._write_dpv_differential_text_export', lambda **kwargs: (None, None))
     monkeypatch.setattr('AFL.automation.instrument.gamry_worker.time.sleep', lambda *_args, **_kwargs: None)
 
     result = collect_dpv(
@@ -542,7 +541,7 @@ def test_run_measurement_builds_chrono_dataset(monkeypatch, driver):
                     'instrument_name': 'PSTAT',
                     'process_name': 'AFL_GamryDriver',
                     'timestamp': '2026-04-22T12:00:00',
-                    'parameters': {'initial_time': 1.0, 'text_export_path': 'C:/tmp/ca.txt'},
+                    'parameters': {'initial_time': 1.0},
                     'data': {
                         'time': [0.0, 0.5, 1.0],
                         'potential': [0.5, 0.5, 0.0],
@@ -562,7 +561,7 @@ def test_run_measurement_builds_chrono_dataset(monkeypatch, driver):
     assert dataset.attrs['measurement_type'] == 'chronoamperometry'
     assert dataset.attrs['x_key'] == 'time'
     assert dataset.attrs['y_key'] == 'current'
-    assert dataset.attrs['parameters']['text_export_path'] == 'C:/tmp/ca.txt'
+    assert dataset.attrs['parameters']['initial_time'] == 1.0
     assert np.allclose(dataset['time'].values, [0.0, 0.5, 1.0])
     assert np.allclose(dataset['potential'].values, [0.5, 0.5, 0.0])
     assert np.allclose(dataset['current'].values, [1.0, 0.8, 0.6])
@@ -570,28 +569,23 @@ def test_run_measurement_builds_chrono_dataset(monkeypatch, driver):
     assert root.calls[0][3] == 'ca'
 
 
-def test_build_measurement_result_from_text_export_uses_export_values(tmp_path):
-    export_path = tmp_path / 'cv_export.txt'
-    export_path.write_text(
-        'time_s\tvoltage_v\tcurrent_a\n'
-        '0\t0.1\t1.0\n'
-        '1\t0.2\t1.5\n'
-        '2\t0.3\t1.2\n',
-        encoding='utf-8',
-    )
-
-    result = _build_measurement_result_from_text_export(
+def test_build_measurement_result_from_data_uses_in_memory_values():
+    result = _build_measurement_result_from_data(
         measurement_type='cyclic_voltammetry',
         instrument_name='PSTAT',
         process_name='AFL_GamryDriver',
         timestamp='2026-04-22T12:00:00',
         parameters={'scan_rate': 0.1},
-        export_path=str(export_path),
+        data={
+            'time': [0.0, 1.0, 2.0],
+            'vf': [0.1, 0.2, 0.3],
+            'im': [1.0, 1.5, 1.2],
+        },
     )
 
     assert result['x_source'] == 'potential'
     assert result['y_source'] == 'current'
-    assert result['parameters']['text_export_path'] == str(export_path)
+    assert result['parameters']['scan_rate'] == 0.1
     assert result['data']['time'] == [0.0, 1.0, 2.0]
     assert result['data']['potential'] == [0.1, 0.2, 0.3]
     assert result['data']['current'] == [1.0, 1.5, 1.2]
@@ -681,6 +675,129 @@ def test_run_stripping_dpv_stamps_task_metadata(monkeypatch, driver):
     assert dataset.attrs['measurement_type'] == 'differential_pulse_voltammetry'
     assert dataset.attrs['sample_uuid'] == 'SAM-ECHEM-002'
     assert root.calls[0][3] == 'dpv'
+
+
+def test_enqueue_panel_measurement_stamps_mode_specific_metadata(monkeypatch, driver):
+    root = FakeBridgeRoot(
+        responses={
+            'run_measurement': {
+                'status': 'ok',
+                'result': {
+                    'mode': 'run_measurement',
+                    'measurement_type': 'sine_wave',
+                    'x_key': 'time',
+                    'y_key': 'current',
+                    'x_source': 'time',
+                    'y_source': 'current',
+                    'instrument_name': 'PSTAT',
+                    'process_name': 'AFL_GamryDriver',
+                    'timestamp': '2026-04-22T12:00:00',
+                    'parameters': {'signal_frequency': 10.0},
+                    'data': {
+                        'time': [0.0, 0.1, 0.2],
+                        'current': [0.01, 0.02, 0.01],
+                        'potential': [0.0, 0.05, 0.0],
+                    },
+                },
+            }
+        }
+    )
+    connection = FakeBridgeConnection(root)
+
+    monkeypatch.setattr(driver, '_ensure_service', lambda: None)
+    monkeypatch.setattr(driver, '_get_bridge_connection', lambda: connection)
+    driver.data = DataPacket()
+
+    dataset = driver.enqueuePanelMeasurement(measurement_mode='sine')
+
+    assert dataset.attrs['task_name'] == 'enqueuePanelMeasurement'
+    assert dataset.attrs['step_name'] == 'panel_sine'
+    assert dataset.attrs['measurement_type'] == 'sine_wave'
+    assert root.calls[0][3] == 'sine'
+
+
+def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver):
+    root = FakeBridgeRoot(
+        responses={
+            'run_measurement': {
+                'status': 'ok',
+                'result': {
+                    'mode': 'run_measurement',
+                    'measurement_type': 'differential_pulse_voltammetry',
+                    'x_key': 'potential',
+                    'y_key': 'current',
+                    'x_source': 'potential',
+                    'y_source': 'current',
+                    'instrument_name': 'PSTAT',
+                    'process_name': 'AFL_GamryDriver',
+                    'timestamp': '2026-04-22T12:00:00',
+                    'parameters': {
+                        'step_size': 0.005,
+                        'dpv_diff_point_count': 2,
+                        'cycle_completion_ratio': 1.0,
+                    },
+                    'data': {
+                        'potential': [0.025, 0.03],
+                        'current': [0.06, 0.08],
+                        'time': [0.50, 1.00],
+                        'cycle_index': [0, 1],
+                    },
+                },
+            }
+        }
+    )
+    connection = FakeBridgeConnection(root)
+
+    monkeypatch.setattr(driver, '_ensure_service', lambda: None)
+    monkeypatch.setattr(driver, '_get_bridge_connection', lambda: connection)
+    driver.data = DataPacket()
+    driver.set_sample('electrode-sample', sample_uuid='SAM-ECHEM-003')
+    dataset = driver.runStrippingDPV()
+
+    class MockTiledContainer:
+        def __init__(self, key, metadata=None):
+            self.key = key
+            self.metadata = metadata or {}
+
+    class MockTiledClient:
+        def __init__(self):
+            self.containers = {}
+
+        def __getitem__(self, key):
+            return self.containers[key]
+
+        def create_container(self, key, metadata=None):
+            container = MockTiledContainer(key, metadata=metadata)
+            self.containers[key] = container
+            return container
+
+    mock_client = MockTiledClient()
+    monkeypatch.setattr('tiled.client.from_uri', lambda *args, **kwargs: mock_client)
+
+    captured = {}
+
+    def fake_write_xarray_dataset(client, written_dataset, key=None):
+        captured['client'] = client
+        captured['dataset'] = written_dataset
+        captured['key'] = key
+
+    tiled_mod = importlib.import_module('AFL.automation.APIServer.data.DataTiled')
+    monkeypatch.setattr(tiled_mod, 'write_xarray_dataset', fake_write_xarray_dataset)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        packet = DataTiled('http://localhost:8000', 'test-api-key', tmpdir)
+        packet['uuid'] = 'QD-GAMRY-001'
+        packet['task'] = {'task_name': 'runStrippingDPV'}
+        packet['meta'] = {'return_val': 'xarray.Dataset'}
+        packet['main_dataset'] = dataset
+        packet.finalize()
+
+    assert captured['client'] is mock_client.containers['run_documents']
+    assert captured['key'] == 'QD-GAMRY-001'
+    assert captured['dataset'].attrs['measurement_type'] == 'differential_pulse_voltammetry'
+    assert captured['dataset'].attrs['sample_uuid'] == 'SAM-ECHEM-003'
+    assert captured['dataset'].attrs['parameters']['dpv_diff_point_count'] == 2
+    assert captured['dataset'].attrs['meta']['return_val'] == 'xarray.Dataset'
 
 
 def test_run_measurement_now_serializes_non_cv_result(monkeypatch, driver):
@@ -1025,40 +1142,13 @@ def test_collect_dpv_uses_restored_signal_order_and_voltage_guard():
         )
 
 
-def test_write_measurement_text_export_writes_time_voltage_current(monkeypatch, tmp_path):
-    export_dir = tmp_path / 'GamryServer_trial'
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker.GAMRY_EXPORT_DIRECTORY', str(export_dir))
-
-    export_path = _write_measurement_text_export(
-        measurement_type='differential_pulse_voltammetry',
-        instrument_name='PSTAT',
-        process_name='AFL_GamryDriver',
-        timestamp='2026-04-23T12:34:56+00:00',
-        data={
-            'time': [0.5, 1.0],
-            'potential': [-0.975, -0.97],
-            'current': [1.2e-6, 1.4e-6],
-        },
-    )
-
-    assert export_path is not None
-    contents = pathlib.Path(export_path).read_text(encoding='utf-8').splitlines()
-    assert contents == [
-        'time_s\tvoltage_v\tcurrent_a',
-        '0.5\t-0.975\t1.2e-06',
-        '1\t-0.97\t1.4e-06',
-    ]
-
-
-def test_collect_dpv_exports_raw_trace_before_derived_update(monkeypatch):
-    captured = {}
-
+def test_collect_dpv_returns_derived_trace_without_text_exports(monkeypatch):
     class FakeCurve:
         def __init__(self, pstat, max_size):
             self.max_size = max_size
 
         def run(self, block):
-            captured['run_block'] = block
+            return None
 
         def running(self):
             return False
@@ -1066,38 +1156,31 @@ def test_collect_dpv_exports_raw_trace_before_derived_update(monkeypatch):
         def acq_data(self):
             return np.array([], dtype=[('time', np.float32), ('vf', np.float32), ('im', np.float32)])
 
-        def stop(self):
-            captured['curve_stopped'] = True
-
-        def free(self):
-            captured['curve_freed'] = True
-
     class FakeSignal:
-        def free(self):
-            captured['signal_freed'] = True
+        pass
 
     class FakePstat:
         def __init__(self, instrument_name):
-            captured['instrument_name'] = instrument_name
+            self.instrument_name = instrument_name
 
         def set_ctrl_mode(self, mode):
-            captured['ctrl_mode'] = mode
+            self.ctrl_mode = mode
 
         def signal_pv_new(self, *args):
-            captured['signal_args'] = args
+            self.signal_args = args
             return FakeSignal()
 
         def set_signal_pv(self, signal):
-            captured['signal_set'] = signal is not None
+            self.signal = signal
 
         def init_signal(self):
-            captured['signal_initialized'] = True
+            return None
 
         def set_cell(self, enabled):
-            captured.setdefault('cell_states', []).append(enabled)
+            self.cell_enabled = enabled
 
         def close(self):
-            captured['pstat_closed'] = True
+            return None
 
     fake_tkp = SimpleNamespace(
         PSTATMODE='PSTATMODE',
@@ -1116,18 +1199,7 @@ def test_collect_dpv_exports_raw_trace_before_derived_update(monkeypatch):
         lambda *args, **kwargs: {'time': [0.5], 'potential': [-0.975], 'current': [0.05]},
     )
     monkeypatch.setattr('AFL.automation.instrument.gamry_worker._summarize_dpv_timing', lambda *args, **kwargs: {})
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker._write_dpv_differential_text_export', lambda **kwargs: (None, None))
     monkeypatch.setattr('AFL.automation.instrument.gamry_worker.time.sleep', lambda *_args, **_kwargs: None)
-
-    def fake_write_raw_measurement_text_export(**kwargs):
-        captured['export_measurement_type'] = kwargs['measurement_type']
-        captured['export_data'] = kwargs['data']
-        return None
-
-    monkeypatch.setattr(
-        'AFL.automation.instrument.gamry_worker._write_raw_measurement_text_export',
-        fake_write_raw_measurement_text_export,
-    )
 
     result = collect_dpv(
         fake_tkp,
@@ -1148,75 +1220,26 @@ def test_collect_dpv_exports_raw_trace_before_derived_update(monkeypatch):
     )
 
     assert result['measurement_type'] == 'differential_pulse_voltammetry'
-    assert captured['export_measurement_type'] == 'differential_pulse_voltammetry'
-    assert captured['export_data'] == {'time': [0.0, 0.1], 'vf': [-1.0, -0.975], 'im': [0.1, 0.2]}
+    assert result['data'] == {'time': [0.5], 'potential': [-0.975], 'current': [0.05]}
+    assert 'text_export_path' not in result['parameters']
 
 
-def test_calculate_dpv_differential_current_uses_saved_raw_export(tmp_path):
-    raw_export_path = tmp_path / 'dpv_raw.txt'
-    raw_export_path.write_text(
-        'time_s\tvoltage_v\tcurrent_a\n'
-        '0.00\t-1.0\t0.10\n'
-        '0.20\t-1.0\t0.11\n'
-        '0.39\t-1.0\t0.12\n'
-        '0.41\t-0.975\t0.16\n'
-        '0.45\t-0.975\t0.17\n'
-        '0.49\t-0.975\t0.18\n'
-        '0.50\t-0.995\t0.14\n'
-        '0.70\t-0.995\t0.15\n'
-        '0.89\t-0.995\t0.16\n'
-        '0.91\t-0.97\t0.21\n'
-        '0.95\t-0.97\t0.22\n'
-        '0.99\t-0.97\t0.23\n',
-        encoding='utf-8',
+def test_calculate_dpv_differential_current_uses_in_memory_raw_data():
+    differential = _calculate_dpv_differential_current(
+        {
+            'time': [0.00, 0.20, 0.39, 0.41, 0.45, 0.49, 0.50, 0.70, 0.89, 0.91, 0.95, 0.99],
+            'vf': [-1.0, -1.0, -1.0, -0.975, -0.975, -0.975, -0.995, -0.995, -0.995, -0.97, -0.97, -0.97],
+            'im': [0.10, 0.11, 0.12, 0.16, 0.17, 0.18, 0.14, 0.15, 0.16, 0.21, 0.22, 0.23],
+        },
+        cycle_time=0.5,
+        pulse_time=0.1,
     )
-
-    differential = _calculate_dpv_differential_current(raw_export_path, cycle_time=0.5, pulse_time=0.1)
 
     assert differential['point_count'] == 2
     assert differential['skipped_cycles'] == 0
     assert differential['cycle_index'] == [0, 1]
     assert differential['voltage_v'] == [-1.0, -0.995]
     assert differential['diff_current_a'] == pytest.approx([0.05333333333333333, 0.07])
-
-
-def test_write_dpv_differential_text_export_writes_voltage_and_diff_current(tmp_path):
-    raw_export_path = tmp_path / 'dpv_raw.txt'
-    raw_export_path.write_text(
-        'time_s\tvoltage_v\tcurrent_a\n'
-        '0.00\t-1.0\t0.10\n'
-        '0.20\t-1.0\t0.11\n'
-        '0.39\t-1.0\t0.12\n'
-        '0.41\t-0.975\t0.16\n'
-        '0.45\t-0.975\t0.17\n'
-        '0.49\t-0.975\t0.18\n'
-        '0.50\t-0.995\t0.14\n'
-        '0.70\t-0.995\t0.15\n'
-        '0.89\t-0.995\t0.16\n'
-        '0.91\t-0.97\t0.21\n'
-        '0.95\t-0.97\t0.22\n'
-        '0.99\t-0.97\t0.23\n',
-        encoding='utf-8',
-    )
-
-    export_path, differential = _write_dpv_differential_text_export(
-        raw_export_path=raw_export_path,
-        instrument_name='PSTAT',
-        process_name='AFL_GamryDriver',
-        timestamp='2026-04-23T12:34:56+00:00',
-        cycle_time=0.5,
-        pulse_time=0.1,
-    )
-
-    assert export_path is not None
-    assert pathlib.Path(export_path).name == 'dpv_raw_diff.txt'
-    assert differential['point_count'] == 2
-    contents = pathlib.Path(export_path).read_text(encoding='utf-8').splitlines()
-    assert contents == [
-        'voltage_v\tdiff_current_a',
-        '-1\t0.0533333333333',
-        '-0.995\t0.07',
-    ]
 
 
 def test_summarize_dpv_timing_reports_observed_cycle_rate():

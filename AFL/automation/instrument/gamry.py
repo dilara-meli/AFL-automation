@@ -14,6 +14,8 @@ import numpy as np
 import xarray as xr
 from jinja2 import Template
 
+from AFL.automation.APIServer.data.DataPacket import DataPacket
+
 
 class GamryDriver(Driver):
     defaults = {}
@@ -475,6 +477,35 @@ class GamryDriver(Driver):
             **kwargs,
         )
 
+    @Driver.queued()
+    def enqueuePanelMeasurement(
+        self,
+        measurement_mode: Optional[str] = None,
+        instrument_name: Optional[str] = None,
+        **kwargs,
+    ):
+        mode = str(self.config['measurement_mode'] if measurement_mode is None else measurement_mode).lower()
+        task_name_by_mode = {
+            'cv': 'enqueuePanelMeasurement',
+            'ca': 'enqueuePanelMeasurement',
+            'sine': 'enqueuePanelMeasurement',
+            'dpv': 'enqueuePanelMeasurement',
+        }
+        step_name_by_mode = {
+            'cv': 'panel_cv',
+            'ca': 'panel_ca',
+            'sine': 'panel_sine',
+            'dpv': 'panel_dpv',
+        }
+        return self.runMeasurement(
+            measurement_mode=mode,
+            instrument_name=instrument_name,
+            return_data=True,
+            task_name=task_name_by_mode[mode],
+            step_name=step_name_by_mode[mode],
+            **kwargs,
+        )
+
     @Driver.unqueued()
     def runMeasurementNow(
         self,
@@ -489,6 +520,9 @@ class GamryDriver(Driver):
             **kwargs,
         )
         self._last_cv_dataset = dataset
+        if self.data is not None:
+            self.data['main_dataset'] = dataset
+            self.data.finalize()
         panel_result = self._build_panel_result(dataset)
         self._last_panel_result = panel_result
         return {
@@ -823,6 +857,10 @@ class GamryDriver(Driver):
         self.shutdownService()
         self._ensure_service()
 
+    def _sanitize_dataset_attrs(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        packet = DataPacket()
+        return packet._core_sanitize(attrs)
+
     def _dataset_from_measurement_response(
         self,
         response: Dict[str, Any],
@@ -841,29 +879,31 @@ class GamryDriver(Driver):
         point_count = min(x_values.size, y_values.size) if x_values.size and y_values.size else max(x_values.size, y_values.size)
         point_index = np.arange(point_count, dtype=int)
 
-        ds = xr.Dataset()
-        ds.attrs['mode'] = payload.get('mode', 'run_measurement')
-        ds.attrs['measurement_type'] = measurement_type
-        ds.attrs['instrument_name'] = payload.get('instrument_name', self.config['instrument_name'])
-        ds.attrs['process_name'] = payload.get('process_name', self.config['process_name'])
-        ds.attrs['timestamp'] = payload.get('timestamp', datetime.datetime.now(datetime.timezone.utc).isoformat())
-        ds.attrs['parameters'] = payload.get('parameters', {})
-        ds.attrs['point_count'] = int(point_count)
-        ds.attrs['x_key'] = x_key
-        ds.attrs['y_key'] = y_key
-        ds.attrs['measurement_mode'] = payload.get('measurement_mode', self.config['measurement_mode'])
+        attrs = {
+            'mode': payload.get('mode', 'run_measurement'),
+            'measurement_type': measurement_type,
+            'instrument_name': payload.get('instrument_name', self.config['instrument_name']),
+            'process_name': payload.get('process_name', self.config['process_name']),
+            'timestamp': payload.get('timestamp', datetime.datetime.now(datetime.timezone.utc).isoformat()),
+            'parameters': payload.get('parameters', {}),
+            'point_count': int(point_count),
+            'x_key': x_key,
+            'y_key': y_key,
+            'measurement_mode': payload.get('measurement_mode', self.config['measurement_mode']),
+        }
         if task_name is not None:
-            ds.attrs['task_name'] = task_name
+            attrs['task_name'] = task_name
         if step_name is not None:
-            ds.attrs['step_name'] = step_name
+            attrs['step_name'] = step_name
         if self.data is not None:
             sample_uuid = self.data.get('sample_uuid', None)
             sample_name = self.data.get('sample_name', None)
             if sample_uuid is not None:
-                ds.attrs['sample_uuid'] = sample_uuid
+                attrs['sample_uuid'] = sample_uuid
             if sample_name is not None:
-                ds.attrs['sample_name'] = sample_name
+                attrs['sample_name'] = sample_name
 
+        ds = xr.Dataset(attrs=self._sanitize_dataset_attrs(attrs))
         ds['point'] = ('point', point_index)
         if x_values.size:
             ds[x_key] = ('point', x_values[:point_count])
@@ -1095,108 +1135,36 @@ class GamryDriver(Driver):
                 payload['data'][name] = dataset.coords[name].values.tolist()
         return payload
 
-    def _load_measurement_text_export(self, export_path: Any, measurement_type: str) -> Dict[str, Any]:
-        path = pathlib.Path(str(export_path)).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f'Measurement text export not found: {path}')
-
-        time_values = []
-        voltage_values = []
-        current_values = []
-        with path.open('r', encoding='utf-8', newline='') as handle:
-            reader = csv.DictReader(handle, delimiter='\t')
-            expected_columns = {'time_s', 'voltage_v', 'current_a'}
-            if reader.fieldnames is None or set(reader.fieldnames) != expected_columns:
-                raise ValueError(f'Measurement text export has unexpected columns: {reader.fieldnames}')
-            for row in reader:
-                time_values.append(float(row['time_s']))
-                voltage_values.append(float(row['voltage_v']))
-                current_values.append(float(row['current_a']))
-
-        point_count = min(len(time_values), len(voltage_values), len(current_values))
-        return {
-            'attrs': {
-                'measurement_type': measurement_type,
-                'x_key': 'voltage_v',
-                'y_key': 'current_a',
-                'point_count': point_count,
-                'text_export_path': str(path),
-                'text_export_name': path.name,
-                'plot_source': 'text_export',
-            },
-            'plot_data': {
-                'time_s': time_values[:point_count],
-                'voltage_v': voltage_values[:point_count],
-                'current_a': current_values[:point_count],
-            },
-            'dims': {'point': point_count},
-        }
-
-    def _load_dpv_differential_text_export(self, export_path: Any) -> Dict[str, Any]:
-        path = pathlib.Path(str(export_path)).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f'DPV differential text export not found: {path}')
-
-        voltage_values = []
-        differential_current_values = []
-        with path.open('r', encoding='utf-8', newline='') as handle:
-            reader = csv.DictReader(handle, delimiter='\t')
-            expected_columns = {'voltage_v', 'diff_current_a'}
-            if reader.fieldnames is None or set(reader.fieldnames) != expected_columns:
-                raise ValueError(f'DPV differential text export has unexpected columns: {reader.fieldnames}')
-            for row in reader:
-                voltage_values.append(float(row['voltage_v']))
-                differential_current_values.append(float(row['diff_current_a']))
-
-        point_count = min(len(voltage_values), len(differential_current_values))
-        return {
-            'attrs': {
-                'measurement_type': 'differential_pulse_voltammetry',
-                'x_key': 'voltage_v',
-                'y_key': 'diff_current_a',
-                'point_count': point_count,
-                'text_export_path': str(path),
-                'text_export_name': path.name,
-                'plot_source': 'text_export',
-                'plot_variant': 'dpv_differential',
-            },
-            'plot_data': {
-                'voltage_v': voltage_values[:point_count],
-                'diff_current_a': differential_current_values[:point_count],
-            },
-            'dims': {'point': point_count},
-        }
-
     def _build_panel_result(self, dataset: Optional[xr.Dataset]) -> Optional[Dict[str, Any]]:
         serialized = self._serialize_dataset(dataset)
         if serialized is None:
             return None
 
-        attrs = serialized.get('attrs', {})
-        parameters = dataset.attrs.get('parameters', {}) if dataset is not None else {}
-        export_path = None
-        diff_export_path = None
-        if isinstance(parameters, dict):
-            export_path = parameters.get('text_export_path')
-            diff_export_path = parameters.get('dpv_diff_export_path')
-
+        attrs = dict(serialized.get('attrs', {}))
+        data = serialized.get('data', {})
         measurement_type = str(attrs.get('measurement_type', 'measurement'))
-        if measurement_type == 'differential_pulse_voltammetry' and diff_export_path:
-            panel_result = self._load_dpv_differential_text_export(diff_export_path)
-            raw_export_name = pathlib.Path(str(export_path)).expanduser().name if export_path else None
-            if raw_export_name is not None:
-                panel_result['attrs']['raw_text_export_name'] = raw_export_name
-            if export_path is not None:
-                panel_result['attrs']['raw_text_export_path'] = str(pathlib.Path(str(export_path)).expanduser())
-        else:
-            if not export_path:
-                return serialized
-            panel_result = self._load_measurement_text_export(export_path, measurement_type)
+        plot_data: Dict[str, Any] = {}
 
-        for key, value in attrs.items():
-            if key not in panel_result['attrs']:
-                panel_result['attrs'][key] = value
-        return panel_result
+        if 'time' in data:
+            plot_data['time_s'] = data['time']
+        if 'potential' in data:
+            plot_data['voltage_v'] = data['potential']
+        if 'current' in data:
+            if measurement_type == 'differential_pulse_voltammetry':
+                plot_data['diff_current_a'] = data['current']
+            else:
+                plot_data['current_a'] = data['current']
+
+        attrs['plot_source'] = 'dataset'
+        if measurement_type == 'differential_pulse_voltammetry':
+            attrs['plot_variant'] = 'dpv_differential'
+
+        return {
+            'attrs': attrs,
+            'data': data,
+            'plot_data': plot_data,
+            'dims': serialized.get('dims', {}),
+        }
 
 
 _DEFAULT_CUSTOM_CONFIG = {

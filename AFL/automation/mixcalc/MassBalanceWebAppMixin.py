@@ -12,10 +12,9 @@ class MassBalanceWebAppMixin:
     def mixdoctor(self, **kwargs):
         from jinja2 import Template
         base = pathlib.Path(__file__).parent.parent / "apps" / "mixdoctor"
-        html = Template((base / "mixdoctor.html").read_text())
-        css = (base / "css" / "style.css").read_text()
-        plotly = (base / "js" / "plotly.min.js").read_text(encoding='utf-8')
-        js = (base / "js" / "main.js").read_text()
+        html = Template((base / "mixdoctor.html").read_text(encoding='utf-8'))
+        css = (base / "css" / "style.css").read_text(encoding='utf-8')
+        js = (base / "js" / "main.js").read_text(encoding='utf-8')
         return html.render(inline_css=css, inline_js=js)
 
     @staticmethod

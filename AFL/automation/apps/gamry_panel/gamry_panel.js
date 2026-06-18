@@ -53,6 +53,8 @@
         return payload;
     }
 
+    let authToken = null;
+
     async function callDriver(route, payload) {
         const params = new URLSearchParams(Object.assign({ r: route }, payload || {}));
         const response = await fetch('/query_driver?' + params.toString(), {
@@ -71,6 +73,44 @@
             throw new Error(message);
         }
         return parsed;
+    }
+
+    async function ensureAuthToken() {
+        if (authToken) {
+            return authToken;
+        }
+        const response = await fetch('/login', {
+            method: 'POST',
+            headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ username: 'gamry_panel', password: 'domo_arigato' }),
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.token) {
+            throw new Error(payload.msg || 'Unable to authenticate panel queue request');
+        }
+        authToken = payload.token;
+        return authToken;
+    }
+
+    async function enqueueDriver(task) {
+        const token = await ensureAuthToken();
+        const response = await fetch('/enqueue', {
+            method: 'POST',
+            headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+                Authorization: 'Bearer ' + token,
+            },
+            body: JSON.stringify(task),
+        });
+        const text = await response.text();
+        if (!response.ok) {
+            throw new Error(text || ('Enqueue failed with status ' + response.status));
+        }
+        return { status: 'ok', task_uuid: text.trim() };
     }
 
     function updateStatus(service) {
@@ -254,11 +294,11 @@
     function drawPlot(result) {
         const attrs = result && result.attrs ? result.attrs : {};
         const plotData = result && result.plot_data ? result.plot_data : null;
-        if (attrs.plot_source === 'text_export') {
-            const voltage = plotData && Array.isArray(plotData.voltage_v) ? plotData.voltage_v : [];
-            const current = plotData && Array.isArray(plotData.current_a) ? plotData.current_a : [];
-            const time = plotData && Array.isArray(plotData.time_s) ? plotData.time_s : [];
-            const differentialCurrent = plotData && Array.isArray(plotData.diff_current_a) ? plotData.diff_current_a : [];
+        if (plotData) {
+            const voltage = Array.isArray(plotData.voltage_v) ? plotData.voltage_v : [];
+            const current = Array.isArray(plotData.current_a) ? plotData.current_a : [];
+            const time = Array.isArray(plotData.time_s) ? plotData.time_s : [];
+            const differentialCurrent = Array.isArray(plotData.diff_current_a) ? plotData.diff_current_a : [];
             const measurementType = attrs.measurement_type || '';
             if (measurementType === 'differential_pulse_voltammetry') {
                 drawSeriesPlot(primaryCanvas, primaryContext, voltage, differentialCurrent, 'Voltage (V)', 'Differential Current (A)', 'No differential-current data to plot yet.', '#0f766e');
@@ -279,7 +319,7 @@
     function renderResult(result) {
         if (!result) {
             resultSummary.textContent = 'No run yet.';
-            resultSource.textContent = 'Source file: none';
+            resultSource.textContent = 'Plot source: none';
             setOutput(resultOutput, 'No result yet.');
             drawPlot(null);
             return;
@@ -287,16 +327,12 @@
         const attrs = result.attrs || {};
         const measurementType = attrs.measurement_type || 'measurement';
         resultSummary.textContent = measurementType + ' | ' + (attrs.instrument_name || 'Unknown instrument') + ' | ' + (attrs.point_count || 0) + ' points';
-        resultSource.textContent = 'Source file: ' + (attrs.text_export_name || attrs.text_export_path || 'none');
+        resultSource.textContent = 'Plot source: ' + (attrs.plot_source || 'dataset');
         setOutput(resultOutput, {
             measurement_type: measurementType,
             instrument_name: attrs.instrument_name || 'Unknown instrument',
-            text_export_path: attrs.text_export_path || null,
-            text_export_name: attrs.text_export_name || null,
-            raw_text_export_path: attrs.raw_text_export_path || null,
-            raw_text_export_name: attrs.raw_text_export_name || null,
             point_count: attrs.point_count || 0,
-            plot_source: attrs.plot_source || 'none',
+            plot_source: attrs.plot_source || 'dataset',
             plot_variant: attrs.plot_variant || null,
         });
         drawPlot(result);
@@ -328,6 +364,17 @@
             if (result.result) {
                 renderResult(result.result);
             }
+        } catch (error) {
+            setOutput(outputElement, { status: 'error', message: String(error) });
+        }
+    }
+
+    async function enqueueMeasurement(payload, outputElement) {
+        outputElement.textContent = 'Queueing...';
+        try {
+            const result = await enqueueDriver(Object.assign({ task_name: 'enqueuePanelMeasurement' }, payload));
+            setOutput(outputElement, result);
+            await refreshState();
         } catch (error) {
             setOutput(outputElement, { status: 'error', message: String(error) });
         }
@@ -366,7 +413,7 @@
         runAction('updatePanelConfig', getFormPayload(), serviceOutput);
     });
     document.getElementById('run-measurement').addEventListener('click', function () {
-        runAction('runMeasurementNow', getFormPayload(), resultOutput);
+        enqueueMeasurement(getFormPayload(), resultOutput);
     });
 
     updateModeVisibility();
