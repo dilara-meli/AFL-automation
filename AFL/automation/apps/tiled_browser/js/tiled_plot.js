@@ -105,8 +105,31 @@ function toNumericArray(values) {
     });
 }
 
-function preferredXColumn(columns) {
-    const preferences = ['q', 'Q', 'SAXS_q', 'USAXS_q', 'x', 'index'];
+function preferredXColumn(columns, metadata = {}) {
+    const measurementType = String(resolveMeta(metadata, 'measurement_type') || '').toLowerCase();
+    const modePreferences = {
+        dpv: ['potential_v', 'voltage_v', 'potential', 'voltage', 'time_s', 'time', 'elapsed_time_s', 'elapsed_time'],
+        cv: ['potential_v', 'voltage_v', 'potential', 'voltage', 'time_s', 'time', 'elapsed_time_s', 'elapsed_time'],
+        sine: ['time_s', 'time', 'elapsed_time_s', 'elapsed_time', 'potential_v', 'voltage_v', 'potential', 'voltage'],
+        ca: ['time_s', 'time', 'elapsed_time_s', 'elapsed_time', 'potential_v', 'voltage_v', 'potential', 'voltage']
+    };
+    const defaultPreferences = [
+        'time_s',
+        'time',
+        'elapsed_time_s',
+        'elapsed_time',
+        'potential_v',
+        'voltage_v',
+        'potential',
+        'voltage',
+        'q',
+        'Q',
+        'SAXS_q',
+        'USAXS_q',
+        'x',
+        'index'
+    ];
+    const preferences = modePreferences[measurementType] || defaultPreferences;
     for (const name of preferences) {
         if (columns.includes(name)) return name;
     }
@@ -595,26 +618,66 @@ async function updateVariableOptions() {
     } else {
         await ensureEntryDataLoaded(firstEntry);
         const numericCols = firstEntry.numericColumns || [];
-        AppState.xVariable = preferredXColumn(numericCols);
         variableOptions = numericCols
-            .filter(c => c !== AppState.xVariable)
             .map(name => ({ name, mode: 'line', classification: 'line_1d' }));
         maxIndex = Math.max(AppState.entries.length - 1, 0);
     }
 
     const scatterSelect = document.getElementById('scatter-vars');
+    const xAxisSelect = document.getElementById('x-axis-select');
     scatterSelect.innerHTML = '';
-    variableOptions.forEach((optionInfo, idx) => {
-        const option = document.createElement('option');
-        option.value = optionInfo.name;
-        option.textContent = optionInfo.mode === 'image'
-            ? `${optionInfo.name} [image]`
-            : optionInfo.name;
-        option.dataset.mode = optionInfo.mode;
-        option.dataset.classification = optionInfo.classification;
-        if (idx === 0) option.selected = true;
-        scatterSelect.appendChild(option);
-    });
+    xAxisSelect.innerHTML = '';
+
+    if (!useManifest && firstEntry.structureFamily !== 'container') {
+        const numericCols = firstEntry.numericColumns || [];
+        const preferredX = preferredXColumn(numericCols, firstEntry.metadata || {});
+        const nextX = numericCols.includes(AppState.xVariable) ? AppState.xVariable : preferredX;
+        AppState.xVariable = nextX;
+
+        numericCols.forEach(name => {
+            const xOption = document.createElement('option');
+            xOption.value = name;
+            xOption.textContent = name;
+            xOption.selected = name === AppState.xVariable;
+            xAxisSelect.appendChild(xOption);
+        });
+
+        variableOptions.forEach((optionInfo) => {
+            const option = document.createElement('option');
+            option.value = optionInfo.name;
+            option.textContent = optionInfo.name;
+            option.dataset.mode = optionInfo.mode;
+            option.dataset.classification = optionInfo.classification;
+            option.selected = AppState.scatterVariables.includes(optionInfo.name)
+                ? true
+                : optionInfo.name !== AppState.xVariable && AppState.scatterVariables.length === 0;
+            scatterSelect.appendChild(option);
+        });
+    } else {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Auto';
+        placeholder.selected = true;
+        xAxisSelect.appendChild(placeholder);
+        xAxisSelect.disabled = true;
+
+        variableOptions.forEach((optionInfo, idx) => {
+            const option = document.createElement('option');
+            option.value = optionInfo.name;
+            option.textContent = optionInfo.mode === 'image'
+                ? `${optionInfo.name} [image]`
+                : optionInfo.name;
+            option.dataset.mode = optionInfo.mode;
+            option.dataset.classification = optionInfo.classification;
+            if (idx === 0) option.selected = true;
+            scatterSelect.appendChild(option);
+        });
+    }
+
+    if (!(!useManifest && firstEntry.structureFamily !== 'container')) {
+        AppState.xVariable = null;
+    }
+    xAxisSelect.disabled = useManifest || firstEntry.structureFamily === 'container';
     AppState.scatterVariables = Array.from(scatterSelect.selectedOptions).map(opt => opt.value);
 
     const compSelect = document.getElementById('composition-var');
@@ -995,6 +1058,7 @@ async function renderScatteringPlot() {
         return;
     }
 
+    const yAxisTitle = selected.length === 1 ? selected[0] : 'value';
     Plotly.react('scattering-plot', traces, {
         xaxis: {
             title: AppState.xVariable || 'x',
@@ -1002,7 +1066,7 @@ async function renderScatteringPlot() {
             range: AppState.logX ? [Math.log10(AppState.xmin), Math.log10(AppState.xmax)] : [AppState.xmin, AppState.xmax]
         },
         yaxis: {
-            title: 'value',
+            title: yAxisTitle,
             type: AppState.logY ? 'log' : 'linear'
         },
         autosize: true,
@@ -1331,6 +1395,11 @@ function initializeEventListeners() {
 
     document.getElementById('scatter-vars').addEventListener('change', (e) => {
         AppState.scatterVariables = Array.from(e.target.selectedOptions).map(opt => opt.value);
+        renderScatteringPlot();
+    });
+
+    document.getElementById('x-axis-select').addEventListener('change', (e) => {
+        AppState.xVariable = e.target.value || null;
         renderScatteringPlot();
     });
 

@@ -889,19 +889,16 @@ def collect_dpv(tkp, instrument_name, process_name, parameters):
             timing_summary = _summarize_dpv_timing(derived_trace, max_cycles, cycle_time)
             normalized.update(timing_summary)
             _log_worker_event('dpv_timing_summary', **timing_summary)
-            normalized['dpv_diff_point_count'] = int(len(derived_trace.get('current', [])))
-            normalized['dpv_diff_skipped_cycles'] = int(max(0, max_cycles - len(derived_trace.get('current', []))))
-            dpv_data = derived_trace
         else:
             _log_worker_event('dpv_derived_trace_empty')
-            differential_trace = _calculate_dpv_differential_current(raw_data, normalized['sample_period'], normalized['pulse_time'])
-            normalized['dpv_diff_point_count'] = int(differential_trace['point_count'])
-            normalized['dpv_diff_skipped_cycles'] = int(differential_trace['skipped_cycles'])
-            dpv_data = {
-                'potential': differential_trace['voltage_v'],
-                'current': differential_trace['diff_current_a'],
-                'cycle_index': differential_trace['cycle_index'],
-            }
+
+        differential_trace = _calculate_dpv_differential_current(raw_data, normalized['sample_period'], normalized['pulse_time'])
+        normalized['dpv_diff_point_count'] = int(differential_trace['point_count'])
+        normalized['dpv_diff_skipped_cycles'] = int(differential_trace['skipped_cycles'])
+        dpv_data = {
+            'potential': differential_trace['voltage_v'],
+            'current': differential_trace['diff_current_a'],
+        }
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
         return {
             'mode': 'run_measurement',

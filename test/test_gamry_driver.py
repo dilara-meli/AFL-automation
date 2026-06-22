@@ -182,10 +182,6 @@ def test_run_measurement_builds_dpv_dataset(monkeypatch, driver):
                     'data': {
                         'potential': [0.025, 0.03],
                         'current': [0.06, 0.08],
-                        'base_current': [0.11, 0.13],
-                        'pulse_current': [0.17, 0.21],
-                        'applied_signal': [0.025, 0.03],
-                        'time': [0.50, 1.00],
                     },
                 },
             }
@@ -201,9 +197,7 @@ def test_run_measurement_builds_dpv_dataset(monkeypatch, driver):
     assert dataset.attrs['measurement_type'] == 'differential_pulse_voltammetry'
     assert np.allclose(dataset['potential'].values, [0.025, 0.03])
     assert np.allclose(dataset['current'].values, [0.06, 0.08])
-    assert np.allclose(dataset['base_current'].values, [0.11, 0.13])
-    assert np.allclose(dataset['pulse_current'].values, [0.17, 0.21])
-    assert np.allclose(dataset['applied_signal'].values, [0.025, 0.03])
+    assert set(dataset.data_vars) == {'potential', 'current'}
     assert root.calls[0][0] == 'run_measurement'
     assert root.calls[0][3] == 'dpv'
     assert root.calls[0][4]['pulse_size'] == driver.config['dpv_pulse_size']
@@ -739,8 +733,6 @@ def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver):
                     'data': {
                         'potential': [0.025, 0.03],
                         'current': [0.06, 0.08],
-                        'time': [0.50, 1.00],
-                        'cycle_index': [0, 1],
                     },
                 },
             }
@@ -1196,7 +1188,19 @@ def test_collect_dpv_returns_derived_trace_without_text_exports(monkeypatch):
     )
     monkeypatch.setattr(
         'AFL.automation.instrument.gamry_worker._derive_dpv_trace',
-        lambda *args, **kwargs: {'time': [0.5], 'potential': [-0.975], 'current': [0.05]},
+        lambda *args, **kwargs: {
+            'time': [0.5, 1.0, 1.5],
+            'potential': [-0.975, -0.970, -0.965],
+            'current': [0.05, 0.06, 0.07],
+        },
+    )
+    monkeypatch.setattr(
+        'AFL.automation.instrument.gamry_worker._curve_data_to_lists',
+        lambda data: {
+            'time': [0.00, 0.20, 0.39, 0.41, 0.45, 0.49, 0.50, 0.70, 0.89, 0.91, 0.95, 0.99],
+            'vf': [-1.0, -1.0, -1.0, -0.975, -0.975, -0.975, -0.995, -0.995, -0.995, -0.97, -0.97, -0.97],
+            'im': [0.10, 0.11, 0.12, 0.16, 0.17, 0.18, 0.14, 0.15, 0.16, 0.21, 0.22, 0.23],
+        },
     )
     monkeypatch.setattr('AFL.automation.instrument.gamry_worker._summarize_dpv_timing', lambda *args, **kwargs: {})
     monkeypatch.setattr('AFL.automation.instrument.gamry_worker.time.sleep', lambda *_args, **_kwargs: None)
@@ -1220,7 +1224,11 @@ def test_collect_dpv_returns_derived_trace_without_text_exports(monkeypatch):
     )
 
     assert result['measurement_type'] == 'differential_pulse_voltammetry'
-    assert result['data'] == {'time': [0.5], 'potential': [-0.975], 'current': [0.05]}
+    assert result['data'] == {
+        'potential': [-1.0, -0.995],
+        'current': pytest.approx([0.05333333333333333, 0.07]),
+    }
+    assert result['parameters']['dpv_diff_point_count'] == 2
     assert 'text_export_path' not in result['parameters']
 
 
