@@ -8,8 +8,6 @@ import time
 
 import numpy as np
 
-import math
-
 class PneumaticPressureSampleCell(Driver,SampleCell):
     '''
         Class for a sample cell consisting of a push-through, pneumatically-closed sample loader.
@@ -37,6 +35,7 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
     defaults['external_load_complete_trigger'] = False
     defaults['ramp_load_stop_pressure'] = 7
     defaults['ramp_load_duration'] = 20
+    defaults['enforce_door_closed'] = True
 
     def __init__(self,pctrl,
                       relayboard,
@@ -173,9 +172,26 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
                 status.extend(ls.status())
             
         return status
+
+    def _log(self, level, message):
+        if self.app is not None and hasattr(self.app, 'logger'):
+            log_method = getattr(self.app.logger, level, None)
+            if log_method is not None:
+                log_method(message)
+                return
+        print(f'[{level.upper()}] {message}')
+
+    def log_warning(self, message):
+        self._log('warning', message)
+
+    def log_info(self, message):
+        self._log('info', message)
  
     def _arm_interlock_check(self):
         if self._USE_DOOR_INTERLOCK:
+            if not self.config['enforce_door_closed']:
+                self.log_warning('Door-closed interlock check is disabled; moving arm without verifying the door is closed.')
+                return
             oldstate = self.state
             while self._door_state():
                 time.sleep(0.2)
@@ -409,8 +425,8 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
     def set_sensor_config(self,**kwargs):
         if self.load_stopper is not None:
             if 'sensor_n' in kwargs:
-                self.load_stopper[kwargs[sensor_n]].update(kwargs)
-                self.load_stopper[kwargs[sensor_n]].reset()                        
+                self.load_stopper[kwargs['sensor_n']].update(kwargs)
+                self.load_stopper[kwargs['sensor_n']].reset()                        
             else: # assume it should apply to all
                 for ls in self.load_stopper:
                     ls.config.update(kwargs)
@@ -442,7 +458,7 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
                 for ls in self.load_stopper:
                     ls.reset_poll()
                     ls.reset_stopper()
-                    if ls_app is not None:
+                    if ls._app is not None:
                         ls.poll.app = self._app
                         ls.stopper.app = self._app
                     if ls._data is not None:
