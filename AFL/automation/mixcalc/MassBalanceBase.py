@@ -6,7 +6,7 @@ from typing import List, Optional, Dict, Set, Callable, Any, Iterator
 import numpy as np
 from scipy.optimize import lsq_linear, Bounds
 
-from AFL.automation.mixcalc.PipetteAction import PipetteAction
+from AFL.automation.prepare.PipetteAction import PipetteAction
 from AFL.automation.mixcalc.Solution import Solution
 from AFL.automation.mixcalc.BalanceDiagnosis import BalanceDiagnosis, FailureCode, FailureDetail
 
@@ -80,6 +80,7 @@ def _make_balanced_target(mass_transfers, target):
                 source=stock.location,
                 dest=target.location,
                 volume=measured.volume.to('ul').magnitude,
+                tip_location=getattr(stock, 'tip_location', None),
             )
         )
     balanced_target.name = target.name + "-balanced"

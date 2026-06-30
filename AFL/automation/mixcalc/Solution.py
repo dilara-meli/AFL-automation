@@ -19,6 +19,7 @@ from AFL.automation.shared.units import (
     AVOGADROS_NUMBER,
 )
 from AFL.automation.shared.warnings import MixWarning
+from AFL.automation.shared.utilities import listify
 
 SANITY_MSG = """
 Solution Check:
@@ -34,6 +35,33 @@ class Solution(Context):
     _stack_name = "stocks"
     _component_init_keys = {'name', 'mass', 'volume', 'density', 'formula', 'sld', 'uid', 'solute'}
 
+    @staticmethod
+    def _tip_locations_as_list(tip_value):
+        if tip_value is None:
+            return None
+        normalized = []
+        for location in listify(tip_value):
+            if location is None:
+                continue
+            if not isinstance(location, str):
+                raise TypeError(
+                    f"Tip location must be a string or list of strings, got {type(location).__name__}"
+                )
+            location = location.strip().upper()
+            if location and location not in normalized:
+                normalized.append(location)
+        if not normalized:
+            return None
+        return normalized
+
+    @staticmethod
+    def _collapse_tip_locations(tip_locations):
+        if tip_locations is None:
+            return None
+        if len(tip_locations) == 1:
+            return tip_locations[0]
+        return tip_locations
+
     def __init__(
         self,
         name: str,
@@ -47,6 +75,8 @@ class Solution(Context):
         molarities: Optional[Dict] = None,
         molalities: Optional[Dict] = None,
         location: Optional[str] = None,
+        tip: Optional[str | List[str]] = None,
+        tip_location: Optional[str | List[str]] = None,
         solutes: Optional[List[str]] = None,
         sanity_check: Optional[bool] = True,
     ):
@@ -79,6 +109,11 @@ class Solution(Context):
             A dictionary of component molalities (moles per kilogram of solvent).
         location : str, optional
             The location of the solution on the robot. Usually a deck location e.g., '1A1'.
+        tip : str or list[str], optional
+            Optional tip location or ordered tip-location list associated with this stock,
+            e.g. '6A4' or ['6A4', '9A4'].
+        tip_location : str or list[str], optional
+            Alias for ``tip``.
         solutes : list of str, optional
             A list of solute names. If set, the components will be initialized as solutes and they won't contribute
             to the volume of the solution
@@ -98,6 +133,24 @@ class Solution(Context):
         super().__init__(name=name)
         self.context_type = "Solution"
         self.location = location
+        normalized_tip = self._tip_locations_as_list(tip)
+        normalized_tip_location = self._tip_locations_as_list(tip_location)
+        if (
+            normalized_tip is not None
+            and normalized_tip_location is not None
+            and normalized_tip != normalized_tip_location
+        ):
+            raise ValueError(
+                f"Received conflicting tip values: tip={tip!r}, tip_location={tip_location!r}"
+            )
+        resolved_tip = (
+            normalized_tip_location
+            if normalized_tip_location is not None
+            else normalized_tip
+        )
+        resolved_tip = self._collapse_tip_locations(resolved_tip)
+        self.tip = resolved_tip
+        self.tip_location = resolved_tip
         self.protocol = None
         self.components: Dict = {}
         self.add_self_to_context()
@@ -451,6 +504,8 @@ class Solution(Context):
     def to_dict(self):
         out_dict = {
             "name": self.name,
+            "location": self.location,
+            "tip": self.tip,
             "components": list(self.components.keys()),
             "masses": {},
         }
@@ -512,6 +567,8 @@ class Solution(Context):
         solution = Solution(name=name if name is not None else self.name)
         solution.context_type = self.context_type
         solution.location = self.location
+        solution.tip = copy.deepcopy(self.tip)
+        solution.tip_location = copy.deepcopy(self.tip_location)
         solution.protocol = self.protocol
         solution.components = {name: component.copy() for name, component in self.components.items()}
         return solution
