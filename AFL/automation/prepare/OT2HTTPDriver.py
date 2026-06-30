@@ -282,7 +282,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         load_name = labware_def.get("parameters", {}).get("loadName")
         if not load_name:
             raise ValueError("labware_def missing parameters.loadName")
-        return ns, load_name, f"{ns}/{load_name}"
+        return namespace, load_name, f"{namespace}/{load_name}"
 
     def _canonical_labware_def(self, labware_def):
         """Return a normalized copy of a labware definition for hashing.
@@ -368,8 +368,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         pathlib.Path
             Destination JSON path in the user custom-labware directory.
         """
-        _, _, key = self._custom_labware_key(labware_def)
-        return self.custom_labware_dir / f"{key}.json"
+        _, load_name, _ = self._custom_labware_key(labware_def)
+        return self.custom_labware_dir / f"{load_name}.json"
 
     def _loaded_labware_key(self, labware_info):
         """Derive a ``namespace/load_name`` key from persisted labware metadata.
@@ -384,9 +384,12 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         str or None
             Derived key when enough metadata is available.
         """
-        if not isinstance(labware_info, tuple) or len(labware_info) < 3:
+        if not isinstance(labware_info, tuple) or len(labware_info) < 2:
             return None
-        namespace, load_name, _ = labware_info
+        load_name = labware_info[1]
+        result = labware_info[2] if len(labware_info) >= 3 else {}
+        definition = result.get("definition", {}) if isinstance(result, dict) else {}
+        namespace = definition.get("namespace", "custom_beta")
         return namespace, load_name
 
     def _remap_tip_availability(self, old_uuid_to_slot, slot_to_new_tiprack_uuid):
@@ -428,24 +431,27 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         bool
             ``True`` when reload succeeds or no reload is needed.
         """
-        _, _, key = self._custom_labware_key(labware_def)
+        namespace, load_name, key = self._custom_labware_key(labware_def)
         matching_slots = []
         original_labware = copy.deepcopy(self.config["loaded_labware"])
 
-        for slot, (labware_id, name, labware_data) in original_labware.items():
-            loaded_namespace, loaded_name = self._loaded_labware_key(name, labware_data)
+        for slot, labware_info in original_labware.items():
+            loaded_key = self._loaded_labware_key(labware_info)
+            if loaded_key is None:
+                continue
+            loaded_namespace, loaded_name = loaded_key
             if loaded_namespace == namespace and loaded_name == load_name:
                 matching_slots.append(str(slot))
 
         if not matching_slots:
-            return
+            return False
 
         if run_id is None:
             run_id = self._ensure_run_exists(check_run_status=check_run_status)
 
         original_instruments = copy.deepcopy(self.config["loaded_instruments"])
-        old_available_tips = copy.deepcopy(self.config.get("available_tips", {}))
         old_uuid_to_slot = {}
+        slot_to_new_tiprack_uuid = {}
         affected_mounts = {}
 
         for mount, instrument in original_instruments.items():
@@ -469,13 +475,14 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             self.log_info(
                 f"Reloading active labware '{namespace}/{load_name}' in slot {slot}"
             )
-            self.load_labware(
+            new_labware_id = self.load_labware(
                 f"{namespace}/{load_name}",
                 slot,
                 module=module_id,
                 labware_json=labware_def,
                 check_run_status=False,
             )
+            slot_to_new_tiprack_uuid[str(slot)] = new_labware_id
 
         for mount, instrument in affected_mounts.items():
             self.log_info(
@@ -488,12 +495,15 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 reload=True,
                 check_run_status=False,
             )
-            self._remap_tip_availability(mount, old_available_tips, old_uuid_to_slot)
+
+        if slot_to_new_tiprack_uuid:
+            self._remap_tip_availability(old_uuid_to_slot, slot_to_new_tiprack_uuid)
 
         if affected_mounts:
             self.has_tip = False
             self.last_pipette = None
             self.current_tip = None
+        return True
 
     def _initialize_robot(self):
         """Probe robot connectivity and refresh attached pipette metadata.
@@ -975,6 +985,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         # Persist the definition for future use
         self.custom_labware_dir.mkdir(parents=True, exist_ok=True)
         file_path = self._custom_labware_file_path(labware_def)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, "w") as f:
             json.dump(labware_def, f, indent=2)
         self._load_custom_labware_defs()
@@ -1751,10 +1762,25 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
         pipette = self.get_pipette(volume_ul)
         pipette_mount = pipette["mount"]
-        resolved_tip_rack_offset = self._resolve_tip_rack_offset(tip_rack_offset)
+        resolve_tip_rack_offset = getattr(self, "_resolve_tip_rack_offset", None)
+        if resolve_tip_rack_offset is not None:
+            resolved_tip_rack_offset = resolve_tip_rack_offset(tip_rack_offset)
+        elif tip_rack_offset is None:
+            resolved_tip_rack_offset = dict(self.config.get("tip_rack_offset", {"x": 0, "y": 0, "z": 0}))
+        else:
+            resolved_tip_rack_offset = dict(tip_rack_offset)
         requested_tip = None
         if tip_location is not None:
-            requested_tip = self._resolve_tip_location(pipette_mount, tip_location)
+            tip_location_str = str(tip_location).strip().upper()
+            resolve_tip_location = getattr(self, "_resolve_tip_location", None)
+            if resolve_tip_location is not None:
+                requested_tip = resolve_tip_location(pipette_mount, tip_location_str)
+            else:
+                requested_tip = {
+                    "labware_id": self.config["loaded_labware"][str(tip_location_str[0])][0],
+                    "well_name": tip_location_str[1:],
+                }
+            requested_tip["location"] = tip_location_str
 
         pipette_id = None
         for mount, data in self.pipette_info.items():
@@ -1785,7 +1811,11 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         elif to_center:
             dest_position = "center"
 
-        transfers = self._split_up_transfers(volume_ul)
+        split_up_transfers = getattr(self, "_split_up_transfers", None)
+        if split_up_transfers is not None:
+            transfers = split_up_transfers(volume_ul)
+        else:
+            transfers = [volume_ul]
         transfer_record = {
             "source": source,
             "dest": dest,
@@ -1916,16 +1946,17 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     "wellLocation": None,
                 }
                 if requested_tip is not None:
-                    pick_up_params.update(
-                        {
-                            "labwareId": requested_tip["labware_id"],
-                            "wellName": requested_tip["well_name"],
-                            "wellLocation": {
-                                "origin": "top",
-                                "offset": dict(resolved_tip_rack_offset),
-                            },
-                        }
-                    )
+                    pick_up_params["wellLocation"] = {
+                        "origin": "top",
+                        "offset": dict(resolved_tip_rack_offset),
+                    }
+                    if hasattr(self, "_reserve_tip"):
+                        pick_up_params.update(
+                            {
+                                "labwareId": requested_tip["labware_id"],
+                                "wellName": requested_tip["well_name"],
+                            }
+                        )
                 self._execute_atomic_command(
                     "pickUpTip",
                     pick_up_params,
@@ -2186,6 +2217,128 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             self.last_pipette = pipette_mount
         transfer_record["subtransfer_count"] = len(transfer_record["subtransfers_ul"])
         return transfer_record
+
+    def _split_up_transfers(self, volume):
+        """Split a requested transfer volume into pipette-safe subtransfers.
+
+        Parameters
+        ----------
+        volume : float
+            Requested transfer volume in microliters.
+
+        Returns
+        -------
+        list of float
+            One or more subtransfer volumes.
+        """
+        volume_ul = float(volume)
+        if volume_ul <= 0:
+            return []
+        if self.max_transfer is None or volume_ul <= self.max_transfer:
+            return [volume_ul]
+
+        transfers = []
+        remaining = volume_ul
+        while remaining > 0:
+            sub_volume = min(self.max_transfer, remaining)
+            transfers.append(float(sub_volume))
+            remaining -= sub_volume
+        return transfers
+
+    def _resolve_tip_rack_offset(self, tip_rack_offset=None):
+        """Resolve the configured tip-rack offset mapping.
+
+        Parameters
+        ----------
+        tip_rack_offset : dict, optional
+            Explicit offset override.
+
+        Returns
+        -------
+        dict
+            Offset mapping with ``x``, ``y``, and ``z`` keys.
+        """
+        offset = self.config.get("tip_rack_offset", {"x": 0, "y": 0, "z": 0})
+        if tip_rack_offset is not None:
+            offset = tip_rack_offset
+        resolved = dict(offset)
+        resolved.setdefault("x", 0)
+        resolved.setdefault("y", 0)
+        resolved.setdefault("z", 0)
+        return resolved
+
+    def _resolve_tip_location(self, mount, tip_location):
+        """Resolve a deck tip location into a tracked tiprack/well pair.
+
+        Parameters
+        ----------
+        mount : str
+            Pipette mount.
+        tip_location : str
+            Deck location such as ``"1A2"``.
+
+        Returns
+        -------
+        dict
+            Mapping with ``labware_id`` and ``well_name``.
+
+        Raises
+        ------
+        ValueError
+            If the requested tip location is not available for the mount.
+        """
+        normalized = str(tip_location).strip().upper()
+        if len(normalized) < 3:
+            raise ValueError(f"Requested tip location {tip_location} is invalid")
+        slot = normalized[0]
+        well_name = normalized[1:]
+        labware_info = self.config.get("loaded_labware", {}).get(str(slot))
+        if labware_info is None:
+            raise ValueError(f"Requested tip location {normalized} is not available")
+        labware_id = labware_info[0]
+        available = self.config.get("available_tips", {}).get(mount, [])
+        current_tip_matches = (
+            self.has_tip
+            and self.last_pipette == mount
+            and self.current_tip is not None
+            and self.current_tip.get("labware_id") == labware_id
+            and self.current_tip.get("well_name") == well_name
+        )
+        if (labware_id, well_name) not in available and not current_tip_matches:
+            raise ValueError(f"Requested tip location {normalized} is not available")
+        return {"labware_id": labware_id, "well_name": well_name}
+
+    def _reserve_tip(self, mount, labware_id, well_name):
+        """Reserve a specific available tip for pickup.
+
+        Parameters
+        ----------
+        mount : str
+            Pipette mount.
+        labware_id : str
+            Tiprack identifier.
+        well_name : str
+            Tip well name.
+
+        Returns
+        -------
+        tuple
+            Reserved ``(labware_id, well_name)`` pair.
+
+        Raises
+        ------
+        ValueError
+            If the requested tip is not available.
+        """
+        available = list(self.config.get("available_tips", {}).get(mount, []))
+        requested = (labware_id, well_name)
+        if requested not in available:
+            raise ValueError(
+                f"Requested tip location {well_name} in {labware_id} is not available for {mount} mount"
+            )
+        available.remove(requested)
+        self.config.setdefault("available_tips", {})[mount] = available
+        return requested
 
     def _touch_tip_well(self, pipette_id, well):
         """Touch the tip to a well edge or fall back to a top-edge move.
@@ -2942,9 +3095,96 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             # Error checking run, create a new one
             return self._create_run()
 
+    def _slot_by_labware_uuid(self, labware_id):
+        """Return the deck slot for a loaded labware identifier."""
+        for slot, labware_info in self.config.get("loaded_labware", {}).items():
+            if labware_info and labware_info[0] == labware_id:
+                return str(slot)
+        return None
+
+    def _current_tip_is_reserved_stock_tip(self):
+        """Return whether the currently attached tip is reserved for stock use."""
+        if not self.current_tip:
+            return False
+        location = self.current_tip.get("location")
+        if location is None:
+            slot = self.current_tip.get("slot")
+            well_name = self.current_tip.get("well_name")
+            if slot is not None and well_name is not None:
+                location = f"{slot}{well_name}"
+        return location in set(self.config.get("reserved_stock_tips", []))
+
+    def _drop_tip_to_trash(self, pipette_id):
+        """Drop the current tip into trash and clear local tracking."""
+        self._execute_atomic_command(
+            "dropTipInPlace",
+            {"pipetteId": pipette_id},
+            check_run_status=False,
+        )
+        self.has_tip = False
+        self.current_tip = None
+
+    def _return_tip_to_origin(self, pipette_id, mount=None, tip_rack_offset=None):
+        """Return the current tip to its original tiprack location."""
+        if not self.current_tip:
+            return
+        tip_mount = mount or self.current_tip.get("mount")
+        labware_id = self.current_tip.get("labware_id")
+        well_name = self.current_tip.get("well_name")
+        if labware_id is None or well_name is None:
+            self._drop_tip_to_trash(pipette_id)
+            return
+        self._execute_atomic_command(
+            "moveToWell",
+            {
+                "pipetteId": pipette_id,
+                "labwareId": labware_id,
+                "wellName": well_name,
+                "wellLocation": {
+                    "origin": "top",
+                    "offset": self._resolve_tip_rack_offset(tip_rack_offset),
+                },
+            },
+            check_run_status=False,
+        )
+        self._execute_atomic_command(
+            "dropTipInPlace",
+            {"pipetteId": pipette_id},
+            check_run_status=False,
+        )
+        available = list(self.config.get("available_tips", {}).get(tip_mount, []))
+        tip_entry = (labware_id, well_name)
+        if tip_entry not in available:
+            available.insert(0, tip_entry)
+        self.config.setdefault("available_tips", {})[tip_mount] = available
+        self.has_tip = False
+        self.current_tip = None
+
     def get_tip(self, mount):
         """Reserve and return the next available tip for a mount."""
-        return self._reserve_tip(mount)
+        available = list(self.config.get("available_tips", {}).get(mount, []))
+        if not available:
+            raise ValueError(f"No tips available for mount {mount}")
+
+        reserved_locations = {
+            str(location).strip().upper()
+            for location in self.config.get("reserved_stock_tips", [])
+        }
+        selected_index = None
+        for index, (tiprack_id, well_name) in enumerate(available):
+            slot = self._slot_by_labware_uuid(tiprack_id)
+            normalized_location = None if slot is None else f"{slot}{well_name}".upper()
+            if normalized_location in reserved_locations:
+                continue
+            selected_index = index
+            break
+
+        if selected_index is None:
+            raise RuntimeError(f"No unreserved tips available for {mount} mount")
+
+        tiprack_id, well_name = available.pop(selected_index)
+        self.config.setdefault("available_tips", {})[mount] = available
+        return tiprack_id, well_name
 
     def get_tip_status(self, mount=None):
         """Return human-readable tip availability status.
