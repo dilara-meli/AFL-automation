@@ -80,6 +80,7 @@ def _solution_to_display_dict(solution):
     out = {
         'name': solution.name,
         'location': solution.location,
+        'tip': getattr(solution, 'tip', None),
         'components': list(solution.components.keys()),
     }
 

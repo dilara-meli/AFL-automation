@@ -2,6 +2,7 @@ import warnings
 
 from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
 from AFL.automation.prepare.PrepareDriver import PrepareDriver
+from AFL.automation.shared.utilities import listify
 
 
 class OT2Prepare(OT2HTTPDriver, PrepareDriver):
@@ -31,18 +32,218 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         status = []
         status.append(f"Stocks: {len(self.stocks)} configured")
         status.append(f"Stock locations: {self.config['stock_locations']}")
+        status.append(
+            f"Stock-reserved tips: {len(self.config.get('reserved_stock_tips', []))}"
+        )
+        status.append(
+            f"Occupied sample locations: {len(self.config.get('occupied_sample_locations', []))}"
+        )
         status.append(f"{len(self.config['prep_targets'])} preparation targets available")
         return status
 
+    def _normalize_locations(self, locations):
+        normalized = []
+        for location in locations:
+            normalized_location = self._normalize_deck_location(location)
+            if normalized_location not in normalized:
+                normalized.append(normalized_location)
+        return normalized
+
+    def _sync_stock_tip_tracking(self):
+        stock_tip_locations = {}
+        for stock in getattr(self, "stocks", []):
+            tip_location = getattr(stock, "tip_location", None) or getattr(stock, "tip", None)
+            if tip_location is None:
+                continue
+            stock_tip_locations[stock.name] = self._normalize_locations(listify(tip_location))
+
+        existing_reservations = self.config.get("stock_tip_reservations", {})
+        normalized_reservations = {}
+        for stock_name, tip_locations in existing_reservations.items():
+            configured_tips = stock_tip_locations.get(stock_name, [])
+            if not configured_tips:
+                continue
+            active = [
+                location
+                for location in self._normalize_locations(listify(tip_locations))
+                if location in configured_tips
+            ]
+            if active:
+                normalized_reservations[stock_name] = active
+
+        active_reserved = []
+        for tip_locations in normalized_reservations.values():
+            active_reserved.extend(tip_locations)
+
+        self.config["stock_tip_locations"] = stock_tip_locations
+        self.config["stock_tip_reservations"] = normalized_reservations
+        self.config["reserved_stock_tips"] = self._normalize_locations(active_reserved)
+
+    def _ordered_stock_tip_candidates(self, stock_name, step_tip_location=None):
+        configured = self.config.get("stock_tip_locations", {}).get(stock_name, [])
+        if step_tip_location is None:
+            candidates = list(configured)
+        else:
+            candidates = self._normalize_locations(listify(step_tip_location))
+
+        active = self.config.get("stock_tip_reservations", {}).get(stock_name, [])
+        ordered = []
+        for location in list(active) + list(candidates):
+            normalized = self._normalize_deck_location(location)
+            if normalized not in ordered:
+                ordered.append(normalized)
+        return ordered
+
+    def _select_stock_tip_location(self, stock_name, volume_ul, step_tip_location=None):
+        candidates = self._ordered_stock_tip_candidates(stock_name, step_tip_location)
+        if not candidates:
+            return None
+
+        pipette_mount = self.get_pipette(float(volume_ul))["mount"]
+        compatible = []
+        for location in candidates:
+            try:
+                matches_mount = self._tip_location_matches_mount(pipette_mount, location)
+            except ValueError:
+                continue
+            if not matches_mount:
+                continue
+            compatible.append(location)
+            try:
+                self._resolve_tip_location(pipette_mount, location)
+                return location
+            except ValueError:
+                continue
+
+        if compatible:
+            raise ValueError(
+                f"No configured tip locations for stock '{stock_name}' are currently available "
+                f"on {pipette_mount} mount: {', '.join(compatible)}"
+            )
+        raise ValueError(
+            f"No configured tip locations for stock '{stock_name}' match the {pipette_mount} mount: "
+            f"{', '.join(candidates)}"
+        )
+
+    def _activate_stock_tip_reservation(self, stock_name, tip_location):
+        if stock_name is None or tip_location is None:
+            return
+
+        tip_location = self._normalize_deck_location(tip_location)
+        configured = self.config.get("stock_tip_locations", {}).get(stock_name, [])
+        if tip_location not in configured:
+            return
+
+        reservations = {
+            name: self._normalize_locations(listify(locations))
+            for name, locations in self.config.get("stock_tip_reservations", {}).items()
+        }
+        for other_stock, locations in reservations.items():
+            if other_stock != stock_name and tip_location in locations:
+                raise ValueError(
+                    f"Tip location {tip_location} is already reserved for stock '{other_stock}' "
+                    f"and cannot also be reserved for stock '{stock_name}'."
+                )
+
+        stock_reservations = reservations.get(stock_name, [])
+        if tip_location not in stock_reservations:
+            stock_reservations.append(tip_location)
+        reservations[stock_name] = self._normalize_locations(stock_reservations)
+
+        active_reserved = []
+        for locations in reservations.values():
+            active_reserved.extend(locations)
+
+        self.config["stock_tip_reservations"] = reservations
+        self.config["reserved_stock_tips"] = self._normalize_locations(active_reserved)
+
+    def _build_stock_transfer_params(self, stock_name, volume_ul, step_tip_location=None):
+        transfer_params = self.get_transfer_params(stock_name)
+        selected_tip_location = self._select_stock_tip_location(
+            stock_name=stock_name,
+            volume_ul=volume_ul,
+            step_tip_location=step_tip_location,
+        )
+        if selected_tip_location is not None:
+            transfer_params["tip_location"] = selected_tip_location
+        return transfer_params, selected_tip_location
+
+    def _occupied_sample_locations(self):
+        return set(self._normalize_locations(self.config.get("occupied_sample_locations", [])))
+
+    def _assert_destination_locations_available(self, destinations):
+        normalized = self._normalize_locations(destinations)
+        duplicates = sorted({location for location in normalized if normalized.count(location) > 1})
+        if duplicates:
+            raise ValueError(
+                "Preparation requested the same destination location more than once: "
+                + ", ".join(duplicates)
+            )
+
+        occupied = self._occupied_sample_locations()
+        conflicts = [location for location in normalized if location in occupied]
+        if conflicts:
+            raise ValueError(
+                "Destination location(s) already contain a prepared sample: "
+                + ", ".join(conflicts)
+                + ". Clear or change those sample destinations before preparing again."
+            )
+
+    def _mark_sample_locations_occupied(self, destinations):
+        updated = self._normalize_locations(
+            list(self.config.get("occupied_sample_locations", [])) + list(destinations)
+        )
+        self.config["occupied_sample_locations"] = updated
+
+    def clear_sample_locations(self, locations=None):
+        occupied = self._normalize_locations(
+            self.config.get("occupied_sample_locations", [])
+        )
+        if locations is None:
+            self.config["occupied_sample_locations"] = []
+            self.config._update_history()
+            return []
+
+        to_clear = set(self._normalize_locations(listify(locations)))
+        remaining = [location for location in occupied if location not in to_clear]
+        cleared = [location for location in occupied if location in to_clear]
+        self.config["occupied_sample_locations"] = remaining
+        self.config._update_history()
+        return cleared
+
     def resolve_destination(self, dest):
         if dest is not None:
-            return dest
+            destination = self._normalize_deck_location(dest)
+            self._assert_destination_locations_available([destination])
+            return destination
         if not self.config.get("prep_targets"):
             raise ValueError("No preparation targets configured. Cannot select a destination target.")
         prep_targets = self.config["prep_targets"]
-        destination = prep_targets.pop(0)
+        destination = self._normalize_deck_location(prep_targets[0])
+        self._assert_destination_locations_available([destination])
+        prep_targets.pop(0)
         self.config["prep_targets"] = prep_targets
         return destination
+
+    def _reserve_destinations(self, dest, required_intermediate_targets):
+        destination, intermediate_destinations, consumed, queue_key = super()._reserve_destinations(
+            dest=dest,
+            required_intermediate_targets=required_intermediate_targets,
+        )
+        all_destinations = list(intermediate_destinations) + [destination]
+        normalized_destinations = self._normalize_locations(all_destinations)
+        normalized_intermediates = normalized_destinations[: len(intermediate_destinations)]
+        normalized_destination = normalized_destinations[-1]
+        try:
+            self._assert_destination_locations_available(normalized_destinations)
+        except Exception:
+            if required_intermediate_targets > 0:
+                self._restore_reserved_destinations(queue_key=queue_key, consumed=consumed)
+            elif dest is None:
+                queue = list(self.config.get("prep_targets", []))
+                self.config["prep_targets"] = [normalized_destination] + queue
+            raise
+        return normalized_destination, normalized_intermediates, consumed, queue_key
 
     def execute_preparation(self, target, balanced_target, destination):
         if not hasattr(balanced_target, "protocol") or not balanced_target.protocol:
@@ -58,7 +259,11 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             if stock_name is None:
                 raise ValueError(f"No stock name found for deck location: {source}")
 
-            transfer_params = self.get_transfer_params(stock_name)
+            transfer_params, selected_tip_location = self._build_stock_transfer_params(
+                stock_name=stock_name,
+                volume_ul=volume_ul,
+                step_tip_location=getattr(step, "tip_location", None),
+            )
             try:
                 transfer_result = self.transfer(
                     source=source,
@@ -80,11 +285,13 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                         "source_stock_name": stock_name,
                     },
                 )
+                self._activate_stock_tip_reservation(stock_name, selected_tip_location)
             except Exception as e:
                 warnings.warn(f"Transfer failed from {source} to {destination}: {str(e)}", stacklevel=2)
                 return False
 
         self.last_target_location = destination
+        self._mark_sample_locations_occupied([destination])
         return True
 
     def _resolve_stage_source(self, source_location, intermediate_map):
@@ -137,8 +344,16 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         stock_name = source_stock_name
         if stock_name is None:
             stock_name = self.config.get("deck", {}).get(source)
-        transfer_params = self.get_transfer_params(stock_name) if stock_name is not None else self.get_transfer_params("default")
+        selected_tip_location = None
+        if stock_name is not None:
+            transfer_params, selected_tip_location = self._build_stock_transfer_params(
+                stock_name=stock_name,
+                volume_ul=volume_ul,
+            )
+        else:
+            transfer_params = self.get_transfer_params("default")
         transfer_result = self.transfer(source=source, dest=dest, volume=volume_ul, **transfer_params)
+        self._activate_stock_tip_reservation(stock_name, selected_tip_location)
         self._record_prepare_transfer(
             stage_type=stage_type,
             source=source,
@@ -245,6 +460,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 raise ValueError(f"Unknown stage type '{stage_type}' in procedure plan")
 
         self.last_target_location = destination
+        self._mark_sample_locations_occupied(list(intermediate_destinations) + [destination])
         return True
 
     def stocks_by_location(self, location):
@@ -262,6 +478,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
     def process_stocks(self):
         PrepareDriver.process_stocks(self)
         self._update_deck_config()
+        self._sync_stock_tip_tracking()
 
     def _update_deck_config(self):
         deck_config = {}
