@@ -117,9 +117,20 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         >>> driver._normalize_locations(["4a1", "4A1", "4b1"])
         ['4A1', '4B1']
         """
+        normalize_location = getattr(self, "_normalize_deck_location", None)
         normalized = []
         for location in locations:
-            normalized_location = self._normalize_deck_location(location)
+            if normalize_location is not None:
+                normalized_location = normalize_location(location)
+            else:
+                if location is None:
+                    normalized_location = None
+                elif not isinstance(location, str):
+                    raise TypeError(
+                        f"Deck location must be a string, got {type(location).__name__}"
+                    )
+                else:
+                    normalized_location = location.strip().upper()
             if normalized_location not in normalized:
                 normalized.append(normalized_location)
         return normalized
@@ -197,8 +208,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
 
         active = self.config.get("stock_tip_reservations", {}).get(stock_name, [])
         ordered = []
-        for location in list(active) + list(candidates):
-            normalized = self._normalize_deck_location(location)
+        for normalized in self._normalize_locations(list(active) + list(candidates)):
             if normalized not in ordered:
                 ordered.append(normalized)
         return ordered
@@ -237,17 +247,22 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             return None
 
         pipette_mount = self.get_pipette(float(volume_ul))["mount"]
+        match_tip_location = getattr(self, "_tip_location_matches_mount", None)
+        resolve_tip_location = getattr(self, "_resolve_tip_location", None)
         compatible = []
         for location in candidates:
-            try:
-                matches_mount = self._tip_location_matches_mount(pipette_mount, location)
-            except ValueError:
-                continue
-            if not matches_mount:
-                continue
+            if match_tip_location is not None:
+                try:
+                    matches_mount = match_tip_location(pipette_mount, location)
+                except ValueError:
+                    continue
+                if not matches_mount:
+                    continue
             compatible.append(location)
+            if resolve_tip_location is None:
+                return location
             try:
-                self._resolve_tip_location(pipette_mount, location)
+                resolve_tip_location(pipette_mount, location)
                 return location
             except ValueError:
                 continue
@@ -280,7 +295,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         if stock_name is None or tip_location is None:
             return
 
-        tip_location = self._normalize_deck_location(tip_location)
+        tip_location = self._normalize_locations([tip_location])[0]
         configured = self.config.get("stock_tip_locations", {}).get(stock_name, [])
         if tip_location not in configured:
             return
@@ -403,8 +418,8 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         --------
         >>> driver._mark_sample_locations_occupied(["4A1"])
         """
-        occupied = self._occupied_sample_locations()
-        for location in locations:
+        occupied = self._normalize_locations(self.config.get("occupied_sample_locations", []))
+        for location in self._normalize_locations(listify(locations)):
             if location not in occupied:
                 occupied.append(location)
         self.config["occupied_sample_locations"] = occupied
@@ -471,19 +486,15 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         if destination is None:
             if not self.config.get("prep_targets"):
                 raise ValueError("No preparation targets configured. Cannot select a destination target.")
-            prep_targets = self.config["prep_targets"]
-            destination = self._normalize_deck_location(prep_targets[0])
+            prep_targets = list(self.config["prep_targets"])
+            destination = self._normalize_locations([prep_targets[0]])[0]
             self._assert_destination_locations_available([destination])
             prep_targets.pop(0)
             self.config["prep_targets"] = prep_targets
             return destination
-        if not self.config.get("prep_targets"):
-            raise ValueError("No preparation targets configured. Cannot select a destination target.")
-        prep_targets = self.config["prep_targets"]
-        destination = self._normalize_deck_location(prep_targets[0])
+
+        destination = self._normalize_locations([destination])[0]
         self._assert_destination_locations_available([destination])
-        prep_targets.pop(0)
-        self.config["prep_targets"] = prep_targets
         return destination
 
     def _reserve_destinations(self, destination, intermediate_destinations=None):
@@ -511,10 +522,12 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         >>> driver._reserve_destinations("4A1", ["5A1"])
         ('4A1', ['5A1'])
         """
-        intermediate_destinations = list(intermediate_destinations or [])
+        requested_destination = destination
+        requested_intermediate_destinations = list(intermediate_destinations or [])
+        required_intermediate_targets = len(requested_intermediate_destinations)
         destination, intermediate_destinations, consumed, queue_key = super()._reserve_destinations(
-            dest=destination,
-            required_intermediate_targets=len(intermediate_destinations),
+            dest=requested_destination,
+            required_intermediate_targets=required_intermediate_targets,
         )
         all_destinations = list(intermediate_destinations) + [destination]
         normalized_destinations = self._normalize_locations(all_destinations)
@@ -525,7 +538,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         except Exception:
             if required_intermediate_targets > 0:
                 self._restore_reserved_destinations(queue_key=queue_key, consumed=consumed)
-            elif dest is None:
+            elif requested_destination is None:
                 queue = list(self.config.get("prep_targets", []))
                 self.config["prep_targets"] = [normalized_destination] + queue
             raise
