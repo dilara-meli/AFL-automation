@@ -184,6 +184,29 @@ class TestAPIServer:
         assert response.status_code == 200
         assert b'nested' in response.data
 
+    def test_query_driver_normalizes_route_name(self, dummy_driver):
+        """Test that query_driver trims route names before dispatch"""
+        server = APIServer(name='TestServer')
+        server.create_queue(dummy_driver)
+
+        with server.app.test_request_context('/query_driver?r=%20how_many%20&count=5'):
+            payload, status = server.query_driver()
+
+        assert status == 200
+        assert '5' in payload
+
+    def test_query_driver_reports_available_routes_for_unknown_command(self, dummy_driver):
+        """Test that query_driver returns registered unqueued routes on 404"""
+        server = APIServer(name='TestServer')
+        server.create_queue(dummy_driver)
+
+        with server.app.test_request_context('/query_driver?r=missing_command'):
+            payload, status = server.query_driver()
+
+        assert status == 404
+        assert payload['route'] == 'missing_command'
+        assert 'how_many' in payload['available_routes']
+
 
 def test_import_apiserver():
     """Test that APIServer can be imported"""
