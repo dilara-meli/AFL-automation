@@ -1167,6 +1167,7 @@ class GamryDriver(Driver):
         }
 
 
+_OVERRIDE_MAIN_MODULE_NAME = 'GamryDriver'
 _DEFAULT_CUSTOM_CONFIG = {
     '_classname': 'AFL.automation.instrument.gamry.GamryDriver',
 }

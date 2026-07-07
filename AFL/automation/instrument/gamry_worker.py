@@ -12,10 +12,10 @@ from rpyc.utils.server import ThreadedServer
 
 
 WORKER_LOG_PATH = os.environ.get('AFL_GAMRY_WORKER_LOG')
-GAMRY_EXPORT_DIRECTORY = os.environ.get(
-    'AFL_GAMRY_DPV_EXPORT_DIR',
-    r'C:\Users\dnm33\Documents\GamryData\GamryServer_trial',
-)
+# GAMRY_EXPORT_DIRECTORY = os.environ.get(
+#     'AFL_GAMRY_DPV_EXPORT_DIR',
+#     r'C:\Users\dnm33\Documents\GamryData\GamryServer_trial',
+# )
 
 
 def _log_worker_event(event, **details):
