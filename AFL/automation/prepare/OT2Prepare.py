@@ -497,15 +497,26 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         self._assert_destination_locations_available([destination])
         return destination
 
-    def _reserve_destinations(self, destination, intermediate_destinations=None):
+    def _reserve_destinations(
+        self,
+        dest=None,
+        required_intermediate_targets=0,
+        intermediate_destinations=None,
+        destination=None,
+    ):
         """Reserve final and intermediate destinations for a preparation plan.
 
         Parameters
         ----------
-        destination : str
+        dest : str, optional
             Final destination location.
+        required_intermediate_targets : int, default=0
+            Number of intermediate destinations required by the preparation
+            plan. Used by the base prepare flow.
         intermediate_destinations : sequence of str, optional
             Intermediate destination locations used by staged plans.
+        destination : str, optional
+            Backward-compatible alias for ``dest``.
 
         Returns
         -------
@@ -522,9 +533,10 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         >>> driver._reserve_destinations("4A1", ["5A1"])
         ('4A1', ['5A1'])
         """
-        requested_destination = destination
+        requested_destination = dest if dest is not None else destination
         requested_intermediate_destinations = list(intermediate_destinations or [])
-        required_intermediate_targets = len(requested_intermediate_destinations)
+        if requested_intermediate_destinations:
+            required_intermediate_targets = len(requested_intermediate_destinations)
         destination, intermediate_destinations, consumed, queue_key = super()._reserve_destinations(
             dest=requested_destination,
             required_intermediate_targets=required_intermediate_targets,
@@ -1098,6 +1110,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         """
         self.reset_targets()
         self.reset_stocks()
+        self._reset_prepare_state()
 
 
 _DEFAULT_PORT = 5002

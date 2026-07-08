@@ -35,6 +35,14 @@ class DummyPrepare(PrepareDriver):
         self.last_plan = {
             'mode': 'single',
             'destination': destination,
+            'protocol': [
+                {
+                    'source': step.source,
+                    'dest': step.dest,
+                    'volume': step.volume,
+                }
+                for step in getattr(balanced_target, 'protocol', [])
+            ],
         }
         return True
 
@@ -76,6 +84,18 @@ def _binary_target():
     return {
         'name': 'BinaryBlend',
         'masses': {'H2O': '250 mg', 'Hexanes': '250 mg'},
+    }
+
+
+def _stock_fraction_target():
+    return {
+        'name': 'ColorSample',
+        'location': '1A4',
+        'stock_volume_fractions': {
+            'Stock1': 0.3,
+            'Stock2': 0.7,
+        },
+        'total_volume': '1000 ul',
     }
 
 
@@ -175,3 +195,64 @@ def test_prepare_driver_default_composition_format_is_masses():
     driver.config.write = False
 
     assert driver.config['composition_format'] == 'masses'
+
+
+@pytest.mark.usefixtures('mixdb')
+def test_is_feasible_accepts_stock_volume_fraction_targets():
+    driver = DummyPrepare()
+    driver.config.write = False
+    _seed_stocks(driver)
+
+    feasible = driver.is_feasible(_stock_fraction_target(), enable_multistep_dilution=False)
+
+    assert feasible == [{
+        'name': 'ColorSample',
+        'location': '1A4',
+        'total_volume': '1000.0 ul',
+        'stock_volume_fractions': {'Stock1': 0.3, 'Stock2': 0.7},
+        'stock_transfer_volumes_ul': {'Stock1': 300.0, 'Stock2': 700.0},
+    }]
+
+
+@pytest.mark.usefixtures('mixdb')
+def test_prepare_accepts_stock_volume_fraction_targets():
+    driver = DummyPrepare()
+    driver.config.write = False
+    _seed_stocks(driver)
+    driver.config['prep_targets'] = ['5A1']
+
+    result, destination = driver.prepare(_stock_fraction_target(), enable_multistep_dilution=False)
+
+    assert destination == '5A1'
+    assert result['destination'] == '5A1'
+    assert result['intermediate_destinations'] == []
+    assert result['planned_mass_transfers'] is None
+    assert result['procedure_plan']['mode'] == 'stock_volume_fractions'
+    assert result['stock_volume_fractions'] == {'Stock1': 0.3, 'Stock2': 0.7}
+    assert result['stock_transfer_volumes_ul'] == {'Stock1': 300.0, 'Stock2': 700.0}
+    assert driver.last_plan['mode'] == 'single'
+    assert driver.last_plan['destination'] == '5A1'
+    assert driver.last_plan['protocol'] == [
+        {'source': '1A1', 'dest': '1A4', 'volume': 300.0},
+        {'source': '1A2', 'dest': '1A4', 'volume': 700.0},
+    ]
+
+    prepare_data = driver.data['prepare']
+    assert prepare_data['requested_target']['stock_volume_fractions'] == {'Stock1': 0.3, 'Stock2': 0.7}
+    assert prepare_data['balanced_target']['stock_transfer_volumes_ul'] == {'Stock1': 300.0, 'Stock2': 700.0}
+    assert prepare_data['execution_success'] is True
+
+
+@pytest.mark.usefixtures('mixdb')
+def test_prepare_rejects_stock_volume_fraction_targets_that_do_not_sum_to_one():
+    driver = DummyPrepare()
+    driver.config.write = False
+    _seed_stocks(driver)
+    driver.config['prep_targets'] = ['5A1']
+    bad_target = _stock_fraction_target()
+    bad_target['stock_volume_fractions'] = {'Stock1': 0.3, 'Stock2': 0.6}
+
+    result, destination = driver.prepare(bad_target, enable_multistep_dilution=False)
+
+    assert result is None
+    assert destination is None

@@ -231,6 +231,7 @@ def test_transfer_with_single_loaded_pipette_allows_rate_overrides():
     assert "pickUpTip" in command_names
     assert "aspirate" in command_names
     assert "dispense" in command_names
+    assert "moveToAddressableAreaForDropTip" in command_names
     assert "dropTipInPlace" in command_names
     assert driver.last_pipette == "left"
     assert transfer_result["requested_volume_ul"] == 50.0
@@ -289,6 +290,15 @@ def test_transfer_without_tip_location_skips_stock_reserved_tips():
     assert driver.config["available_tips"]["left"] == [("tiprack-left", "A1")]
 
 
+def test_get_tip_status_reports_general_and_reserved_counts():
+    driver = _configured_driver()
+    driver.config["reserved_stock_tips"] = ["1A1"]
+
+    status = driver.get_tip_status("left")
+
+    assert status == "1/96 general tips available on left mount (1 reserved for stock pipetting)"
+
+
 def test_transfer_without_tip_location_errors_when_only_reserved_stock_tips_remain():
     driver = _configured_driver()
     driver.config["reserved_stock_tips"] = ["1A1", "1A2"]
@@ -318,6 +328,114 @@ def test_transfer_return_tip_restores_tip_to_available_trace():
         ("tiprack-left", "A1"),
         ("tiprack-left", "A2"),
     ]
+
+
+def test_transfer_return_tip_uses_return_tip_z_offset():
+    driver = _configured_driver()
+
+    driver.transfer(
+        "1A1",
+        "1A2",
+        50,
+        drop_tip=False,
+        return_tip=True,
+        return_tip_z_offset=-7.0,
+    )
+
+    drop_tip_command = next(
+        params for command, params in driver.executed_commands if command == "dropTipInPlace"
+    )
+    assert drop_tip_command["wellLocation"]["offset"]["z"] == -7.0
+
+
+def test_split_transfer_drops_tip_without_force_new_tip():
+    driver = _configured_driver()
+
+    transfer_result = driver.transfer("1A1", "1A2", 350, drop_tip=True, force_new_tip=False)
+
+    command_names = [name for name, _ in driver.executed_commands]
+    assert command_names.count("pickUpTip") == 1
+    assert command_names.count("moveToAddressableAreaForDropTip") == 1
+    assert command_names.count("dropTipInPlace") == 1
+    assert transfer_result["subtransfers_ul"] == [300.0, 50.0]
+    assert driver.has_tip is False
+    assert driver.current_tip is None
+
+
+def test_split_transfer_force_new_tip_refreshes_tip_each_subtransfer():
+    driver = _configured_driver()
+    driver.config["available_tips"]["left"] = [
+        ("tiprack-left", "A1"),
+        ("tiprack-left", "A2"),
+        ("tiprack-left", "A3"),
+    ]
+
+    transfer_result = driver.transfer("1A1", "1A2", 350, drop_tip=True, force_new_tip=True)
+
+    command_names = [name for name, _ in driver.executed_commands]
+    assert command_names.count("pickUpTip") == 2
+    assert command_names.count("moveToAddressableAreaForDropTip") == 2
+    assert command_names.count("dropTipInPlace") == 2
+    assert transfer_result["subtransfers_ul"] == [300.0, 50.0]
+    assert driver.has_tip is False
+    assert driver.current_tip is None
+
+
+def test_drop_tip_to_trash_targets_fixed_trash_before_drop():
+    driver = _configured_driver()
+    driver.has_tip = True
+    driver.current_tip = {"mount": "left", "labware_id": "tiprack-left", "well_name": "A1"}
+
+    driver._drop_tip_to_trash("left-id")
+
+    assert driver.executed_commands[-2] == (
+        "moveToAddressableAreaForDropTip",
+        {
+            "pipetteId": "left-id",
+            "addressableAreaName": "fixedTrash",
+            "alternateDropLocation": False,
+        },
+    )
+    assert driver.executed_commands[-1] == (
+        "dropTipInPlace",
+        {"pipetteId": "left-id"},
+    )
+    assert driver.has_tip is False
+    assert driver.current_tip is None
+
+
+def test_drop_tip_to_trash_falls_back_when_fixed_trash_move_is_unavailable():
+    driver = _configured_driver()
+    driver.has_tip = True
+    driver.current_tip = {"mount": "left", "labware_id": "tiprack-left", "well_name": "A1"}
+    attempts = []
+
+    def fake_execute(command, params, check_run_status=True):
+        attempts.append((command, dict(params)))
+        if command == "moveToAddressableAreaForDropTip":
+            raise RuntimeError("unsupported command")
+        if command == "dropTipInPlace":
+            driver.has_tip = False
+            driver.current_tip = None
+        return {"commandType": command, "params": params}
+
+    driver._execute_atomic_command = fake_execute
+
+    driver._drop_tip_to_trash("left-id")
+
+    assert attempts == [
+        (
+            "moveToAddressableAreaForDropTip",
+            {
+                "pipetteId": "left-id",
+                "addressableAreaName": "fixedTrash",
+                "alternateDropLocation": False,
+            },
+        ),
+        ("dropTipInPlace", {"pipetteId": "left-id"}),
+    ]
+    assert driver.has_tip is False
+    assert driver.current_tip is None
 
 
 def test_transfer_tip_rack_offset_applies_to_pickup_and_return():

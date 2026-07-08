@@ -16,6 +16,7 @@ from AFL.automation.shared.utilities import listify
 
 # Add this constant at the top of the file, after the imports
 TIPRACK_WELLS = [f"{row}{col}" for col in range(1, 13) for row in "ABCDEFGH"]
+FIXED_TRASH_ADDRESSABLE_AREA = "fixedTrash"
 
 class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
     """HTTP-backed Opentrons OT-2 driver.
@@ -1639,6 +1640,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         to_top_z_offset=0,
         source_z_offset=0,
         tip_rack_offset=None,
+        return_tip_z_offset=None,
         fast_mixing=False,
         touch_tip=False,
         tip_location=None,
@@ -1696,6 +1698,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         tip_rack_offset : dict, optional
             Offset mapping with ``x``, ``y``, and ``z`` keys used for tip pickup
             and tip return.
+        return_tip_z_offset : float, optional
+            Additional z-offset applied when returning a tip to its origin.
+            If omitted, the existing ``tip_rack_offset`` z value is used.
         fast_mixing : bool, default=False
             Reserved flag for higher-level callers.
         touch_tip : bool, default=False
@@ -1872,10 +1877,12 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 continue
             transfer_record["subtransfers_ul"].append(float(sub_volume))
 
-            # Intermediate split transfers should not drop the tip unless explicitly forced.
+            # Final tip disposal is controlled by drop_tip / return_tip alone.
+            # force_new_tip only controls whether a used tip is cleared before
+            # the next subtransfer picks up a fresh one.
             is_last_subtransfer = i == (len(transfers) - 1)
-            effective_drop_tip = drop_tip if (is_last_subtransfer or force_new_tip) else False
-            effective_return_tip = return_tip if (is_last_subtransfer or force_new_tip) else False
+            effective_drop_tip = bool(drop_tip and is_last_subtransfer)
+            effective_return_tip = bool(return_tip and is_last_subtransfer)
 
             # Keep tip handling consistent with the non-HTTP driver:
             # reuse the current tip across split transfers unless force_new_tip is set.
@@ -1887,6 +1894,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         tip_pipette_id,
                         mount=tip_mount,
                         tip_rack_offset=resolved_tip_rack_offset,
+                        return_tip_z_offset=return_tip_z_offset,
                     )
                 else:
                     self._drop_tip_to_trash(tip_pipette_id)
@@ -1899,6 +1907,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         tip_pipette_id,
                         mount=self.last_pipette,
                         tip_rack_offset=resolved_tip_rack_offset,
+                        return_tip_z_offset=return_tip_z_offset,
                     )
                 else:
                     self._drop_tip_to_trash(tip_pipette_id)
@@ -1914,6 +1923,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         pipette_id,
                         mount=pipette_mount,
                         tip_rack_offset=resolved_tip_rack_offset,
+                        return_tip_z_offset=return_tip_z_offset,
                     )
                 else:
                     self._drop_tip_to_trash(pipette_id)
@@ -1935,6 +1945,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         pipette_id,
                         mount=pipette_mount,
                         tip_rack_offset=resolved_tip_rack_offset,
+                        return_tip_z_offset=return_tip_z_offset,
                     )
                 else:
                     self._drop_tip_to_trash(pipette_id)
@@ -2184,13 +2195,17 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
             # 10. Blow out if specified
             if blow_out:
+                flow_rate = self.pipette_info.get(pipette_mount, {}).get(
+                    "dispense_flow_rate", 300
+                )
                 self._execute_atomic_command(
-                    "blowOut",
+                    "blowout",
                     {
                         "pipetteId": pipette_id,
                         "labwareId": dest_well["labwareId"],
                         "wellName": dest_well["wellName"],
                         "wellLocation": {"origin": dest_position, "offset": offset},
+                        "flowRate": flow_rate,
                     },
                     check_run_status=False,
                 )
@@ -2212,6 +2227,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     pipette_id,
                     mount=pipette_mount,
                     tip_rack_offset=resolved_tip_rack_offset,
+                    return_tip_z_offset=return_tip_z_offset,
                 )
             # Update last pipette
             self.last_pipette = pipette_mount
@@ -3116,6 +3132,21 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
     def _drop_tip_to_trash(self, pipette_id):
         """Drop the current tip into trash and clear local tracking."""
+        try:
+            self._execute_atomic_command(
+                "moveToAddressableAreaForDropTip",
+                {
+                    "pipetteId": pipette_id,
+                    "addressableAreaName": FIXED_TRASH_ADDRESSABLE_AREA,
+                    "alternateDropLocation": False,
+                },
+                check_run_status=False,
+            )
+        except Exception as exc:
+            self.log_warning(
+                "Explicit fixed-trash move unavailable; falling back to "
+                f"dropTipInPlace only. Error: {exc}"
+            )
         self._execute_atomic_command(
             "dropTipInPlace",
             {"pipetteId": pipette_id},
@@ -3124,7 +3155,14 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         self.has_tip = False
         self.current_tip = None
 
-    def _return_tip_to_origin(self, pipette_id, mount=None, tip_rack_offset=None):
+
+    def _return_tip_to_origin(
+        self,
+        pipette_id,
+        mount=None,
+        tip_rack_offset=None,
+        return_tip_z_offset=None,
+    ):
         """Return the current tip to its original tiprack location."""
         if not self.current_tip:
             return
@@ -3134,6 +3172,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         if labware_id is None or well_name is None:
             self._drop_tip_to_trash(pipette_id)
             return
+        offset_z = 0.0 if return_tip_z_offset is None else return_tip_z_offset
         self._execute_atomic_command(
             "moveToWell",
             {
@@ -3142,14 +3181,20 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "wellName": well_name,
                 "wellLocation": {
                     "origin": "top",
-                    "offset": self._resolve_tip_rack_offset(tip_rack_offset),
+                    "offset": {"x": 0, "y": 0, "z": offset_z},
                 },
             },
             check_run_status=False,
         )
         self._execute_atomic_command(
             "dropTipInPlace",
-            {"pipetteId": pipette_id},
+            {
+                "pipetteId": pipette_id,
+                "wellLocation": {
+                    "origin": "center",
+                    "offset": {"x": 0, "y": 0, "z": offset_z},
+                },
+            },
             check_run_status=False,
         )
         available = list(self.config.get("available_tips", {}).get(tip_mount, []))
@@ -3185,6 +3230,40 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         tiprack_id, well_name = available.pop(selected_index)
         self.config.setdefault("available_tips", {})[mount] = available
         return tiprack_id, well_name
+
+    def _tip_status_counts(self, mount):
+        """Summarize general and reserved tip availability for a mount.
+
+        Parameters
+        ----------
+        mount : str
+            Pipette mount name such as ``"left"`` or ``"right"``.
+
+        Returns
+        -------
+        dict
+            Counts keyed by ``general_available`` and ``reserved_available``.
+        """
+        available = list(self.config.get("available_tips", {}).get(mount, []))
+        reserved_locations = {
+            str(location).strip().upper()
+            for location in self.config.get("reserved_stock_tips", [])
+        }
+
+        reserved_available = 0
+        general_available = 0
+        for tiprack_id, well_name in available:
+            slot = self._slot_by_labware_uuid(tiprack_id)
+            normalized_location = None if slot is None else f"{slot}{well_name}".upper()
+            if normalized_location in reserved_locations:
+                reserved_available += 1
+            else:
+                general_available += 1
+
+        return {
+            "general_available": general_available,
+            "reserved_available": reserved_available,
+        }
 
     def get_tip_status(self, mount=None):
         """Return human-readable tip availability status.

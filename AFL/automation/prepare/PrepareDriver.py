@@ -4,9 +4,46 @@ from typing import Dict, Optional
 
 from AFL.automation.mixcalc.MassBalance import MassBalance
 from AFL.automation.mixcalc.MassBalanceDriver import MassBalanceDriver
+from AFL.automation.prepare.PipetteAction import PipetteAction
 from AFL.automation.mixcalc.Solution import Solution
 from AFL.automation.shared.PersistentConfig import PersistentConfig
+from AFL.automation.shared.units import enforce_units
 from AFL.automation.shared.utilities import listify
+
+
+class _StockVolumeFractionTarget:
+    """Direct stock-dispense target used by prepare backends.
+
+    This lightweight target bypasses mass-balance solving when the user
+    already specifies the final sample as volume fractions over named stocks.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        location: str | None,
+        total_volume,
+        stock_volume_fractions: dict[str, float],
+        protocol: list[PipetteAction],
+        stock_transfer_volumes: dict[str, float],
+    ):
+        self.name = name
+        self.location = location
+        self.volume = total_volume
+        self.protocol = protocol
+        self.stock_volume_fractions = dict(stock_volume_fractions)
+        self.stock_transfer_volumes = dict(stock_transfer_volumes)
+
+    def to_dict(self) -> dict:
+        total_volume_ul = round(float(self.volume.to('ul').magnitude), 6)
+        return {
+            "name": self.name,
+            "location": self.location,
+            "total_volume": f"{total_volume_ul} ul",
+            "stock_volume_fractions": copy.deepcopy(self.stock_volume_fractions),
+            "stock_transfer_volumes_ul": copy.deepcopy(self.stock_transfer_volumes),
+        }
 
 
 class PrepareDriver(MassBalanceDriver):
@@ -54,6 +91,105 @@ class PrepareDriver(MassBalanceDriver):
         """Subclass hook for additional status lines."""
         return []
 
+    def _reset_prepare_state(self) -> None:
+        """Clear transient preparation bookkeeping.
+
+        This resets runtime and persisted state derived from stock processing
+        and sample execution without touching backend-specific robot/session
+        state.
+        """
+        self.stocks = []
+        self.targets = []
+        if "deck" in self.config:
+            self.config["deck"] = {}
+        if "occupied_sample_locations" in self.config:
+            self.config["occupied_sample_locations"] = []
+        if "stock_tip_locations" in self.config:
+            self.config["stock_tip_locations"] = {}
+        if "stock_tip_reservations" in self.config:
+            self.config["stock_tip_reservations"] = {}
+        if "reserved_stock_tips" in self.config:
+            self.config["reserved_stock_tips"] = []
+
+    @staticmethod
+    def _is_stock_volume_fraction_target(target: dict) -> bool:
+        return isinstance(target, dict) and "stock_volume_fractions" in target
+
+    def _build_stock_volume_fraction_target(
+        self,
+        target: dict,
+    ) -> _StockVolumeFractionTarget:
+        stock_volume_fractions = target.get("stock_volume_fractions")
+        if not isinstance(stock_volume_fractions, dict) or len(stock_volume_fractions) == 0:
+            raise ValueError("stock_volume_fractions must be a non-empty mapping of stock names to fractions")
+
+        total_volume_value = target.get("total_volume")
+        if total_volume_value is None:
+            raise ValueError("stock_volume_fractions targets require total_volume")
+        total_volume = enforce_units(total_volume_value, "volume")
+
+        stocks_by_name = {stock.name: stock for stock in self.stocks}
+        normalized_fractions: dict[str, float] = {}
+        fraction_sum = 0.0
+        for stock_name, fraction in stock_volume_fractions.items():
+            normalized_name = str(stock_name).strip()
+            if not normalized_name:
+                raise ValueError("stock_volume_fractions contains an empty stock name")
+            normalized_fraction_value = enforce_units(fraction, "dimensionless")
+            normalized_fraction = float(
+                getattr(normalized_fraction_value, "magnitude", normalized_fraction_value)
+            )
+            if normalized_fraction < 0.0:
+                raise ValueError(
+                    f"stock_volume_fractions[{normalized_name!r}] must be non-negative, got {normalized_fraction}"
+                )
+            normalized_fractions[normalized_name] = normalized_fraction
+            fraction_sum += normalized_fraction
+
+        if abs(fraction_sum - 1.0) > 1e-9:
+            raise ValueError(
+                f"stock_volume_fractions must sum to 1.0, got {fraction_sum}"
+            )
+
+        protocol = []
+        stock_transfer_volumes = {}
+        total_volume_ul = float(total_volume.to("ul").magnitude)
+        for stock_name, fraction in normalized_fractions.items():
+            if stock_name not in stocks_by_name:
+                raise ValueError(f"Unknown stock '{stock_name}' in stock_volume_fractions")
+            stock = stocks_by_name[stock_name]
+            if stock.location is None:
+                raise ValueError(
+                    f"Stock '{stock_name}' does not have a configured location"
+                )
+            transfer_volume_ul = round(total_volume_ul * fraction, 6)
+            stock_transfer_volumes[stock_name] = transfer_volume_ul
+            protocol.append(
+                PipetteAction(
+                    source=stock.location,
+                    dest=target.get("location"),
+                    volume=transfer_volume_ul,
+                    tip_location=getattr(stock, "tip_location", None),
+                )
+            )
+
+        return _StockVolumeFractionTarget(
+            name=target.get("name", "Unnamed target"),
+            location=target.get("location"),
+            total_volume=total_volume,
+            stock_volume_fractions=normalized_fractions,
+            protocol=protocol,
+            stock_transfer_volumes=stock_transfer_volumes,
+        )
+
+    @staticmethod
+    def _stock_volume_fraction_procedure_plan() -> dict:
+        return {
+            "mode": "stock_volume_fractions",
+            "required_intermediate_targets": 0,
+            "stages": [],
+        }
+
     def is_feasible(
         self,
         targets: dict | list[dict],
@@ -68,6 +204,11 @@ class PrepareDriver(MassBalanceDriver):
         results: list[dict | None] = []
         for target in targets_to_check:
             try:
+                if self._is_stock_volume_fraction_target(target):
+                    direct_target = self._build_stock_volume_fraction_target(target.copy())
+                    results.append(direct_target.to_dict())
+                    continue
+
                 mb = MassBalance(minimum_volume=minimum_volume)
                 for stock in self.stocks:
                     mb.stocks.append(stock)
@@ -305,6 +446,43 @@ class PrepareDriver(MassBalanceDriver):
             return None, None
 
         feasible_result = feasibility_results[0]
+
+        if self._is_stock_volume_fraction_target(target):
+            self.before_balance(target)
+            balanced_target = self._build_stock_volume_fraction_target(target.copy())
+            procedure_plan = self._stock_volume_fraction_procedure_plan()
+            planned_mass_transfers = None
+            destination, intermediate_destinations, consumed, queue_key = self._reserve_destinations(
+                dest=dest,
+                required_intermediate_targets=0,
+            )
+            self._update_prepare_metadata(
+                feasible_result=copy.deepcopy(feasible_result),
+                balanced_target=balanced_target.to_dict(),
+                planned_mass_transfers=None,
+                procedure_plan=copy.deepcopy(procedure_plan),
+                destination=destination,
+                intermediate_destinations=[],
+            )
+            try:
+                success = self.execute_preparation(target, balanced_target, destination)
+                if success is False:
+                    self._update_prepare_metadata(execution_success=False)
+                    return None, None
+            except Exception:
+                self._update_prepare_metadata(execution_success=False)
+                self.on_prepare_exception(destination=destination, dest_was_none=(dest is None))
+                raise
+
+            self._update_prepare_metadata(execution_success=True)
+            result = self.build_prepare_result(feasible_result, balanced_target)
+            return self._augment_prepare_result(
+                result=result,
+                destination=destination,
+                intermediate_destinations=intermediate_destinations,
+                planned_mass_transfers=planned_mass_transfers,
+                procedure_plan=procedure_plan,
+            ), destination
 
         self.before_balance(target)
 

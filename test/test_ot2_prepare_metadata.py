@@ -163,3 +163,65 @@ def test_clear_sample_locations_allows_destination_reuse():
     assert cleared == ["5A1"]
     assert driver.config["occupied_sample_locations"] == ["5A2"]
     assert driver.resolve_destination("5A1") == "5A1"
+
+
+def test_reset_clears_tip_reservations_and_occupied_samples():
+    driver = StubOT2Prepare()
+    driver.config["targets"] = [{"name": "Target"}]
+    driver.config["stocks"] = [{"name": "Water", "location": "1A1"}]
+    driver.config["deck"] = {"1A1": "Water"}
+    driver.config["occupied_sample_locations"] = ["5A1", "5A2"]
+    driver.config["stock_tip_locations"] = {"Water": ["1A1", "2A1"]}
+    driver.config["stock_tip_reservations"] = {"Water": ["1A1"]}
+    driver.config["reserved_stock_tips"] = ["1A1"]
+    driver.stocks = [SimpleNamespace(name="Water", location="1A1")]
+    driver.targets = [SimpleNamespace(name="Target")]
+
+    driver.reset()
+
+    assert driver.config["targets"] == []
+    assert driver.config["stocks"] == []
+    assert driver.config["deck"] == {}
+    assert driver.config["occupied_sample_locations"] == []
+    assert driver.config["stock_tip_locations"] == {}
+    assert driver.config["stock_tip_reservations"] == {}
+    assert driver.config["reserved_stock_tips"] == []
+    assert driver.stocks == []
+    assert driver.targets == []
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_prepare_stock_volume_fractions_emits_ot2_transfers():
+    driver = StubOT2Prepare()
+    driver.config["stocks"] = [
+        {"name": "stock_Red", "masses": {"H2O": "20 g"}, "location": "1A1"},
+        {"name": "stock_Blue", "masses": {"H2O": "20 g"}, "location": "1A2"},
+        {"name": "stock_Green", "masses": {"H2O": "20 g"}, "location": "1A3"},
+        {"name": "stock_Yellow", "masses": {"H2O": "20 g"}, "location": "1A4"},
+    ]
+    driver.process_stocks()
+    target = {
+        "name": "color_sample",
+        "location": "6A1",
+        "stock_volume_fractions": {
+            "stock_Red": 0.3,
+            "stock_Blue": 0.4,
+            "stock_Green": 0.1,
+            "stock_Yellow": 0.2,
+        },
+        "total_volume": "1000 ul",
+    }
+
+    result, destination = driver.prepare(target=target, dest=target["location"])
+
+    assert destination == "6A1"
+    assert result["destination"] == "6A1"
+    assert result["stock_transfer_volumes_ul"] == {
+        "stock_Red": 300.0,
+        "stock_Blue": 400.0,
+        "stock_Green": 100.0,
+        "stock_Yellow": 200.0,
+    }
+    assert [call["source"] for call in driver.transfer_calls] == ["1A1", "1A2", "1A3", "1A4"]
+    assert [call["dest"] for call in driver.transfer_calls] == ["6A1", "6A1", "6A1", "6A1"]
+    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [300.0, 400.0, 100.0, 200.0]
