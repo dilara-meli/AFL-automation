@@ -1699,7 +1699,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             Offset mapping with ``x``, ``y``, and ``z`` keys used for tip pickup
             and tip return.
         return_tip_z_offset : float, optional
-            Additional z-offset applied when returning a tip to its origin.
+            Return-only z-offset applied when returning a tip to its origin.
             If omitted, the existing ``tip_rack_offset`` z value is used.
         fast_mixing : bool, default=False
             Reserved flag for higher-level callers.
@@ -1769,7 +1769,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         pipette_mount = pipette["mount"]
         resolve_tip_rack_offset = getattr(self, "_resolve_tip_rack_offset", None)
         if resolve_tip_rack_offset is not None:
-            resolved_tip_rack_offset = resolve_tip_rack_offset(tip_rack_offset)
+            resolved_tip_rack_offset = resolve_tip_rack_offset(
+                tip_rack_offset,
+                mount=pipette_mount,
+            )
         elif tip_rack_offset is None:
             resolved_tip_rack_offset = dict(self.config.get("tip_rack_offset", {"x": 0, "y": 0, "z": 0}))
         else:
@@ -1941,9 +1944,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
             if needs_requested_tip and self.has_tip:
                 if return_tip:
-                    self._return_tip_to_origin(
-                        pipette_id,
-                        mount=pipette_mount,
+                    self.return_tip(
+                        tip_location=self.current_tip.get("location") if self.current_tip is not None else None,
                         tip_rack_offset=resolved_tip_rack_offset,
                         return_tip_z_offset=return_tip_z_offset,
                     )
@@ -1951,30 +1953,26 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     self._drop_tip_to_trash(pipette_id)
 
             if not self.has_tip:
-                pick_up_params = {
-                    "pipetteId": pipette_id,
-                    "pipetteMount": pipette_mount,
-                    "wellLocation": None,
-                }
                 if requested_tip is not None:
-                    pick_up_params["wellLocation"] = {
-                        "origin": "top",
-                        "offset": dict(resolved_tip_rack_offset),
-                    }
-                    if hasattr(self, "_reserve_tip"):
-                        pick_up_params.update(
-                            {
-                                "labwareId": requested_tip["labware_id"],
-                                "wellName": requested_tip["well_name"],
-                            }
-                        )
-                self._execute_atomic_command(
-                    "pickUpTip",
-                    pick_up_params,
-                    check_run_status=False,
-                )
-                self.has_tip = True
-                self.last_pipette = pipette_mount
+                    requested_tip_location = (
+                        f"{self._slot_by_labware_uuid(requested_tip['labware_id'])}{requested_tip['well_name']}"
+                    )
+                    self.pickup_tip(
+                        requested_tip_location,
+                        tip_rack_offset=resolved_tip_rack_offset,
+                    )
+                else:
+                    self._execute_atomic_command(
+                        "pickUpTip",
+                        {
+                            "pipetteId": pipette_id,
+                            "pipetteMount": pipette_mount,
+                            "tipRackOffset": dict(resolved_tip_rack_offset),
+                        },
+                        check_run_status=False,
+                    )
+                    self.has_tip = True
+                    self.last_pipette = pipette_mount
             
             # 1a. If destination is on a heater-shaker, stop the shaking and latch the latch pre-flight
             was_shaking = False
@@ -2261,13 +2259,15 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             remaining -= sub_volume
         return transfers
 
-    def _resolve_tip_rack_offset(self, tip_rack_offset=None):
+    def _resolve_tip_rack_offset(self, tip_rack_offset=None, mount=None):
         """Resolve the configured tip-rack offset mapping.
 
         Parameters
         ----------
         tip_rack_offset : dict, optional
             Explicit offset override.
+        mount : str, optional
+            Pipette mount used when the configured offsets are stored per mount.
 
         Returns
         -------
@@ -2277,7 +2277,16 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         offset = self.config.get("tip_rack_offset", {"x": 0, "y": 0, "z": 0})
         if tip_rack_offset is not None:
             offset = tip_rack_offset
-        resolved = dict(offset)
+        if (
+            mount is not None
+            and isinstance(offset, dict)
+            and "x" not in offset
+            and "y" not in offset
+            and "z" not in offset
+            and mount in offset
+        ):
+            offset = offset[mount]
+        resolved = copy.deepcopy(offset)
         resolved.setdefault("x", 0)
         resolved.setdefault("y", 0)
         resolved.setdefault("z", 0)
@@ -2323,6 +2332,233 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         if (labware_id, well_name) not in available and not current_tip_matches:
             raise ValueError(f"Requested tip location {normalized} is not available")
         return {"labware_id": labware_id, "well_name": well_name}
+
+    def _resolve_tip_mount(self, tip_location):
+        """Resolve a tip location to the unique loaded mount and pipette.
+
+        Parameters
+        ----------
+        tip_location : str
+            Deck tip location such as ``"1A2"``.
+
+        Returns
+        -------
+        dict
+            Mapping with ``mount``, ``pipette_id``, ``tip_location``,
+            ``labware_id``, and ``well_name``.
+
+        Raises
+        ------
+        ValueError
+            If the tip location is invalid, unavailable, or maps to zero or
+            multiple loaded mounts.
+        """
+        normalized = str(tip_location).strip().upper()
+        if len(normalized) < 3:
+            raise ValueError(f"Requested tip location {tip_location} is invalid")
+
+        slot = normalized[0]
+        labware_info = self.config.get("loaded_labware", {}).get(str(slot))
+        if labware_info is None:
+            raise ValueError(f"Requested tip location {normalized} is not available")
+        labware_id = labware_info[0]
+
+        matches = []
+        for mount, instrument in self.config.get("loaded_instruments", {}).items():
+            if labware_id not in instrument.get("tip_racks", []):
+                continue
+            pipette_id = self.pipette_info.get(mount, {}).get("id")
+            if pipette_id is None:
+                pipette_id = instrument.get("pipette_id")
+            requested_tip = self._resolve_tip_location(mount, normalized)
+            matches.append(
+                {
+                    "mount": mount,
+                    "pipette_id": pipette_id,
+                    "tip_location": normalized,
+                    "labware_id": requested_tip["labware_id"],
+                    "well_name": requested_tip["well_name"],
+                }
+            )
+
+        if not matches:
+            raise ValueError(
+                f"No loaded instrument is configured for tip location {normalized}"
+            )
+        if len(matches) > 1:
+            mounts = ", ".join(sorted(match["mount"] for match in matches))
+            raise ValueError(
+                f"Tip location {normalized} is ambiguous across loaded mounts: {mounts}"
+            )
+        if not matches[0]["pipette_id"]:
+            raise ValueError(
+                f"Could not find pipette ID for mount {matches[0]['mount']}"
+            )
+        return matches[0]
+
+    def pickup_tip(self, tip_location, tip_rack_offset=None):
+        """Pick up a specific tip from a deck tip location.
+
+        Parameters
+        ----------
+        tip_location : str
+            Deck tip location such as ``"1A2"``.
+        tip_rack_offset : dict, optional
+            Offset mapping with ``x``, ``y``, and ``z`` keys applied during
+            pickup.
+
+        Returns
+        -------
+        dict
+            Pickup metadata including mount, pipette, and requested tip
+            location.
+
+        Raises
+        ------
+        ValueError
+            If the requested tip location is invalid or unavailable.
+        RuntimeError
+            If another tip is already attached.
+        """
+        tip_target = self._resolve_tip_mount(tip_location)
+
+        current_tip_matches = (
+            self.has_tip
+            and self.last_pipette == tip_target["mount"]
+            and self.current_tip is not None
+            and self.current_tip.get("labware_id") == tip_target["labware_id"]
+            and self.current_tip.get("well_name") == tip_target["well_name"]
+        )
+        if current_tip_matches:
+            return {
+                "mount": tip_target["mount"],
+                "pipette_id": tip_target["pipette_id"],
+                "tip_location": tip_target["tip_location"],
+                "labware_id": tip_target["labware_id"],
+                "well_name": tip_target["well_name"],
+                "status": "already_attached",
+            }
+        if self.has_tip:
+            raise RuntimeError(
+                f"Cannot pick up tip {tip_target['tip_location']} while a tip is already attached on "
+                f"{self.last_pipette} mount"
+            )
+
+        self._execute_atomic_command(
+            "pickUpTip",
+            {
+                "pipetteId": tip_target["pipette_id"],
+                "pipetteMount": tip_target["mount"],
+                "labwareId": tip_target["labware_id"],
+                "wellName": tip_target["well_name"],
+                "tipRackOffset": self._resolve_tip_rack_offset(
+                    tip_rack_offset,
+                    mount=tip_target["mount"],
+                ),
+            },
+            check_run_status=False,
+        )
+        self.has_tip = True
+        self.last_pipette = tip_target["mount"]
+        return {
+            "mount": tip_target["mount"],
+            "pipette_id": tip_target["pipette_id"],
+            "tip_location": tip_target["tip_location"],
+            "labware_id": tip_target["labware_id"],
+            "well_name": tip_target["well_name"],
+            "status": "picked_up",
+        }
+
+    def return_tip(
+        self,
+        tip_location=None,
+        tip_rack_offset=None,
+        return_tip_z_offset=None,
+    ):
+        """Return the currently attached tip to its original tiprack well.
+
+        Parameters
+        ----------
+        tip_location : str, optional
+            Expected current tip location such as ``"1A2"``. When provided,
+            this is validated against the attached tip before returning it.
+        tip_rack_offset : dict, optional
+            Offset mapping with ``x``, ``y``, and ``z`` keys applied while
+            moving to the return location.
+        return_tip_z_offset : float, optional
+            Return-only z-offset applied during the return operation.
+
+        Returns
+        -------
+        dict
+            Return metadata including the tip origin and status.
+
+        Raises
+        ------
+        ValueError
+            If the requested tip location does not match the attached tip.
+        """
+        if not self.has_tip or self.current_tip is None:
+            status = {"status": "no_tip_attached"}
+            if tip_location is not None:
+                status["tip_location"] = str(tip_location).strip().upper()
+            return status
+
+        attached_location = self.current_tip.get("location")
+        if attached_location is None:
+            slot = self.current_tip.get("slot")
+            well_name = self.current_tip.get("well_name")
+            if slot is not None and well_name is not None:
+                attached_location = f"{slot}{well_name}"
+
+        expected_tip_target = None
+        if tip_location is not None:
+            expected_tip_target = self._resolve_tip_mount(tip_location)
+            if (
+                self.current_tip.get("mount") != expected_tip_target["mount"]
+                or self.current_tip.get("labware_id") != expected_tip_target["labware_id"]
+                or self.current_tip.get("well_name") != expected_tip_target["well_name"]
+            ):
+                raise ValueError(
+                    f"Attached tip does not match requested return location {expected_tip_target['tip_location']}"
+                )
+        else:
+            mount = self.current_tip.get("mount")
+            expected_tip_target = {
+                "mount": mount,
+                "pipette_id": self.pipette_info.get(mount, {}).get("id"),
+                "tip_location": attached_location,
+                "labware_id": self.current_tip.get("labware_id"),
+                "well_name": self.current_tip.get("well_name"),
+            }
+            if expected_tip_target["pipette_id"] is None and mount in self.config.get(
+                "loaded_instruments", {}
+            ):
+                expected_tip_target["pipette_id"] = self.config["loaded_instruments"][mount].get(
+                    "pipette_id"
+                )
+
+        if not expected_tip_target.get("pipette_id"):
+            raise ValueError(
+                f"Could not find pipette ID for mount {expected_tip_target['mount']}"
+            )
+
+        self._return_tip_to_origin(
+            expected_tip_target["pipette_id"],
+            mount=expected_tip_target["mount"],
+            tip_rack_offset=tip_rack_offset,
+            return_tip_z_offset=return_tip_z_offset,
+        )
+        return {
+            "mount": expected_tip_target["mount"],
+            "pipette_id": expected_tip_target["pipette_id"],
+            "tip_location": expected_tip_target["tip_location"],
+            "labware_id": expected_tip_target["labware_id"],
+            "well_name": expected_tip_target["well_name"],
+            "status": "returned",
+            "offset": tip_rack_offset,
+            "z_offset" : return_tip_z_offset
+        }
 
     def _reserve_tip(self, mount, labware_id, well_name):
         """Reserve a specific available tip for pickup.
@@ -2390,6 +2626,32 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 check_run_status=False,
             )
 
+    def _move_above_tiprack(
+        self,
+        pipette_id,
+        labware_id,
+        well_name,
+        tip_rack_offset,
+        approach_z_offset = 40.0,
+        check_run_status=True,
+    ):
+        """Move above a target tip before issuing the pickup command."""
+        approach_offset = dict(tip_rack_offset)
+        approach_offset["z"] = approach_z_offset
+        self._execute_atomic_command(
+            "moveToWell",
+            {
+                "pipetteId": pipette_id,
+                "labwareId": labware_id,
+                "wellName": well_name,
+                "wellLocation": {
+                    "origin": "top",
+                    "offset": approach_offset,
+                },
+            },
+            check_run_status=check_run_status,
+        )
+
     def _execute_atomic_command(
         self, command_type, params=None, wait_until_complete=True, timeout=None, check_run_status=True
     ):
@@ -2435,11 +2697,23 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             self.log_debug(
                 f"Using tip from {tiprack_id} well {well} for {mount} mount"
             )
+            tip_rack_offset = self._resolve_tip_rack_offset(
+                params.get("tipRackOffset"),
+                mount=mount,
+            )
+            self._move_above_tiprack(
+                pipette_id=params["pipetteId"],
+                labware_id=tiprack_id,
+                well_name=well,
+                tip_rack_offset=tip_rack_offset,
+                approach_z_offset= 40.0, 
+                check_run_status=check_run_status,
+            )
             params["labwareId"] = tiprack_id
             params["wellName"] = well
             params["wellLocation"] = {
                 "origin": "top",
-                "offset": self._resolve_tip_rack_offset(params.get("tipRackOffset")),
+                "offset": tip_rack_offset,
             }
             params.pop("tipRackOffset", None)
             slot = self._slot_by_labware_uuid(tiprack_id)
@@ -3172,7 +3446,23 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         if labware_id is None or well_name is None:
             self._drop_tip_to_trash(pipette_id)
             return
-        offset_z = 0.0 if return_tip_z_offset is None else return_tip_z_offset
+        offset = self._resolve_tip_rack_offset(tip_rack_offset, mount=tip_mount)
+        return_offset = copy.deepcopy(offset)
+
+        # approch the tiprack safely
+        self._move_above_tiprack(
+            pipette_id=pipette_id,
+            labware_id=labware_id,
+            well_name=well_name,
+            tip_rack_offset=tip_rack_offset,
+            approach_z_offset= 50.0,
+            check_run_status=False,
+        )
+
+        # set up the drop location to be center of the tip
+        if return_tip_z_offset is not None:
+            return_offset["z"] += return_tip_z_offset
+        # move the pipette to well location with the z offset
         self._execute_atomic_command(
             "moveToWell",
             {
@@ -3180,20 +3470,18 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "labwareId": labware_id,
                 "wellName": well_name,
                 "wellLocation": {
-                    "origin": "top",
-                    "offset": {"x": 0, "y": 0, "z": offset_z},
+                    "origin": "center",
+                    "offset": dict(return_offset),
                 },
             },
             check_run_status=False,
         )
+
+        # drop the tip
         self._execute_atomic_command(
             "dropTipInPlace",
             {
                 "pipetteId": pipette_id,
-                "wellLocation": {
-                    "origin": "center",
-                    "offset": {"x": 0, "y": 0, "z": offset_z},
-                },
             },
             check_run_status=False,
         )

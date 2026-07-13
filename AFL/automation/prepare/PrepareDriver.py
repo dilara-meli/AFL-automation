@@ -146,7 +146,7 @@ class PrepareDriver(MassBalanceDriver):
             normalized_fractions[normalized_name] = normalized_fraction
             fraction_sum += normalized_fraction
 
-        if abs(fraction_sum - 1.0) > 1e-9:
+        if abs(fraction_sum - 1.0) > 1e-2:
             raise ValueError(
                 f"stock_volume_fractions must sum to 1.0, got {fraction_sum}"
             )
@@ -162,7 +162,7 @@ class PrepareDriver(MassBalanceDriver):
                 raise ValueError(
                     f"Stock '{stock_name}' does not have a configured location"
                 )
-            transfer_volume_ul = round(total_volume_ul * fraction, 6)
+            transfer_volume_ul = round(total_volume_ul * fraction)
             stock_transfer_volumes[stock_name] = transfer_volume_ul
             protocol.append(
                 PipetteAction(
@@ -190,6 +190,22 @@ class PrepareDriver(MassBalanceDriver):
             "stages": [],
         }
 
+    def _condition_stock_volume_fraction_target(
+        self,
+        direct_target: _StockVolumeFractionTarget,
+    ) -> _StockVolumeFractionTarget:
+        """Backend hook to adjust direct stock-dispense targets before validation."""
+        return direct_target
+
+    def _prepare_stock_volume_fraction_target(
+        self,
+        target: dict,
+    ) -> _StockVolumeFractionTarget:
+        direct_target = self._build_stock_volume_fraction_target(target)
+        direct_target = self._condition_stock_volume_fraction_target(direct_target)
+        self._validate_pipette_action_plan(direct_target.protocol)
+        return direct_target
+
     def is_feasible(
         self,
         targets: dict | list[dict],
@@ -205,7 +221,7 @@ class PrepareDriver(MassBalanceDriver):
         for target in targets_to_check:
             try:
                 if self._is_stock_volume_fraction_target(target):
-                    direct_target = self._build_stock_volume_fraction_target(target.copy())
+                    direct_target = self._prepare_stock_volume_fraction_target(target.copy())
                     results.append(direct_target.to_dict())
                     continue
 
@@ -270,6 +286,14 @@ class PrepareDriver(MassBalanceDriver):
 
     def before_balance(self, target: dict) -> None:
         """Subclass hook to perform backend-specific checks before solving."""
+
+    def _validate_pipette_action_plan(self, protocol: list[PipetteAction]) -> None:
+        """Validate a planned transfer protocol.
+
+        Subclasses may override this to enforce backend-specific pipette
+        constraints. The default implementation accepts all plans.
+        """
+        return None
 
     def resolve_destination(self, dest: Optional[str]) -> str:
         """Return destination identifier for this backend."""
@@ -449,7 +473,7 @@ class PrepareDriver(MassBalanceDriver):
 
         if self._is_stock_volume_fraction_target(target):
             self.before_balance(target)
-            balanced_target = self._build_stock_volume_fraction_target(target.copy())
+            balanced_target = self._prepare_stock_volume_fraction_target(target.copy())
             procedure_plan = self._stock_volume_fraction_procedure_plan()
             planned_mass_transfers = None
             destination, intermediate_destinations, consumed, queue_key = self._reserve_destinations(

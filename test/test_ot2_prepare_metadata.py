@@ -225,3 +225,106 @@ def test_prepare_stock_volume_fractions_emits_ot2_transfers():
     assert [call["source"] for call in driver.transfer_calls] == ["1A1", "1A2", "1A3", "1A4"]
     assert [call["dest"] for call in driver.transfer_calls] == ["6A1", "6A1", "6A1", "6A1"]
     assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [300.0, 400.0, 100.0, 200.0]
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_is_feasible_accepts_stock_volume_fractions_when_large_transfers_can_split():
+    driver = StubOT2Prepare()
+    driver.config["stocks"] = [
+        {"name": "stock_Red", "masses": {"H2O": "20 g"}, "location": "1A1"},
+        {"name": "stock_Blue", "masses": {"H2O": "20 g"}, "location": "1A2"},
+    ]
+    driver.process_stocks()
+    target = {
+        "name": "split_sample",
+        "location": "6A1",
+        "stock_volume_fractions": {
+            "stock_Red": 0.7,
+            "stock_Blue": 0.3,
+        },
+        "total_volume": "1000 ul",
+    }
+
+    feasible = driver.is_feasible(target)
+
+    assert feasible == [{
+        "name": "split_sample",
+        "location": "6A1",
+        "total_volume": "1000.0 ul",
+        "stock_volume_fractions": {"stock_Red": 0.7, "stock_Blue": 0.3},
+        "stock_transfer_volumes_ul": {"stock_Red": 700.0, "stock_Blue": 300.0},
+    }]
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_is_feasible_sets_tiny_stock_volume_fractions_to_zero_below_loaded_pipette_minimum():
+    driver = StubOT2Prepare()
+
+    def only_large_pipette(volume):
+        if float(volume) < 20:
+            raise ValueError("No suitable loaded pipettes found!")
+        return {"mount": "left", "name": "p300_single"}
+
+    driver.get_pipette = only_large_pipette
+    driver.config["stocks"] = [
+        {"name": "stock_Red", "masses": {"H2O": "20 g"}, "location": "1A1"},
+        {"name": "stock_Blue", "masses": {"H2O": "20 g"}, "location": "1A2"},
+    ]
+    driver.process_stocks()
+    target = {
+        "name": "tiny_sample",
+        "location": "6A1",
+        "stock_volume_fractions": {
+            "stock_Red": 0.005,
+            "stock_Blue": 0.995,
+        },
+        "total_volume": "1000 ul",
+    }
+
+    feasible = driver.is_feasible(target)
+
+    assert feasible[0]["stock_transfer_volumes_ul"] == {
+        "stock_Red": 0.0,
+        "stock_Blue": 995.0,
+    }
+    assert feasible[0]["total_volume"] == "995.0 ul"
+    assert feasible[0]["stock_volume_fractions"]["stock_Red"] == pytest.approx(0.0)
+    assert feasible[0]["stock_volume_fractions"]["stock_Blue"] == pytest.approx(1.0)
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_prepare_sets_tiny_stock_volume_fraction_transfers_to_zero_below_loaded_pipette_minimum():
+    driver = StubOT2Prepare()
+
+    def only_large_pipette(volume):
+        if float(volume) < 20:
+            raise ValueError("No suitable loaded pipettes found!")
+        return {"mount": "left", "name": "p300_single"}
+
+    driver.get_pipette = only_large_pipette
+    driver.config["stocks"] = [
+        {"name": "stock_Red", "masses": {"H2O": "20 g"}, "location": "1A1"},
+        {"name": "stock_Blue", "masses": {"H2O": "20 g"}, "location": "1A2"},
+    ]
+    driver.process_stocks()
+    target = {
+        "name": "tiny_sample",
+        "location": "6A1",
+        "stock_volume_fractions": {
+            "stock_Red": 0.005,
+            "stock_Blue": 0.995,
+        },
+        "total_volume": "1000 ul",
+    }
+
+    result, destination = driver.prepare(target=target, dest="6A1")
+
+    assert destination == "6A1"
+    assert result["stock_transfer_volumes_ul"] == {
+        "stock_Red": 0.0,
+        "stock_Blue": 995.0,
+    }
+    assert result["total_volume"] == "995.0 ul"
+    assert result["stock_volume_fractions"]["stock_Red"] == pytest.approx(0.0)
+    assert result["stock_volume_fractions"]["stock_Blue"] == pytest.approx(1.0)
+    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [995.0]

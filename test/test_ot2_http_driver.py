@@ -74,6 +74,26 @@ class StubOT2HTTPDriver(OT2HTTPDriver):
                 tiprack_id, well = self.get_tip(mount)
                 params["labwareId"] = tiprack_id
                 params["wellName"] = well
+            pickup_offset = self._resolve_tip_rack_offset(params.get("tipRackOffset"))
+            approach_offset = dict(pickup_offset)
+            approach_offset["z"] = max(approach_offset.get("z", 0), 0)
+            self.executed_commands.append((
+                "moveToWell",
+                {
+                    "pipetteId": params["pipetteId"],
+                    "labwareId": tiprack_id,
+                    "wellName": well,
+                    "wellLocation": {
+                        "origin": "top",
+                        "offset": approach_offset,
+                    },
+                },
+            ))
+            params["wellLocation"] = {
+                "origin": "top",
+                "offset": pickup_offset,
+            }
+            params.pop("tipRackOffset", None)
             self.has_tip = True
             self.last_pipette = mount
             self.current_tip = {
@@ -267,6 +287,135 @@ def test_transfer_with_tip_location_uses_requested_tip():
     assert transfer_result["requested_tip"]["location"] == "1A2"
 
 
+def test_pickup_tip_uses_requested_tip_location_and_returns_metadata():
+    driver = _configured_driver()
+
+    pickup_result = driver.pickup_tip("1A2")
+
+    move_to_well = next(params for command, params in driver.executed_commands if command == "moveToWell")
+    pick_up = next(params for command, params in driver.executed_commands if command == "pickUpTip")
+    assert move_to_well["labwareId"] == "tiprack-left"
+    assert move_to_well["wellName"] == "A2"
+    assert pick_up["labwareId"] == "tiprack-left"
+    assert pick_up["wellName"] == "A2"
+    assert pickup_result["mount"] == "left"
+    assert pickup_result["pipette_id"] == "left-id"
+    assert pickup_result["tip_location"] == "1A2"
+    assert pickup_result["status"] == "picked_up"
+    assert driver.current_tip["well_name"] == "A2"
+    assert driver.config["available_tips"]["left"] == [("tiprack-left", "A1")]
+
+
+def test_pickup_tip_with_local_offset_does_not_mutate_global_or_input_offsets():
+    driver = _configured_driver()
+    driver.config["tip_rack_offset"] = {
+        "left": {"x": 0.0, "y": 0.0, "z": -2.0},
+        "right": {"x": 1.0, "y": 2.0, "z": 3.0},
+    }
+    local_offset = {"x": 1.5, "y": -0.5, "z": -4.0}
+
+    driver.pickup_tip("1A2", tip_rack_offset=local_offset)
+
+    move_to_well = next(params for command, params in driver.executed_commands if command == "moveToWell")
+    pick_up = next(params for command, params in driver.executed_commands if command == "pickUpTip")
+
+    assert move_to_well["wellLocation"]["offset"] == {"x": 1.5, "y": -0.5, "z": 0}
+    assert pick_up["wellLocation"]["offset"] == {"x": 1.5, "y": -0.5, "z": -4.0}
+    assert local_offset == {"x": 1.5, "y": -0.5, "z": -4.0}
+    assert driver.config["tip_rack_offset"] == {
+        "left": {"x": 0.0, "y": 0.0, "z": -2.0},
+        "right": {"x": 1.0, "y": 2.0, "z": 3.0},
+    }
+
+
+def test_pickup_tip_moves_above_tip_before_pickup():
+    driver = _configured_driver()
+
+    driver.pickup_tip("1A2", tip_rack_offset={"x": 1.0, "y": -1.0, "z": -3.0})
+
+    move_index = next(i for i, (command, _) in enumerate(driver.executed_commands) if command == "moveToWell")
+    pickup_index = next(i for i, (command, _) in enumerate(driver.executed_commands) if command == "pickUpTip")
+    move_to_well = driver.executed_commands[move_index][1]
+    pick_up = driver.executed_commands[pickup_index][1]
+
+    assert move_index < pickup_index
+    assert move_to_well["labwareId"] == "tiprack-left"
+    assert move_to_well["wellName"] == "A2"
+    assert move_to_well["wellLocation"]["origin"] == "top"
+    assert move_to_well["wellLocation"]["offset"] == {"x": 1.0, "y": -1.0, "z": 0}
+    assert pick_up["wellLocation"]["offset"] == {"x": 1.0, "y": -1.0, "z": -3.0}
+
+
+def test_pickup_tip_rejects_when_different_tip_is_already_attached():
+    driver = _configured_driver()
+    driver.pickup_tip("1A1")
+
+    with pytest.raises(RuntimeError, match="already attached"):
+        driver.pickup_tip("1A2")
+
+
+def test_return_tip_returns_attached_tip_to_origin():
+    driver = _configured_driver()
+    driver.pickup_tip("1A2")
+    driver.executed_commands.clear()
+
+    return_result = driver.return_tip("1A2")
+
+    command_names = [name for name, _ in driver.executed_commands]
+    assert "moveToWell" in command_names
+    assert "dropTipInPlace" in command_names
+    assert return_result["mount"] == "left"
+    assert return_result["tip_location"] == "1A2"
+    assert return_result["status"] == "returned"
+    assert driver.has_tip is False
+    assert driver.current_tip is None
+    assert driver.config["available_tips"]["left"] == [
+        ("tiprack-left", "A2"),
+        ("tiprack-left", "A1"),
+    ]
+
+
+def test_return_tip_with_local_offset_does_not_mutate_global_or_input_offsets():
+    driver = _configured_driver()
+    driver.config["tip_rack_offset"] = {
+        "left": {"x": 0.0, "y": 0.0, "z": -2.0},
+        "right": {"x": 1.0, "y": 2.0, "z": 3.0},
+    }
+    local_offset = {"x": 1.5, "y": -0.5, "z": -4.0}
+    driver.pickup_tip("1A2")
+    driver.executed_commands.clear()
+
+    driver.return_tip(
+        "1A2",
+        tip_rack_offset=local_offset,
+        return_tip_z_offset=-1.0,
+    )
+
+    move_to_well = next(
+        params
+        for command, params in reversed(driver.executed_commands)
+        if command == "moveToWell" and params.get("labwareId") == "tiprack-left"
+    )
+    drop_tip = next(params for command, params in driver.executed_commands if command == "dropTipInPlace")
+
+    assert move_to_well["wellLocation"]["offset"] == {"x": 1.5, "y": -0.5, "z": -4.0}
+    assert drop_tip["wellLocation"]["offset"] == {"x": 1.5, "y": -0.5, "z": -5.0}
+    assert local_offset == {"x": 1.5, "y": -0.5, "z": -4.0}
+    assert driver.config["tip_rack_offset"] == {
+        "left": {"x": 0.0, "y": 0.0, "z": -2.0},
+        "right": {"x": 1.0, "y": 2.0, "z": 3.0},
+    }
+
+
+def test_return_tip_without_attached_tip_is_noop():
+    driver = _configured_driver()
+
+    result = driver.return_tip("1A1")
+
+    assert result == {"status": "no_tip_attached", "tip_location": "1A1"}
+    assert driver.executed_commands == []
+
+
 def test_transfer_with_tip_location_reuses_current_tip_when_already_attached():
     driver = _configured_driver()
 
@@ -285,9 +434,30 @@ def test_transfer_without_tip_location_skips_stock_reserved_tips():
 
     driver.transfer("1A1", "1A2", 50)
 
+    move_to_well = next(params for command, params in driver.executed_commands if command == "moveToWell")
     pick_up = next(params for command, params in driver.executed_commands if command == "pickUpTip")
+    assert move_to_well["labwareId"] == "tiprack-left"
+    assert move_to_well["wellName"] == "A2"
     assert pick_up["wellName"] == "A2"
     assert driver.config["available_tips"]["left"] == [("tiprack-left", "A1")]
+
+
+def test_transfer_moves_above_tip_before_pickup():
+    driver = _configured_driver()
+    driver.config["tip_rack_offset"] = {"x": 1.5, "y": -0.5, "z": -2.0}
+
+    driver.transfer("1A1", "1A2", 50)
+
+    move_index = next(i for i, (command, _) in enumerate(driver.executed_commands) if command == "moveToWell")
+    pickup_index = next(i for i, (command, _) in enumerate(driver.executed_commands) if command == "pickUpTip")
+    move_to_well = driver.executed_commands[move_index][1]
+    pick_up = driver.executed_commands[pickup_index][1]
+
+    assert move_index < pickup_index
+    assert move_to_well["labwareId"] == "tiprack-left"
+    assert move_to_well["wellName"] == "A1"
+    assert move_to_well["wellLocation"]["offset"] == {"x": 1.5, "y": -0.5, "z": 0}
+    assert pick_up["wellLocation"]["offset"] == {"x": 1.5, "y": -0.5, "z": -2.0}
 
 
 def test_get_tip_status_reports_general_and_reserved_counts():
@@ -455,13 +625,101 @@ def test_transfer_tip_rack_offset_applies_to_pickup_and_return():
     pick_up = next(params for command, params in driver.executed_commands if command == "pickUpTip")
     move_to_well = next(
         params
-        for command, params in driver.executed_commands
+        for command, params in reversed(driver.executed_commands)
         if command == "moveToWell" and params.get("labwareId") == "tiprack-left"
     )
+    drop_tip = next(params for command, params in driver.executed_commands if command == "dropTipInPlace")
 
     assert pick_up["wellLocation"]["offset"] == offset
     assert move_to_well["wellLocation"]["offset"] == offset
+    assert drop_tip["wellLocation"]["offset"] == offset
     assert transfer_result["options"]["tip_rack_offset"] == offset
+
+
+def test_return_tip_z_offset_adds_to_local_return_z_without_mutating_tip_rack_offset():
+    driver = _configured_driver()
+    offset = {"x": 1.5, "y": -0.5, "z": -2.0}
+
+    driver.transfer(
+        "1A1",
+        "1A2",
+        50,
+        drop_tip=False,
+        return_tip=True,
+        tip_location="1A2",
+        tip_rack_offset=offset,
+        return_tip_z_offset=-1.0,
+    )
+
+    move_to_well = next(
+        params
+        for command, params in reversed(driver.executed_commands)
+        if command == "moveToWell" and params.get("labwareId") == "tiprack-left"
+    )
+    drop_tip = next(params for command, params in driver.executed_commands if command == "dropTipInPlace")
+    expected_offset = {"x": 1.5, "y": -0.5, "z": -3.0}
+
+    assert move_to_well["wellLocation"]["offset"] == offset
+    assert drop_tip["wellLocation"]["offset"] == expected_offset
+    assert offset == {"x": 1.5, "y": -0.5, "z": -2.0}
+    assert driver.config["tip_rack_offset"] == {"x": 0, "y": 0, "z": 0}
+
+
+def test_return_tip_z_offset_does_not_change_later_pickup_global_offset():
+    driver = _configured_driver()
+    driver.config["tip_rack_offset"] = {"x": 0.5, "y": 1.0, "z": -2.0}
+
+    driver.transfer(
+        "1A1",
+        "1A2",
+        50,
+        drop_tip=False,
+        return_tip=True,
+        tip_location="1A2",
+        return_tip_z_offset=-7.0,
+    )
+    driver.executed_commands.clear()
+
+    driver.pickup_tip("1A1")
+
+    pick_up = next(params for command, params in driver.executed_commands if command == "pickUpTip")
+
+    assert driver.config["tip_rack_offset"] == {"x": 0.5, "y": 1.0, "z": -2.0}
+    assert pick_up["wellLocation"]["offset"] == {"x": 0.5, "y": 1.0, "z": -2.0}
+
+
+def test_return_tip_z_offset_does_not_mutate_mount_scoped_global_offsets():
+    driver = _configured_driver()
+    driver.config["tip_rack_offset"] = {
+        "left": {"x": 0, "y": 0, "z": 0.0},
+        "right": {"x": 1.0, "y": 2.0, "z": 3.0},
+    }
+
+    driver.transfer(
+        "1A1",
+        "1A2",
+        50,
+        drop_tip=False,
+        return_tip=True,
+        tip_location="1A2",
+        return_tip_z_offset=-5.0,
+    )
+    move_to_well = next(
+        params
+        for command, params in reversed(driver.executed_commands)
+        if command == "moveToWell" and params.get("labwareId") == "tiprack-left"
+    )
+    driver.executed_commands.clear()
+
+    driver.pickup_tip("1A1")
+    pick_up = next(params for command, params in driver.executed_commands if command == "pickUpTip")
+
+    assert move_to_well["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 0.0}
+    assert driver.config["tip_rack_offset"] == {
+        "left": {"x": 0, "y": 0, "z": 0.0},
+        "right": {"x": 1.0, "y": 2.0, "z": 3.0},
+    }
+    assert pick_up["wellLocation"]["offset"] == {"x": 0, "y": 0, "z": 0.0}
 
 
 def test_get_pipette_raises_when_no_loaded_pipettes_exist():

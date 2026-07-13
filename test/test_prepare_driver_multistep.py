@@ -20,6 +20,8 @@ class DummyPrepare(PrepareDriver):
         self.data = {}
         self.last_plan = None
         self.raise_on_plan = False
+        self.raise_on_protocol_validation = False
+        self.last_validated_protocol = None
 
     def resolve_destination(self, dest):
         if dest is not None:
@@ -56,6 +58,18 @@ class DummyPrepare(PrepareDriver):
         if self.raise_on_plan:
             raise RuntimeError('planned failure')
         return True
+
+    def _validate_pipette_action_plan(self, protocol):
+        self.last_validated_protocol = [
+            {
+                'source': step.source,
+                'dest': step.dest,
+                'volume': step.volume,
+            }
+            for step in protocol
+        ]
+        if self.raise_on_protocol_validation:
+            raise ValueError('protocol contains infeasible transfer volume')
 
 
 
@@ -236,11 +250,49 @@ def test_prepare_accepts_stock_volume_fraction_targets():
         {'source': '1A1', 'dest': '1A4', 'volume': 300.0},
         {'source': '1A2', 'dest': '1A4', 'volume': 700.0},
     ]
+    assert driver.last_validated_protocol == [
+        {'source': '1A1', 'dest': '1A4', 'volume': 300.0},
+        {'source': '1A2', 'dest': '1A4', 'volume': 700.0},
+    ]
 
     prepare_data = driver.data['prepare']
     assert prepare_data['requested_target']['stock_volume_fractions'] == {'Stock1': 0.3, 'Stock2': 0.7}
     assert prepare_data['balanced_target']['stock_transfer_volumes_ul'] == {'Stock1': 300.0, 'Stock2': 700.0}
     assert prepare_data['execution_success'] is True
+
+
+@pytest.mark.usefixtures('mixdb')
+def test_is_feasible_rejects_stock_volume_fraction_targets_with_invalid_protocol_volumes():
+    driver = DummyPrepare()
+    driver.config.write = False
+    driver.raise_on_protocol_validation = True
+    _seed_stocks(driver)
+
+    feasible = driver.is_feasible(_stock_fraction_target(), enable_multistep_dilution=False)
+
+    assert feasible == [None]
+    assert driver.last_validated_protocol == [
+        {'source': '1A1', 'dest': '1A4', 'volume': 300.0},
+        {'source': '1A2', 'dest': '1A4', 'volume': 700.0},
+    ]
+
+
+@pytest.mark.usefixtures('mixdb')
+def test_prepare_rejects_stock_volume_fraction_targets_with_invalid_protocol_volumes():
+    driver = DummyPrepare()
+    driver.config.write = False
+    driver.raise_on_protocol_validation = True
+    _seed_stocks(driver)
+    driver.config['prep_targets'] = ['5A1']
+
+    result, destination = driver.prepare(_stock_fraction_target(), enable_multistep_dilution=False)
+
+    assert result is None
+    assert destination is None
+    assert driver.last_validated_protocol == [
+        {'source': '1A1', 'dest': '1A4', 'volume': 300.0},
+        {'source': '1A2', 'dest': '1A4', 'volume': 700.0},
+    ]
 
 
 @pytest.mark.usefixtures('mixdb')

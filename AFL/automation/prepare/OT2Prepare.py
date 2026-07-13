@@ -3,6 +3,7 @@ import warnings
 from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
 from AFL.automation.prepare.PrepareDriver import PrepareDriver
 from AFL.automation.shared.utilities import listify
+from AFL.automation.shared.units import enforce_units
 
 
 class OT2Prepare(OT2HTTPDriver, PrepareDriver):
@@ -98,6 +99,168 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         )
         status.append(f"{len(self.config['prep_targets'])} preparation targets available")
         return status
+
+    def _validate_pipette_action_plan(self, protocol):
+        """Validate planned transfer volumes against loaded OT-2 pipettes."""
+        split_up_transfers = getattr(self, "_split_up_transfers", None)
+        can_split = split_up_transfers is not None and hasattr(self, "max_transfer")
+        for action in protocol:
+            volume_ul = float(action.volume)
+            if volume_ul <= 0:
+                continue
+            subtransfers = [volume_ul]
+            if can_split:
+                subtransfers = split_up_transfers(volume_ul)
+            if not subtransfers:
+                continue
+            for subtransfer_ul in subtransfers:
+                try:
+                    self.get_pipette(subtransfer_ul)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Planned transfer from {action.source} to {action.dest} with volume "
+                        f"{volume_ul} uL is not executable with the loaded pipettes. "
+                        f"Subtransfer {subtransfer_ul} uL failed: {exc}"
+                    ) from exc
+
+    @staticmethod
+    def _infer_pipette_min_volume(pipette_name):
+        """Infer a pipette minimum transfer volume from its model name."""
+        if pipette_name is None:
+            return None
+        normalized = str(pipette_name).strip().lower()
+        known_minima = {
+            "p10": 1.0,
+            "p10_single": 1.0,
+            "p10_single_gen1": 1.0,
+            "p20": 1.0,
+            "p20_single": 1.0,
+            "p20_single_gen2": 1.0,
+            "p50": 5.0,
+            "p50_single": 5.0,
+            "p100": 10.0,
+            "p100_single": 10.0,
+            "p300": 20.0,
+            "p300_single": 20.0,
+            "p1000": 100.0,
+            "p1000_single": 100.0,
+        }
+        return known_minima.get(normalized)
+
+    def _loaded_pipette_minimum_volumes(self):
+        """Return candidate positive minimum transfer volumes for active pipettes."""
+        minima = []
+
+        update_pipettes = getattr(self, "_update_pipettes", None)
+        if update_pipettes is not None:
+            try:
+                update_pipettes()
+            except Exception:
+                pass
+
+        get_active_pipettes = getattr(self, "_get_active_pipettes", None)
+        if get_active_pipettes is not None:
+            try:
+                active_pipettes = get_active_pipettes()
+            except Exception:
+                active_pipettes = {}
+            for info in active_pipettes.values():
+                min_volume = info.get("min_volume")
+                if min_volume is None:
+                    min_volume = self._infer_pipette_min_volume(info.get("name"))
+                if min_volume is not None and float(min_volume) > 0:
+                    minima.append(float(min_volume))
+
+        if not minima:
+            for instrument in self.config.get("loaded_instruments", {}).values():
+                min_volume = self._infer_pipette_min_volume(instrument.get("name"))
+                if min_volume is not None and float(min_volume) > 0:
+                    minima.append(float(min_volume))
+
+        min_transfer = getattr(self, "min_transfer", None)
+        if min_transfer is not None and float(min_transfer) > 0:
+            minima.append(float(min_transfer))
+
+        unique_minima = []
+        for min_volume in sorted(minima):
+            if min_volume not in unique_minima:
+                unique_minima.append(min_volume)
+        return unique_minima
+
+    def _closest_feasible_transfer_volume(self, requested_volume_ul):
+        """Return the nearest OT-2-executable transfer volume for a request."""
+        requested_volume_ul = float(requested_volume_ul)
+        if requested_volume_ul <= 0:
+            return 0.0
+
+        try:
+            self.get_pipette(requested_volume_ul)
+            return requested_volume_ul
+        except ValueError:
+            pass
+
+        candidate_minima = []
+        for candidate_volume_ul in self._loaded_pipette_minimum_volumes():
+            try:
+                self.get_pipette(candidate_volume_ul)
+            except ValueError:
+                continue
+            candidate_minima.append(candidate_volume_ul)
+
+        if candidate_minima:
+            nearest_positive_volume_ul = candidate_minima[0]
+            if requested_volume_ul < (nearest_positive_volume_ul / 2.0):
+                return 0.0
+
+        for candidate_volume_ul in candidate_minima:
+            if candidate_volume_ul < requested_volume_ul:
+                continue
+            try:
+                self.get_pipette(candidate_volume_ul)
+                return candidate_volume_ul
+            except ValueError:
+                continue
+
+        raise ValueError(
+            f"No feasible OT-2 transfer volume found for requested aliquot {requested_volume_ul} uL"
+        )
+
+    def _condition_stock_volume_fraction_target(self, direct_target):
+        """Adjust undersized stock-fraction transfers to executable OT-2 aliquots."""
+        adjusted_transfer_volumes = {}
+        adjusted_protocol = []
+        adjusted_any_transfer = False
+
+        for action in direct_target.protocol:
+            adjusted_volume_ul = round(
+                self._closest_feasible_transfer_volume(action.volume),
+                6,
+            )
+            if abs(adjusted_volume_ul - float(action.volume)) > 1e-9:
+                adjusted_any_transfer = True
+
+            adjusted_action = action
+            adjusted_action.kwargs["volume"] = adjusted_volume_ul
+            adjusted_protocol.append(adjusted_action)
+
+            stock_name = self.stocks_by_location(action.source).name
+            adjusted_transfer_volumes[stock_name] = adjusted_volume_ul
+
+        if not adjusted_any_transfer:
+            return direct_target
+
+        actual_total_volume_ul = round(sum(adjusted_transfer_volumes.values()), 6)
+        if actual_total_volume_ul <= 0:
+            raise ValueError("Adjusted stock-fraction target has no executable transfer volume")
+
+        direct_target.protocol = adjusted_protocol
+        direct_target.stock_transfer_volumes = adjusted_transfer_volumes
+        direct_target.stock_volume_fractions = {
+            stock_name: adjusted_volume_ul / actual_total_volume_ul
+            for stock_name, adjusted_volume_ul in adjusted_transfer_volumes.items()
+        }
+        direct_target.volume = enforce_units(f"{actual_total_volume_ul} ul", "volume")
+        return direct_target
 
     def _normalize_locations(self, locations):
         """Normalize and deduplicate deck locations.
@@ -928,7 +1091,8 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         """
         result_dict = balanced_target.to_dict()
         if hasattr(balanced_target, "volume") and balanced_target.volume is not None:
-            result_dict["total_volume"] = f"{balanced_target.volume.to('ul').magnitude} ul"
+            total_volume_ul = round(float(balanced_target.volume.to("ul").magnitude), 6)
+            result_dict["total_volume"] = f"{total_volume_ul} ul"
         return result_dict
 
     def process_stocks(self):
