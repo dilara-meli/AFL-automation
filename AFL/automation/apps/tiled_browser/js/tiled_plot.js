@@ -261,7 +261,7 @@ function getEffectiveSampleDim() {
 function getVariableMode(info, sampleDim, catalog) {
     const classification = classifyCatalogItem(info, catalog, sampleDim);
     if (classification === 'image_2d' || classification === 'image_stack_3d') return 'image';
-    if (classification === 'line_1d' || classification === 'stacked_2d') return 'line';
+    if (classification === 'line_1d' || classification === 'stacked_2d' || classification === 'sample_1d') return 'line';
     return 'other';
 }
 
@@ -584,12 +584,12 @@ async function updateVariableOptions() {
 
     if (useManifest) {
         const catalog = AppState.plotManifest.catalog;
-        const sampleDim = AppState.plotManifest.sample_dim || 'index';
+        const sampleDim = AppState.plotManifest.sample_dim || null;
         firstEntry.sampleDim = sampleDim;
         firstEntry.numSamples = AppState.plotManifest.sample_count || 1;
-        AppState.sampleDim = sampleDim;
+        AppState.sampleDim = sampleDim || 'entry';
         AppState.xVariable = null;
-        maxIndex = Math.max((AppState.plotManifest.dims?.[sampleDim] ?? AppState.plotManifest.sample_count ?? 1) - 1, 0);
+        maxIndex = Math.max((sampleDim ? (AppState.plotManifest.dims?.[sampleDim] ?? AppState.plotManifest.sample_count ?? 1) : (AppState.plotManifest.sample_count ?? 1)) - 1, 0);
         variableOptions = Object.entries(catalog)
             .filter(([name, info]) => {
                 if (getCatalogCoordNames(catalog).has(name)) return false;
@@ -609,10 +609,19 @@ async function updateVariableOptions() {
             .map(([name, info]) => ({
                 name,
                 mode: getVariableMode(info, sampleDim, catalog),
-                classification: classifyCatalogItem(info, catalog, sampleDim)
+                classification: classifyCatalogItem(info, catalog, sampleDim),
+                dims: info.dims || []
             }))
             .filter(option => option.mode === 'line' || option.mode === 'image');
-        AppState.xVariable = null;
+        const numericAxisOptions = Object.entries(catalog)
+            .filter(([_, info]) => {
+                if (!'fiu'.includes(info?.kind || '')) return false;
+                const dims = info?.dims || [];
+                return dims.length === 1 && (!sampleDim || dims[0] === sampleDim);
+            })
+            .map(([name]) => name);
+        const preferredX = preferredXColumn(numericAxisOptions, firstEntry.metadata || {});
+        AppState.xVariable = numericAxisOptions.includes(AppState.xVariable) ? AppState.xVariable : preferredX;
         AppState.sampleDim = sampleDim || 'entry';
         maxIndex = firstEntry.numSamples - 1;
     } else {
@@ -654,12 +663,32 @@ async function updateVariableOptions() {
             scatterSelect.appendChild(option);
         });
     } else {
-        const placeholder = document.createElement('option');
-        placeholder.value = '';
-        placeholder.textContent = 'Auto';
-        placeholder.selected = true;
-        xAxisSelect.appendChild(placeholder);
-        xAxisSelect.disabled = true;
+        if (!useManifest && firstEntry.structureFamily === 'container') {
+            const catalog = firstEntry.varCatalog || {};
+            const sampleDim = firstEntry.sampleDim;
+            const numericAxisOptions = Object.entries(catalog)
+                .filter(([_, info]) => {
+                    if (!'fiu'.includes(info?.kind || '')) return false;
+                    const dims = info?.dims || [];
+                    return dims.length === 1 && (!sampleDim || dims[0] === sampleDim);
+                })
+                .map(([name]) => name);
+            numericAxisOptions.forEach(name => {
+                const xOption = document.createElement('option');
+                xOption.value = name;
+                xOption.textContent = name;
+                xOption.selected = name === AppState.xVariable;
+                xAxisSelect.appendChild(xOption);
+            });
+            xAxisSelect.disabled = numericAxisOptions.length === 0;
+        } else {
+            const placeholder = document.createElement('option');
+            placeholder.value = '';
+            placeholder.textContent = 'Auto';
+            placeholder.selected = true;
+            xAxisSelect.appendChild(placeholder);
+            xAxisSelect.disabled = true;
+        }
 
         variableOptions.forEach((optionInfo, idx) => {
             const option = document.createElement('option');
@@ -669,15 +698,21 @@ async function updateVariableOptions() {
                 : optionInfo.name;
             option.dataset.mode = optionInfo.mode;
             option.dataset.classification = optionInfo.classification;
-            if (idx === 0) option.selected = true;
+            if (AppState.scatterVariables.includes(optionInfo.name)) {
+                option.selected = true;
+            } else if (AppState.scatterVariables.length === 0 && optionInfo.mode === 'line' && optionInfo.name !== AppState.xVariable) {
+                option.selected = true;
+            } else if (idx === 0 && scatterSelect.options.length === 0) {
+                option.selected = true;
+            }
             scatterSelect.appendChild(option);
         });
     }
 
-    if (!(!useManifest && firstEntry.structureFamily !== 'container')) {
+    if (useManifest) {
         AppState.xVariable = null;
     }
-    xAxisSelect.disabled = useManifest || firstEntry.structureFamily === 'container';
+    xAxisSelect.disabled = useManifest ? true : xAxisSelect.disabled;
     AppState.scatterVariables = Array.from(scatterSelect.selectedOptions).map(opt => opt.value);
 
     const compSelect = document.getElementById('composition-var');
@@ -736,7 +771,7 @@ async function updateVariableOptions() {
 
     const sampleDimSelect = document.getElementById('sample-dim-select');
     if (useManifest) {
-        const sampleDim = AppState.plotManifest.sample_dim || 'index';
+        const sampleDim = AppState.plotManifest.sample_dim || 'entry';
         sampleDimSelect.innerHTML = `<option value="${sampleDim}" selected>${sampleDim}</option>`;
     } else if (firstEntry.structureFamily === 'container' && firstEntry.varCatalog) {
         const allDims = new Set();
@@ -832,10 +867,19 @@ async function buildScatteringTraces() {
                 continue;
             }
 
-            // x-axis: for 1D the single dim IS the q-axis; for 2D find the non-sample dim
-            const qDim = isMultiEntry1D
-                ? varInfo.dims[0]
-                : varInfo.dims.find(d => d !== entry.sampleDim);
+            // Prefer the user-selected X variable when it is a numeric 1D variable on the active dimension.
+            const selectedXInfo = AppState.xVariable ? entry.varCatalog?.[AppState.xVariable] : null;
+            const canUseSelectedX = Boolean(
+                selectedXInfo
+                && 'fiu'.includes(selectedXInfo.kind || '')
+                && (selectedXInfo.dims || []).length === 1
+                && (!entry.sampleDim || selectedXInfo.dims[0] === entry.sampleDim)
+            );
+            const qDim = canUseSelectedX
+                ? AppState.xVariable
+                : (isMultiEntry1D
+                    ? varInfo.dims[0]
+                    : varInfo.dims.find(d => d !== entry.sampleDim));
             let xData = null;
             if (qDim && entry.varCatalog?.[qDim]) {
                 try {
@@ -851,8 +895,8 @@ async function buildScatteringTraces() {
                 ? xData[AppState.dataIndex]
                 : xData;
             traces.push({
-                x: xRow || yRow.map((_, j) => j),
-                y: yRow,
+                x: Array.isArray(xRow) ? toNumericArray(xRow) : yRow.map((_, j) => j),
+                y: toNumericArray(yRow),
                 type: 'scatter',
                 mode: 'markers',
                 name: varName,
