@@ -939,6 +939,11 @@ class DriverWebAppsMixin:
         if sample_dim not in dataset.dims:
             sample_dim = self._detect_sample_dimension(dataset, allow_size_fallback=True)
 
+        # For single-entry datasets, a lone physical axis like "point" should
+        # remain a plottable line axis, not be reinterpreted as a sample axis.
+        if sample_dim and len(dataset.dims) == 1 and int(dataset.attrs.get('_sample_count', 1)) <= 1:
+            sample_dim = None
+
         catalog = {}
         for coord_name, coord in dataset.coords.items():
             catalog[coord_name] = self._describe_plot_dataarray(
@@ -1406,22 +1411,14 @@ class DriverWebAppsMixin:
         if len(datasets) == 1:
             dataset = datasets[0]
             metadata = metadata_list[0]
-            
-            # Detect the sample dimension from the dataset
-            # For single entries, avoid guessing a random axis as "sample".
+
+            # Preserve the native dataset shape for single-entry plotting.
+            # Adding a synthetic sample dimension turns simple 1D traces into
+            # sample-indexed arrays that the plot UI no longer treats as lines.
             sample_dim = self._detect_sample_dimension(dataset, allow_size_fallback=False)
-            if sample_dim is None:
-                # Ensure plotter paths have a sample dimension even for one entry.
-                # Use concat_dim for consistency with multi-entry flow.
-                sample_dim = concat_dim
-                dataset = dataset.expand_dims({sample_dim: [0]})
-                dataset = dataset.assign_coords({
-                    'sample_name': (sample_dim, [metadata['sample_name']]),
-                    'sample_uuid': (sample_dim, [metadata['sample_uuid']]),
-                    'entry_id': (sample_dim, [metadata['entry_id']]),
-                })
-            
-            # Add metadata as dataset attributes (not coordinates, since we don't have a new dim)
+
+            # Add metadata as dataset attributes. For single entries we do not
+            # synthesize sample coordinates unless the dataset already has one.
             dataset.attrs['sample_name'] = metadata['sample_name']
             dataset.attrs['sample_uuid'] = metadata['sample_uuid']
             dataset.attrs['entry_id'] = metadata['entry_id']
