@@ -1,6 +1,6 @@
 import xarray as xr
 
-from AFL.automation.instrument.gamry import GamryDriver
+from AFL.automation.instrument.GamryDriver import GamryDriver
 
 
 class _PanelTestGamryDriver(GamryDriver):

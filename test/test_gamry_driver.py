@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from AFL.automation.instrument.gamry import GamryDriver
+from AFL.automation.instrument.GamryDriver import GamryDriver
 from AFL.automation.instrument.gamry_worker import (
     _build_measurement_result_from_data,
     _calculate_dpv_differential_current,
@@ -349,7 +349,7 @@ def test_start_service_launches_worker(monkeypatch, driver):
         captured['kwargs'] = kwargs
         return process
 
-    monkeypatch.setattr('AFL.automation.instrument.gamry.subprocess.Popen', fake_popen)
+    monkeypatch.setattr('AFL.automation.instrument.GamryDriver.subprocess.Popen', fake_popen)
 
     result = driver.startService()
 
