@@ -40,7 +40,7 @@ from pathlib import Path
 
 from AFL.automation.APIServer.APIServer import APIServer
 from AFL.automation.APIServer.data.DataTiled import DataTiled
-from AFL.automation.instrument.gamry import GamryDriver
+from AFL.automation.instrument.GamryDriver import GamryDriver
 
 
 def build_driver(args: argparse.Namespace) -> GamryDriver:
