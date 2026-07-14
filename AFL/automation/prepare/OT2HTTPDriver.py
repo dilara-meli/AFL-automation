@@ -3454,15 +3454,17 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             pipette_id=pipette_id,
             labware_id=labware_id,
             well_name=well_name,
-            tip_rack_offset=tip_rack_offset,
-            approach_z_offset= 50.0,
+            tip_rack_offset=offset,
+            approach_z_offset=50.0,
             check_run_status=False,
         )
 
-        # set up the drop location to be center of the tip
+        # Apply any return-only z adjustment without mutating the configured or
+        # caller-provided offset mapping used for future pickups.
         if return_tip_z_offset is not None:
             return_offset["z"] += return_tip_z_offset
-        # move the pipette to well location with the z offset
+
+        # Move to the base well location before issuing the return/drop command.
         self._execute_atomic_command(
             "moveToWell",
             {
@@ -3471,7 +3473,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "wellName": well_name,
                 "wellLocation": {
                     "origin": "center",
-                    "offset": dict(return_offset),
+                    "offset": dict(offset),
                 },
             },
             check_run_status=False,
@@ -3482,6 +3484,12 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             "dropTipInPlace",
             {
                 "pipetteId": pipette_id,
+                "labwareId": labware_id,
+                "wellName": well_name,
+                "wellLocation": {
+                    "origin": "center",
+                    "offset": dict(return_offset),
+                },
             },
             check_run_status=False,
         )
