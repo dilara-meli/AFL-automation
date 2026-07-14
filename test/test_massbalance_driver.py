@@ -259,6 +259,73 @@ def test_massbalance_driver_balance_status_metadata_failed():
 
 
 @pytest.mark.usefixtures("mixdb")
+def test_add_stock_normalizes_legacy_single_source_payload():
+    mb = MassBalanceDriver()
+    mb.config.write = False
+    mb.reset_stocks()
+
+    mb.add_stock(
+        {
+            'name': 'WaterStock',
+            'masses': {'H2O': '20 g'},
+            'location': '1a1',
+            'total_volume': '10 ml',
+            'tip_location': ['2A1', '2A2'],
+        }
+    )
+
+    assert mb.config['stocks'] == [
+        {
+            'name': 'WaterStock',
+            'masses': {'H2O': '20 g'},
+            'tip_location': ['2A1', '2A2'],
+            'sources': [{'location': '1A1', 'initial_volume': '10 ml'}],
+        }
+    ]
+    assert mb.config['stock_inventory'] == {
+        'WaterStock@1A1': {'remaining_volume': '10 ml'}
+    }
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_upload_stocks_preserves_multi_source_schema_and_list_stocks_reports_remaining_volume():
+    mb = MassBalanceDriver()
+    mb.config.write = False
+    mb.reset_stocks()
+
+    result = mb.upload_stocks(
+        stocks=[
+            {
+                'name': 'BufferA',
+                'masses': {'H2O': '20 g'},
+                'tip_location': ['6A1', '6A2'],
+                'sources': [
+                    {'location': '1A1', 'initial_volume': '700 ul'},
+                    {'location': '1A2', 'initial_volume': '1000 ul'},
+                ],
+            }
+        ],
+        reset=True,
+    )
+
+    assert result['success'] is True
+    assert len(mb.stocks) == 2
+    listed = mb.list_stocks()
+    assert listed == [
+        {
+            'name': 'BufferA',
+            'masses': {'H2O': '20 g'},
+            'tip_location': ['6A1', '6A2'],
+            'sources': [
+                {'location': '1A1', 'initial_volume': '700 ul', 'stock_id': 'BufferA@1A1', 'remaining_volume': '700 ul'},
+                {'location': '1A2', 'initial_volume': '1000 ul', 'stock_id': 'BufferA@1A2', 'remaining_volume': '1000 ul'},
+            ],
+            'remaining_volume': '1700.0 ul',
+        }
+    ]
+
+
+@pytest.mark.usefixtures("mixdb")
 def test_massbalance_driver_balance_report_includes_status_metadata():
     mb = _build_balanced_massbalance_driver()
 
