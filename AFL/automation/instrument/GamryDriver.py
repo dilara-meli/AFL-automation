@@ -123,14 +123,20 @@ class GamryDriver(Driver):
         self._last_panel_result = None
         self._last_connection_result = None
         Driver.__init__(self, name='GamryDriver', defaults=self.gather_defaults(), overrides=overrides)
-        if gamry_env_path is not None:
-            self.config['gamry_env_path'] = gamry_env_path
+
+        default_env_path = pathlib.Path(self.defaults['gamry_env_path'])
+        configured_env_path = pathlib.Path(gamry_env_path) if gamry_env_path is not None else pathlib.Path(self.config['gamry_env_path'])
+        if gamry_env_path is not None or not configured_env_path.exists():
+            self.config['gamry_env_path'] = str(configured_env_path if gamry_env_path is not None else default_env_path)
+
         if instrument_name is not None:
             self.config['instrument_name'] = instrument_name
+
         default_worker_path = pathlib.Path(__file__).with_name('gamry_worker.py')
         configured_worker_path = pathlib.Path(self.config['worker_path']) if self.config['worker_path'] else None
         if configured_worker_path is None or not configured_worker_path.exists():
             self.config['worker_path'] = str(default_worker_path)
+
         self.config['dpv_irange_mode'] = self._normalize_dpv_irange_mode(self.config.get('dpv_irange_mode', 'fixed'))
         self._refresh_collect_cv_quickbar()
         self.useful_links['Gamry Panel'] = '/gamry_panel'
@@ -328,7 +334,7 @@ class GamryDriver(Driver):
             'connection': self._last_connection_snapshot(),
         }
 
-    @Driver.unqueued()
+    @Driver.queued()
     @Driver.quickbar(qb={'button_text': 'Collect CV', 'params': {}})
     def collectCV(
         self,
@@ -346,10 +352,11 @@ class GamryDriver(Driver):
         current_range_mode: Optional[str] = None,
         instrument_name: Optional[str] = None,
         return_data: bool = False,
+        measurement_mode: Optional[str] = None,
         **kwargs,
     ):
         dataset = self.runMeasurement(
-            measurement_mode='cv',
+            measurement_mode='cv' if measurement_mode is None else measurement_mode,
             instrument_name=instrument_name,
             return_data=True,
             initial_voltage=initial_voltage,
@@ -370,41 +377,6 @@ class GamryDriver(Driver):
             return dataset
         return dataset
 
-    @Driver.unqueued()
-    def runCVNow(
-        self,
-        initial_voltage: Optional[float] = None,
-        apex1_voltage: Optional[float] = None,
-        apex2_voltage: Optional[float] = None,
-        final_voltage: Optional[float] = None,
-        apex1_hold: Optional[float] = None,
-        apex2_hold: Optional[float] = None,
-        final_hold: Optional[float] = None,
-        scan_rate: Optional[float] = None,
-        step_size: Optional[float] = None,
-        cycles: Optional[int] = None,
-        scan_delay: Optional[float] = None,
-        current_range_mode: Optional[str] = None,
-        instrument_name: Optional[str] = None,
-        **kwargs,
-    ):
-        return self.runMeasurementNow(
-            measurement_mode='cv',
-            instrument_name=instrument_name,
-            initial_voltage=initial_voltage,
-            apex1_voltage=apex1_voltage,
-            apex2_voltage=apex2_voltage,
-            final_voltage=final_voltage,
-            apex1_hold=apex1_hold,
-            apex2_hold=apex2_hold,
-            final_hold=final_hold,
-            scan_rate=scan_rate,
-            step_size=step_size,
-            cycles=cycles,
-            scan_delay=scan_delay,
-            current_range_mode=current_range_mode,
-            **kwargs,
-        )
 
     @Driver.unqueued()
     def runMeasurement(
@@ -433,7 +405,22 @@ class GamryDriver(Driver):
         return dataset
 
     @Driver.queued()
-    def runDepositionCA(
+    def runCV(
+        self,
+        instrument_name: Optional[str] = None,
+        **kwargs,
+    ):
+        return self.runMeasurement(
+            measurement_mode='cv',
+            instrument_name=instrument_name,
+            return_data=True,
+            task_name='runCV',
+            step_name='cv',
+            **kwargs,
+        )
+
+    @Driver.queued()
+    def runCA(
         self,
         instrument_name: Optional[str] = None,
         **kwargs,
@@ -442,28 +429,28 @@ class GamryDriver(Driver):
             measurement_mode='ca',
             instrument_name=instrument_name,
             return_data=True,
-            task_name='runDepositionCA',
-            step_name='deposition_ca',
+            task_name='runCA',
+            step_name='ca',
             **kwargs,
         )
 
     @Driver.queued()
-    def runAnalyteCA(
+    def runSine(
         self,
         instrument_name: Optional[str] = None,
         **kwargs,
     ):
         return self.runMeasurement(
-            measurement_mode='ca',
+            measurement_mode='sine',
             instrument_name=instrument_name,
             return_data=True,
-            task_name='runAnalyteCA',
-            step_name='analyte_ca',
+            task_name='runSine',
+            step_name='sine',
             **kwargs,
         )
 
     @Driver.queued()
-    def runStrippingDPV(
+    def runDPV(
         self,
         instrument_name: Optional[str] = None,
         **kwargs,
@@ -472,8 +459,8 @@ class GamryDriver(Driver):
             measurement_mode='dpv',
             instrument_name=instrument_name,
             return_data=True,
-            task_name='runStrippingDPV',
-            step_name='stripping_dpv',
+            task_name='runDPV',
+            step_name='dpv',
             **kwargs,
         )
 
@@ -506,30 +493,30 @@ class GamryDriver(Driver):
             **kwargs,
         )
 
-    @Driver.unqueued()
-    def runMeasurementNow(
-        self,
-        measurement_mode: Optional[str] = None,
-        instrument_name: Optional[str] = None,
-        **kwargs,
-    ):
-        dataset = self.runMeasurement(
-            measurement_mode=measurement_mode,
-            instrument_name=instrument_name,
-            return_data=True,
-            **kwargs,
-        )
-        self._last_cv_dataset = dataset
-        if self.data is not None:
-            self.data['main_dataset'] = dataset
-            self.data.finalize()
-        panel_result = self._build_panel_result(dataset)
-        self._last_panel_result = panel_result
-        return {
-            'status': 'ok',
-            'service': self._service_status(),
-            'result': panel_result,
-        }
+    # @Driver.unqueued()
+    # def runMeasurementNow(
+    #     self,
+    #     measurement_mode: Optional[str] = None,
+    #     instrument_name: Optional[str] = None,
+    #     **kwargs,
+    # ):
+    #     dataset = self.runMeasurement(
+    #         measurement_mode=measurement_mode,
+    #         instrument_name=instrument_name,
+    #         return_data=True,
+    #         **kwargs,
+    #     )
+    #     self._last_cv_dataset = dataset
+    #     if self.data is not None:
+    #         self.data['main_dataset'] = dataset
+    #         self.data.finalize()
+    #     panel_result = self._build_panel_result(dataset)
+    #     self._last_panel_result = panel_result
+    #     return {
+    #         'status': 'ok',
+    #         'service': self._service_status(),
+    #         'result': panel_result,
+    #     }
 
     @Driver.unqueued()
     def updatePanelConfig(
@@ -1167,9 +1154,9 @@ class GamryDriver(Driver):
         }
 
 
-_OVERRIDE_MAIN_MODULE_NAME = 'GamryDriver'
+# _OVERRIDE_MAIN_MODULE_NAME = 'GamryDriver'
 _DEFAULT_CUSTOM_CONFIG = {
-    '_classname': 'AFL.automation.instrument.gamry.GamryDriver',
+    '_classname': 'AFL.automation.instrument.GamryDriver.GamryDriver',
 }
 _DEFAULT_PORT = 5051
 
