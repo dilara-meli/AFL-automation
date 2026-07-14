@@ -1,5 +1,6 @@
 import warnings
 
+from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
 from AFL.automation.prepare.PrepareDriver import PrepareDriver
 from AFL.automation.shared.utilities import listify
@@ -56,6 +57,9 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         OT2HTTPDriver.__init__(self, overrides=overrides)
         PrepareDriver.__init__(self, driver_name="OT2Prepare", overrides=overrides)
         self.last_target_location = None
+        self.stock_sources_by_id = {}
+        self.stock_sources_by_group = {}
+        self.stock_sources_by_location = {}
         self.useful_links["View Deck"] = "/visualize_deck"
 
     def status(self):
@@ -91,6 +95,15 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         status = []
         status.append(f"Stocks: {len(self.stocks)} configured")
         status.append(f"Stock locations: {self.config['stock_locations']}")
+        stock_inventory = self._stock_inventory_snapshot(include_sources=False)
+        if stock_inventory:
+            remaining_by_stock = {}
+            for stock_name, entry in stock_inventory.items():
+                remaining_volume_ul = entry.get("remaining_volume_ul")
+                remaining_by_stock[stock_name] = (
+                    f"{remaining_volume_ul} uL" if remaining_volume_ul is not None else "unknown"
+                )
+            status.append(f"Stock inventory remaining: {remaining_by_stock}")
         status.append(
             f"Stock-reserved tips: {len(self.config.get('reserved_stock_tips', []))}"
         )
@@ -314,11 +327,14 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         True
         """
         stock_tip_locations = {}
-        for stock in getattr(self, "stocks", []):
-            tip_location = getattr(stock, "tip_location", None) or getattr(stock, "tip", None)
+        for stock in self.config.get("stocks", []):
+            stock_name = str(stock.get("name", "")).strip()
+            if not stock_name:
+                continue
+            tip_location = stock.get("tip_location", stock.get("tip"))
             if tip_location is None:
                 continue
-            stock_tip_locations[stock.name] = self._normalize_locations(listify(tip_location))
+            stock_tip_locations[stock_name] = self._normalize_locations(listify(tip_location))
 
         existing_reservations = self.config.get("stock_tip_reservations", {})
         normalized_reservations = {}
@@ -341,6 +357,103 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         self.config["stock_tip_locations"] = stock_tip_locations
         self.config["stock_tip_reservations"] = normalized_reservations
         self.config["reserved_stock_tips"] = self._normalize_locations(active_reserved)
+
+    def _rebuild_stock_source_indexes(self):
+        """Rebuild runtime lookup tables for physical stock sources."""
+        self.stock_sources_by_id = {}
+        self.stock_sources_by_group = {}
+        self.stock_sources_by_location = {}
+        for stock in getattr(self, "stocks", []):
+            stock_id = getattr(stock, "stock_id", None)
+            stock_group = getattr(stock, "stock_group", stock.name)
+            if stock_id is not None:
+                self.stock_sources_by_id[stock_id] = stock
+            self.stock_sources_by_group.setdefault(stock_group, []).append(stock)
+            if stock.location is not None:
+                self.stock_sources_by_location[stock.location] = stock
+
+    def _resolve_stock_sources(self, stock_name):
+        stock_name = str(stock_name).strip()
+        if stock_name in getattr(self, "stock_sources_by_group", {}):
+            return list(self.stock_sources_by_group[stock_name])
+        return super()._resolve_stock_sources(stock_name)
+
+    def _stock_inventory_snapshot(self, stock_name=None, include_sources=True):
+        snapshot = {}
+        if not getattr(self, "stocks", None):
+            return snapshot
+
+        grouped_sources = {}
+        for stock in self.stocks:
+            grouped_sources.setdefault(
+                getattr(stock, "stock_group", stock.name),
+                [],
+            ).append(stock)
+
+        requested_name = None if stock_name is None else str(stock_name).strip()
+        for group_name, sources in grouped_sources.items():
+            if requested_name is not None and group_name != requested_name:
+                continue
+            total_remaining_ul = 0.0
+            total_known = False
+            source_entries = []
+            for source in sources:
+                remaining_ul = None
+                if getattr(source, "volume", None) is not None:
+                    try:
+                        remaining_ul = round(float(source.volume.to("ul").magnitude), 6)
+                    except Exception:
+                        remaining_ul = None
+                if remaining_ul is not None:
+                    total_remaining_ul += remaining_ul
+                    total_known = True
+                if include_sources:
+                    source_entries.append(
+                        {
+                            "stock_id": getattr(source, "stock_id", None),
+                            "location": source.location,
+                            "remaining_volume_ul": remaining_ul,
+                            "tip_location": getattr(source, "tip_location", None),
+                        }
+                    )
+            entry = {
+                "remaining_volume_ul": round(total_remaining_ul, 6) if total_known else None,
+            }
+            if include_sources:
+                entry["sources"] = source_entries
+            snapshot[group_name] = entry
+        return snapshot
+
+    def _consume_stock_volume(self, source_location, consumed_volume_ul):
+        """Deplete tracked stock volume for a physical source well."""
+        try:
+            stock = self.stocks_by_location(source_location)
+        except ValueError:
+            return {
+                "stock_id": None,
+                "source_stock_group": self.config.get("deck", {}).get(source_location),
+                "remaining_before_ul": None,
+                "remaining_after_ul": None,
+                "consumed_volume_ul": round(float(consumed_volume_ul), 6),
+            }
+        before_ul = None
+        after_ul = None
+        if getattr(stock, "volume", None) is not None:
+            before_ul = round(float(stock.volume.to("ul").magnitude), 6)
+            stock.measure_out(f"{float(consumed_volume_ul)} ul", deplete=True)
+            after_ul = round(float(stock.volume.to("ul").magnitude), 6)
+            inventory = dict(self.config.get("stock_inventory", {}))
+            inventory[getattr(stock, "stock_id", f"{stock.name}@{stock.location}")] = {
+                "remaining_volume": f"{after_ul} ul"
+            }
+            self.config["stock_inventory"] = inventory
+        return {
+            "stock_id": getattr(stock, "stock_id", None),
+            "source_stock_group": getattr(stock, "stock_group", stock.name),
+            "remaining_before_ul": before_ul,
+            "remaining_after_ul": after_ul,
+            "consumed_volume_ul": round(float(consumed_volume_ul), 6),
+        }
 
     def _ordered_stock_tip_candidates(self, stock_name, step_tip_location=None):
         """Return prioritized tip candidates for a stock transfer.
@@ -771,6 +884,10 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                     volume=volume_ul,
                     **transfer_params,
                 )
+                depletion_info = self._consume_stock_volume(
+                    source,
+                    sum(transfer_result.get("subtransfers_ul", [])) or float(volume_ul),
+                )
                 self._record_prepare_transfer(
                     stage_type="single",
                     source=source,
@@ -784,6 +901,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                         "dest": destination,
                         "source_stock_name": stock_name,
                     },
+                    extra=depletion_info,
                 )
                 self._activate_stock_tip_reservation(stock_name, selected_tip_location)
             except Exception as e:
@@ -911,6 +1029,12 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             transfer_params = self.get_transfer_params("default")
         transfer_result = self.transfer(source=source, dest=dest, volume=volume_ul, **transfer_params)
         self._activate_stock_tip_reservation(stock_name, selected_tip_location)
+        depletion_info = {}
+        if stock_name is not None:
+            depletion_info = self._consume_stock_volume(
+                source,
+                sum(transfer_result.get("subtransfers_ul", [])) or float(volume_ul),
+            )
         self._record_prepare_transfer(
             stage_type=stage_type,
             source=source,
@@ -920,7 +1044,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             transfer_params=transfer_params,
             transfer_result=transfer_result,
             planned_transfer=planned_transfer,
-            extra=extra,
+            extra=dict((extra or {}), **depletion_info),
         )
 
     def execute_preparation_plan(self, target, balanced_target, destination, procedure_plan, intermediate_destinations):
@@ -1069,8 +1193,11 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         ValueError
             If no stock is configured at the requested location.
         """
+        normalized = self._normalize_locations([location])[0]
+        if normalized in getattr(self, "stock_sources_by_location", {}):
+            return self.stock_sources_by_location[normalized]
         for stock in self.stocks:
-            if stock.location == location:
+            if stock.location == normalized:
                 return stock
         raise ValueError(f"No stock configured at location '{location}'")
 
@@ -1093,6 +1220,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         if hasattr(balanced_target, "volume") and balanced_target.volume is not None:
             total_volume_ul = round(float(balanced_target.volume.to("ul").magnitude), 6)
             result_dict["total_volume"] = f"{total_volume_ul} ul"
+        result_dict["stock_inventory_after"] = self._stock_inventory_snapshot()
         return result_dict
 
     def process_stocks(self):
@@ -1104,6 +1232,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         reverse deck map and stock-tip reservation state.
         """
         PrepareDriver.process_stocks(self)
+        self._rebuild_stock_source_indexes()
         self._update_deck_config()
         self._sync_stock_tip_tracking()
 
@@ -1117,10 +1246,19 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         True
         """
         deck_config = {}
-        stock_locations = self.config.get("stock_locations", {})
-        for stock_name, deck_location in stock_locations.items():
-            deck_config[deck_location] = stock_name
+        for stock in getattr(self, "stocks", []):
+            if stock.location is None:
+                continue
+            deck_config[stock.location] = getattr(stock, "stock_group", stock.name)
         self.config["deck"] = deck_config
+
+    @Driver.unqueued()
+    def get_stock_inventory(self, stock_name=None, include_sources=True):
+        self.process_stocks()
+        return self._stock_inventory_snapshot(
+            stock_name=stock_name,
+            include_sources=bool(include_sources),
+        )
 
     def get_transfer_params(self, stock_name):
         """Return merged transfer parameters for a stock.

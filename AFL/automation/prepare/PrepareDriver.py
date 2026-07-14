@@ -157,21 +157,18 @@ class PrepareDriver(MassBalanceDriver):
         for stock_name, fraction in normalized_fractions.items():
             if stock_name not in stocks_by_name:
                 raise ValueError(f"Unknown stock '{stock_name}' in stock_volume_fractions")
-            stock = stocks_by_name[stock_name]
-            if stock.location is None:
-                raise ValueError(
-                    f"Stock '{stock_name}' does not have a configured location"
-                )
             transfer_volume_ul = round(total_volume_ul * fraction)
             stock_transfer_volumes[stock_name] = transfer_volume_ul
-            protocol.append(
-                PipetteAction(
-                    source=stock.location,
-                    dest=target.get("location"),
-                    volume=transfer_volume_ul,
-                    tip_location=getattr(stock, "tip_location", None),
+            allocations = self._allocate_stock_volume(stock_name, transfer_volume_ul)
+            for allocation in allocations:
+                protocol.append(
+                    PipetteAction(
+                        source=allocation["location"],
+                        dest=target.get("location"),
+                        volume=allocation["allocated_volume_ul"],
+                        tip_location=allocation.get("tip_location"),
+                    )
                 )
-            )
 
         return _StockVolumeFractionTarget(
             name=target.get("name", "Unnamed target"),
@@ -286,6 +283,61 @@ class PrepareDriver(MassBalanceDriver):
 
     def before_balance(self, target: dict) -> None:
         """Subclass hook to perform backend-specific checks before solving."""
+
+    def _resolve_stock_sources(self, stock_name: str) -> list[Solution]:
+        sources = []
+        for stock in self.stocks:
+            logical_name = getattr(stock, "stock_group", stock.name)
+            if logical_name == stock_name:
+                sources.append(stock)
+        return sources
+
+    def _allocate_stock_volume(self, stock_name: str, required_volume_ul: float) -> list[dict]:
+        required_volume_ul = float(required_volume_ul)
+        if required_volume_ul <= 0:
+            return []
+
+        sources = self._resolve_stock_sources(stock_name)
+        if not sources:
+            raise ValueError(f"Unknown stock '{stock_name}' in stock_volume_fractions")
+
+        allocations = []
+        remaining_volume_ul = required_volume_ul
+        for stock in sources:
+            if stock.location is None:
+                continue
+            available_volume_ul = None
+            if getattr(stock, "volume", None) is not None:
+                try:
+                    available_volume_ul = float(stock.volume.to("ul").magnitude)
+                except Exception:
+                    available_volume_ul = None
+
+            allocation_volume_ul = remaining_volume_ul
+            if available_volume_ul is not None:
+                allocation_volume_ul = min(remaining_volume_ul, available_volume_ul)
+            if allocation_volume_ul <= 0:
+                continue
+
+            allocations.append(
+                {
+                    "stock_id": getattr(stock, "stock_id", None),
+                    "stock_name": stock_name,
+                    "location": stock.location,
+                    "allocated_volume_ul": round(float(allocation_volume_ul), 6),
+                    "tip_location": getattr(stock, "tip_location", None),
+                }
+            )
+            remaining_volume_ul = round(remaining_volume_ul - float(allocation_volume_ul), 6)
+            if remaining_volume_ul <= 1e-6:
+                break
+
+        if remaining_volume_ul > 1e-6:
+            raise ValueError(
+                f"Not enough volume remaining across stock sources for '{stock_name}'. "
+                f"Requested {required_volume_ul} uL, {remaining_volume_ul} uL could not be allocated."
+            )
+        return allocations
 
     def _validate_pipette_action_plan(self, protocol: list[PipetteAction]) -> None:
         """Validate a planned transfer protocol.

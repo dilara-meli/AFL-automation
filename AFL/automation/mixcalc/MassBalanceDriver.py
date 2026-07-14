@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import sys
 import time
@@ -18,6 +19,7 @@ from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.mixcalc.Solution import Solution
 from AFL.automation.mixcalc.MixDB import MixDB
 from AFL.automation.shared.units import enforce_units
+from AFL.automation.shared.utilities import listify
 
 
 def _is_finite(v):
@@ -221,6 +223,7 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
     defaults = {
         'minimum_volume': '20 ul',
         'stocks': [],
+        'stock_inventory': {},
         'targets': [],
         'tol': 1e-3,
         'enable_multistep_dilution': False,
@@ -292,6 +295,145 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
             raise ValueError('No targets have been added; Must call process_stocks before accessing components')
         return {component for target in self.targets for component in target.components}
 
+    @staticmethod
+    def _normalize_stock_location(location):
+        if location is None:
+            raise ValueError('Stock source location is required')
+        if not isinstance(location, str):
+            raise TypeError(
+                f"Stock source location must be a string, got {type(location).__name__}"
+            )
+        normalized = location.strip().upper()
+        if not normalized:
+            raise ValueError('Stock source location cannot be empty')
+        return normalized
+
+    @classmethod
+    def _make_stock_source_id(cls, stock_name: str, location: str) -> str:
+        return f"{str(stock_name).strip()}@{cls._normalize_stock_location(location)}"
+
+    @classmethod
+    def _normalize_stock_source(cls, source: Dict) -> Dict:
+        if not isinstance(source, dict):
+            raise TypeError(
+                f"Stock source must be a mapping, got {type(source).__name__}"
+            )
+        if source.get('tip') is not None or source.get('tip_location') is not None:
+            raise ValueError('tip_location must be defined once at the stock level, not per source')
+        normalized = {
+            'location': cls._normalize_stock_location(source.get('location')),
+        }
+        if source.get('initial_volume') is not None:
+            normalized['initial_volume'] = source.get('initial_volume')
+        return normalized
+
+    @classmethod
+    def _normalize_stock_definition(cls, stock: Dict) -> Dict:
+        if not isinstance(stock, dict):
+            raise TypeError(f"Stock definition must be a mapping, got {type(stock).__name__}")
+        normalized = copy.deepcopy(stock)
+        stock_name = str(normalized.get('name', '')).strip()
+        if not stock_name:
+            raise ValueError('Stock definition requires a non-empty name')
+        normalized['name'] = stock_name
+
+        location = normalized.get('location')
+        sources = normalized.get('sources')
+        if location is not None and sources:
+            raise ValueError("Specify either top-level location or sources, not both")
+
+        if sources:
+            normalized_sources = [
+                cls._normalize_stock_source(source)
+                for source in listify(sources)
+            ]
+        elif location is not None:
+            normalized_sources = [
+                cls._normalize_stock_source(
+                    {
+                        'location': location,
+                        'initial_volume': normalized.get('total_volume'),
+                    }
+                )
+            ]
+        else:
+            normalized_sources = []
+
+        seen_locations = set()
+        for source in normalized_sources:
+            location_key = source['location']
+            if location_key in seen_locations:
+                raise ValueError(
+                    f"Stock '{stock_name}' defines duplicate source location {location_key}"
+                )
+            seen_locations.add(location_key)
+
+        normalized.pop('location', None)
+        normalized.pop('total_volume', None)
+        normalized['sources'] = normalized_sources
+        return normalized
+
+    def _initialize_stock_inventory_entry(self, stock: Dict) -> None:
+        inventory = dict(self.config.get('stock_inventory', {}))
+        for source in stock.get('sources', []):
+            stock_id = self._make_stock_source_id(stock['name'], source['location'])
+            if stock_id in inventory:
+                continue
+            inventory[stock_id] = {
+                'remaining_volume': source.get('initial_volume'),
+            }
+        self.config['stock_inventory'] = inventory
+
+    def _normalize_and_store_stocks(self, stocks: List[Dict]) -> List[Dict]:
+        normalized_stocks = []
+        seen_locations = {}
+        inventory = dict(self.config.get('stock_inventory', {}))
+        for stock in stocks:
+            normalized = self._normalize_stock_definition(stock)
+            for source in normalized.get('sources', []):
+                location = source['location']
+                existing_stock = seen_locations.get(location)
+                if existing_stock is not None:
+                    raise ValueError(
+                        f"Stock source location {location} is already assigned to stock '{existing_stock}'"
+                    )
+                seen_locations[location] = normalized['name']
+                stock_id = self._make_stock_source_id(normalized['name'], location)
+                if stock_id not in inventory:
+                    inventory[stock_id] = {
+                        'remaining_volume': source.get('initial_volume'),
+                    }
+            normalized_stocks.append(normalized)
+
+        self.config['stocks'] = normalized_stocks
+        self.config['stock_inventory'] = inventory
+        return normalized_stocks
+
+    def _runtime_stock_configs(self, stock_config: Dict) -> List[Dict]:
+        runtime_configs = []
+        base = copy.deepcopy(stock_config)
+        sources = base.pop('sources', [])
+        tip_location = base.get('tip_location', base.get('tip'))
+        if not sources:
+            return [base]
+        for source in sources:
+            runtime_config = copy.deepcopy(base)
+            runtime_config['location'] = source['location']
+            if tip_location is not None:
+                runtime_config['tip_location'] = tip_location
+            stock_id = self._make_stock_source_id(runtime_config['name'], source['location'])
+            inventory_entry = self.config.get('stock_inventory', {}).get(stock_id, {})
+            remaining_volume = inventory_entry.get('remaining_volume')
+            if remaining_volume is None:
+                remaining_volume = source.get('initial_volume')
+            if remaining_volume is not None:
+                remaining_volume_qty = enforce_units(remaining_volume, 'volume')
+                if float(remaining_volume_qty.to('ul').magnitude) <= 0:
+                    continue
+                runtime_config['total_volume'] = remaining_volume
+            runtime_configs.append(runtime_config)
+        return runtime_configs
+
     def process_stocks(self):
         self._process_stocks_with_diagnostics(False)
 
@@ -300,16 +442,35 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
         diagnostics = []
         if capture_diagnostics:
             self.last_stock_load_diagnostics = diagnostics
-        for idx, stock_config in enumerate(self.config['stocks']):
-            if capture_diagnostics:
-                stock, diag = self._build_solution_with_diagnostics(stock_config, idx)
-                if diag:
-                    diagnostics.append(diag)
-            else:
-                stock = Solution(**stock_config)
-            new_stocks.append(stock)
-            if 'stock_locations' in self.config and stock.location is not None:
-                self.config['stock_locations'][stock.name] = stock.location
+        normalized_stocks = self._normalize_and_store_stocks(self.config['stocks'])
+        stock_locations = {}
+        for idx, stock_config in enumerate(normalized_stocks):
+            source_locations = [source['location'] for source in stock_config.get('sources', [])]
+            if 'stock_locations' in self.config:
+                stock_locations[stock_config['name']] = (
+                    source_locations[0] if len(source_locations) == 1 else source_locations
+                )
+            for runtime_config in self._runtime_stock_configs(stock_config):
+                if capture_diagnostics:
+                    stock, diag = self._build_solution_with_diagnostics(runtime_config, idx)
+                    if diag:
+                        diagnostics.append(diag)
+                else:
+                    stock = Solution(**runtime_config)
+                stock.stock_group = stock_config['name']
+                stock.stock_id = (
+                    self._make_stock_source_id(stock_config['name'], stock.location)
+                    if stock.location is not None
+                    else None
+                )
+                new_stocks.append(stock)
+                inventory_entry = self.config.get('stock_inventory', {}).get(stock.stock_id, {})
+                if stock.stock_id is not None and inventory_entry.get('remaining_volume') is None and stock.volume is not None:
+                    self.config['stock_inventory'][stock.stock_id] = {
+                        'remaining_volume': f"{float(stock.volume.to('ul').magnitude)} ul"
+                    }
+        if 'stock_locations' in self.config:
+            self.config['stock_locations'] = stock_locations
         self.stocks = new_stocks
         return diagnostics
 
@@ -386,13 +547,15 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
             self.reset_stocks()
         else:
             prev = list(self.config['stocks'])
-        self.config['stocks'] = self.config['stocks'] + [solution]
-        if 'stock_locations' in self.config and solution.get('location') is not None:
-            self.config['stock_locations'][solution['name']] = solution['location']
+        prev_inventory = dict(self.config.get('stock_inventory', {}))
+        normalized_solution = self._normalize_stock_definition(solution)
+        self.config['stocks'] = self.config['stocks'] + [normalized_solution]
+        self._initialize_stock_inventory_entry(normalized_solution)
         try:
             self.process_stocks()
         except Exception as e:
             self.config['stocks'] = prev
+            self.config['stock_inventory'] = prev_inventory
             self.process_stocks()
             raise e
         self.config._update_history()
@@ -413,6 +576,7 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
 
     def reset_stocks(self):
         self.config['stocks'] = []
+        self.config['stock_inventory'] = {}
         if 'stock_locations' in self.config:
             self.config['stock_locations'].clear()
         self.config._update_history()
@@ -581,18 +745,20 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
             stocks = []
         prev_stocks = list(self.config['stocks'])
         prev_locs = dict(self.config['stock_locations']) if 'stock_locations' in self.config else {}
+        prev_inventory = dict(self.config.get('stock_inventory', {}))
         try:
             if reset:
                 self.reset_stocks()
-            for stock in stocks:
-                self.config['stocks'] = self.config['stocks'] + [stock]
-                if 'stock_locations' in self.config and stock.get('location') is not None:
-                    self.config['stock_locations'][stock['name']] = stock['location']
+            normalized_stocks = [self._normalize_stock_definition(stock) for stock in stocks]
+            self.config['stocks'] = self.config['stocks'] + normalized_stocks
+            for stock in normalized_stocks:
+                self._initialize_stock_inventory_entry(stock)
             diagnostics = self._process_stocks_with_diagnostics(True)
-            history_source = self._save_stock_snapshot(stocks=stocks, tags=tags)
-            return {'success': True, 'count': len(stocks), 'diagnostics': diagnostics, 'history_source': history_source}
+            history_source = self._save_stock_snapshot(stocks=normalized_stocks, tags=tags)
+            return {'success': True, 'count': len(normalized_stocks), 'diagnostics': diagnostics, 'history_source': history_source}
         except Exception as e:
             self.config['stocks'] = prev_stocks
+            self.config['stock_inventory'] = prev_inventory
             if 'stock_locations' in self.config:
                 self.config['stock_locations'].clear()
                 self.config['stock_locations'].update(prev_locs)
@@ -697,7 +863,29 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
     @Driver.unqueued()
     def list_stocks(self):
         self.process_stocks()
-        return [_solution_to_display_dict(stock) for stock in self.stocks]
+        inventory = self.config.get('stock_inventory', {})
+        listed_stocks = []
+        for stock in self.config.get('stocks', []):
+            entry = copy.deepcopy(stock)
+            aggregate_remaining_ul = 0.0
+            aggregate_known = False
+            for source in entry.get('sources', []):
+                stock_id = self._make_stock_source_id(entry['name'], source['location'])
+                remaining_volume = inventory.get(stock_id, {}).get('remaining_volume')
+                source['stock_id'] = stock_id
+                source['remaining_volume'] = remaining_volume
+                if remaining_volume is None:
+                    continue
+                try:
+                    aggregate_remaining_ul += float(enforce_units(remaining_volume, 'volume').to('ul').magnitude)
+                    aggregate_known = True
+                except Exception:
+                    continue
+            entry['remaining_volume'] = (
+                f"{round(aggregate_remaining_ul, 6)} ul" if aggregate_known else None
+            )
+            listed_stocks.append(entry)
+        return listed_stocks
 
     @Driver.unqueued()
     def list_stock_history(self):
