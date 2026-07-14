@@ -19,7 +19,7 @@ from AFL.automation.APIServer.data.DataPacket import DataPacket
 
 class GamryDriver(Driver):
     defaults = {}
-    defaults['gamry_env_path'] = r'C:\Users\dnm33\Documents\GamryPython\.venv'
+    defaults['gamry_env_path'] = ''
     defaults['worker_path'] = ''
     defaults['instrument_name'] = 'PSTAT'
     defaults['process_name'] = 'AFL_GamryDriver'
@@ -124,10 +124,13 @@ class GamryDriver(Driver):
         self._last_connection_result = None
         Driver.__init__(self, name='GamryDriver', defaults=self.gather_defaults(), overrides=overrides)
 
-        default_env_path = pathlib.Path(self.defaults['gamry_env_path'])
-        configured_env_path = pathlib.Path(gamry_env_path) if gamry_env_path is not None else pathlib.Path(self.config['gamry_env_path'])
-        if gamry_env_path is not None or not configured_env_path.exists():
-            self.config['gamry_env_path'] = str(configured_env_path if gamry_env_path is not None else default_env_path)
+        configured_env_path = str(self.config.get('gamry_env_path', '')).strip()
+        if gamry_env_path is not None:
+            self.config['gamry_env_path'] = str(pathlib.Path(gamry_env_path))
+        elif configured_env_path:
+            self.config['gamry_env_path'] = str(pathlib.Path(configured_env_path))
+        else:
+            self.config['gamry_env_path'] = ''
 
         if instrument_name is not None:
             self.config['instrument_name'] = instrument_name
