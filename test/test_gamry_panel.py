@@ -199,61 +199,63 @@ def test_connect_instrument_updates_selected_potentiostat():
 def test_run_cv_now_serializes_dataset_and_caches_last_result():
     driver = _PanelTestGamryDriver()
 
-    result = driver.runCVNow(scan_rate=0.75)
+    dataset = driver.runMeasurement(measurement_mode='cv', return_data=True, scan_rate=0.75)
+    panel_result = driver._build_panel_result(dataset)
+    driver._last_panel_result = panel_result
 
-    assert result['status'] == 'ok'
-    assert result['result']['attrs']['instrument_name'] == 'PSTAT'
-    assert result['result']['attrs']['point_count'] == 3
-    assert result['result']['attrs']['plot_source'] == 'dataset'
-    assert result['result']['plot_data']['voltage_v'] == [0.1, 0.2, 0.3]
-    assert result['result']['plot_data']['current_a'] == [1.0, 1.5, 1.2]
+    assert panel_result['attrs']['instrument_name'] == 'PSTAT'
+    assert panel_result['attrs']['point_count'] == 3
+    assert panel_result['attrs']['plot_source'] == 'dataset'
+    assert panel_result['plot_data']['voltage_v'] == [0.1, 0.2, 0.3]
+    assert panel_result['plot_data']['current_a'] == [1.0, 1.5, 1.2]
     assert driver.getPanelState()['last_result']['plot_data']['time_s'] == [0.0, 1.0, 2.0]
 
 
-def test_run_measurement_now_serializes_generic_result():
+def test_run_measurement_serializes_generic_result():
     driver = _PanelTestGamryDriver()
 
-    result = driver.runMeasurementNow(measurement_mode='ca')
+    dataset = driver.runMeasurement(measurement_mode='ca', return_data=True)
+    result = driver._build_panel_result(dataset)
 
-    assert result['status'] == 'ok'
-    assert result['result']['attrs']['measurement_type'] == 'chronoamperometry'
-    assert result['result']['attrs']['plot_source'] == 'dataset'
-    assert result['result']['plot_data']['time_s'] == [0.0, 0.5, 1.0]
-    assert result['result']['plot_data']['voltage_v'] == [0.5, 0.5, 0.0]
-    assert result['result']['plot_data']['current_a'] == [1.0, 0.8, 0.6]
+    assert result['attrs']['measurement_type'] == 'chronoamperometry'
+    assert result['attrs']['plot_source'] == 'dataset'
+    assert result['plot_data']['time_s'] == [0.0, 0.5, 1.0]
+    assert result['plot_data']['voltage_v'] == [0.5, 0.5, 0.0]
+    assert result['plot_data']['current_a'] == [1.0, 0.8, 0.6]
 
 
-def test_run_measurement_now_serializes_dpv_result_from_dataset():
+def test_run_measurement_serializes_dpv_result_from_dataset():
     driver = _PanelTestGamryDriver()
 
-    result = driver.runMeasurementNow(measurement_mode='dpv')
+    dataset = driver.runMeasurement(measurement_mode='dpv', return_data=True)
+    result = driver._build_panel_result(dataset)
+    driver._last_panel_result = result
 
-    assert result['status'] == 'ok'
-    assert result['result']['attrs']['measurement_type'] == 'differential_pulse_voltammetry'
-    assert result['result']['attrs']['plot_source'] == 'dataset'
-    assert result['result']['attrs']['plot_variant'] == 'dpv_differential'
-    assert result['result']['plot_data']['voltage_v'] == [-1.0, -0.995]
-    assert result['result']['plot_data']['diff_current_a'] == [0.05, 0.07]
-    assert 'current_a' not in result['result']['plot_data']
-    assert 'time_s' not in result['result']['plot_data']
-    assert result['result']['data']['potential'] == [-1.0, -0.995]
+    assert result['attrs']['measurement_type'] == 'differential_pulse_voltammetry'
+    assert result['attrs']['plot_source'] == 'dataset'
+    assert result['attrs']['plot_variant'] == 'dpv_differential'
+    assert result['plot_data']['voltage_v'] == [-1.0, -0.995]
+    assert result['plot_data']['diff_current_a'] == [0.05, 0.07]
+    assert 'current_a' not in result['plot_data']
+    assert 'time_s' not in result['plot_data']
+    assert result['data']['potential'] == [-1.0, -0.995]
     assert driver.getPanelState()['last_result']['plot_data']['voltage_v'] == [-1.0, -0.995]
 
 
-def test_run_measurement_now_serializes_sine_result_from_dataset():
+def test_run_measurement_serializes_sine_result_from_dataset():
     driver = _PanelTestGamryDriver()
 
-    result = driver.runMeasurementNow(measurement_mode='sine')
+    dataset = driver.runMeasurement(measurement_mode='sine', return_data=True)
+    result = driver._build_panel_result(dataset)
 
-    assert result['status'] == 'ok'
-    assert result['result']['attrs']['measurement_type'] == 'sine_wave'
-    assert result['result']['attrs']['plot_source'] == 'dataset'
-    assert result['result']['plot_data']['time_s'] == [0.0, 0.1, 0.2]
-    assert result['result']['plot_data']['voltage_v'] == [0.0, 0.05, 0.0]
-    assert result['result']['plot_data']['current_a'] == [0.01, 0.02, 0.01]
+    assert result['attrs']['measurement_type'] == 'sine_wave'
+    assert result['attrs']['plot_source'] == 'dataset'
+    assert result['plot_data']['time_s'] == [0.0, 0.1, 0.2]
+    assert result['plot_data']['voltage_v'] == [0.0, 0.05, 0.0]
+    assert result['plot_data']['current_a'] == [0.01, 0.02, 0.01]
 
 
-def test_run_measurement_now_persists_dataset_to_data_backend():
+def test_run_measurement_persists_dataset_to_data_backend():
     driver = _PanelTestGamryDriver()
 
     class _RecordingData:
@@ -269,9 +271,10 @@ def test_run_measurement_now_persists_dataset_to_data_backend():
 
     driver.data = _RecordingData()
 
-    result = driver.runMeasurementNow(measurement_mode='ca')
+    dataset = driver.runMeasurement(measurement_mode='ca', return_data=True)
+    driver.data['main_dataset'] = dataset
+    driver.data.finalize()
 
-    assert result['status'] == 'ok'
     assert 'main_dataset' in driver.data.values
     assert driver.data.values['main_dataset'].attrs['measurement_type'] == 'chronoamperometry'
     assert driver.data.finalize_calls == 1

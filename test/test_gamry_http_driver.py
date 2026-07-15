@@ -12,105 +12,116 @@ class FakeClient:
     def login(self, username, populate_commands=True):
         self.logged_in_username = username
 
-    def logged_in(self):
-        return self.logged_in_username is not None
-
     def driver_status(self):
         self.calls.append(('driver_status', {}, None))
         return {'status': 'ok', 'driver': 'remote-gamry'}
 
-    def validateConnection(self, **kwargs):
-        self.calls.append(('validateConnection', kwargs, None))
-        return {'status': 'ok', 'validated': True}
+    def query_driver(self, **kwargs):
+        self.calls.append(('query_driver', kwargs, None))
+        route = kwargs.get('r')
+        if route == 'validateConnection':
+            return {'status': 'ok', 'validated': True}
+        if route == 'connectInstrument':
+            return {'status': 'ok', 'instrument_name': kwargs.get('instrument_name', 'PSTAT')}
+        if route == 'startService':
+            return {'status': 'ok'}
+        raise AssertionError(f'Unexpected query_driver route: {route}')
 
-    def connectInstrument(self, **kwargs):
-        self.calls.append(('connectInstrument', kwargs, None))
-        return {'status': 'ok', 'instrument_name': kwargs.get('instrument_name', 'PSTAT')}
+    def enqueue(self, **kwargs):
+        self.calls.append(('enqueue', kwargs, None))
+        return 'remote-task-1'
 
-    def startService(self, **kwargs):
-        self.calls.append(('startService', kwargs, None))
-        return {'status': 'ok'}
+    def wait(self, target_uuid, first_check_delay=0.5):
+        self.calls.append(('wait', {'target_uuid': target_uuid, 'first_check_delay': first_check_delay}, None))
+        return {
+            'exit_state': 'Completed',
+            'return_val': 'xarray.Dataset',
+        }
 
-    def listInstruments(self, **kwargs):
-        self.calls.append(('listInstruments', kwargs, None))
-        return {'status': 'ok', 'result': ['PSTAT']}
+    def retrieve_obj(self, uuid):
+        import xarray as xr
 
-    def runMeasurementNow(self, **kwargs):
-        self.calls.append(('runMeasurementNow', kwargs, None))
-        return {'status': 'ok', 'result': {'measurement_mode': kwargs.get('measurement_mode')}}
-
-    def enqueue(self, interactive=None, **kwargs):
-        self.calls.append(('enqueue', kwargs, interactive))
-        return {'task_uuid': 'remote-task-1', 'task_name': kwargs['task_name']}
+        self.calls.append(('retrieve_obj', {'uuid': uuid}, None))
+        return xr.Dataset(
+            data_vars={
+                'current': ('point', [1.0, 0.8]),
+                'time': ('point', [0.0, 0.5]),
+            },
+            coords={'point': [0, 1]},
+            attrs={'measurement_mode': 'ca'},
+        )
 
 
 def test_status_reports_remote_endpoint(monkeypatch):
     monkeypatch.setattr('AFL.automation.instrument.GamryHTTPDriver.Client', FakeClient)
-    driver = GamryHTTPDriver(overrides={'remote_host': 'gamry-win', 'remote_port': '5051'})
+    driver = GamryHTTPDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
 
     status = driver.status()
 
-    assert 'remote_host=gamry-win' in status
-    assert 'remote_port=5051' in status
+    assert 'server_url=http://gamry-win:5051' in status
 
 
-def test_ping_remote_uses_client_and_login(monkeypatch):
+def test_ping_uses_client_and_login(monkeypatch):
     monkeypatch.setattr('AFL.automation.instrument.GamryHTTPDriver.Client', FakeClient)
     driver = GamryHTTPDriver(
         overrides={
-            'remote_host': 'gamry-win',
-            'remote_port': '5051',
-            'remote_login': True,
-            'remote_username': 'afl',
+            'server_ip': 'gamry-win',
+            'server_port': '5051',
+            'server_username': 'afl',
         }
     )
 
-    result = driver.pingRemote()
+    result = driver.ping()
 
     assert result == {
         'status': 'ok',
-        'remote_host': 'gamry-win',
-        'remote_port': '5051',
-        'logged_in': True,
+        'server_url': 'http://gamry-win:5051',
+        'driver_status': {'status': 'ok', 'driver': 'remote-gamry'},
     }
 
 
 def test_unqueued_methods_forward_to_remote_client(monkeypatch):
     monkeypatch.setattr('AFL.automation.instrument.GamryHTTPDriver.Client', FakeClient)
-    driver = GamryHTTPDriver(overrides={'remote_host': 'gamry-win', 'remote_port': '5051'})
+    driver = GamryHTTPDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
 
-    status = driver.getRemoteDriverStatus()
-    validation = driver.validateConnection()
+    status = driver.ping()
     connection = driver.connectInstrument(instrument_name='PSTAT-1')
-    measurement = driver.runMeasurementNow(measurement_mode='ca', instrument_name='PSTAT-1', ca_step1_time=2.0)
 
-    assert status['driver'] == 'remote-gamry'
-    assert validation['validated'] is True
+    assert status['driver_status']['driver'] == 'remote-gamry'
     assert connection['instrument_name'] == 'PSTAT-1'
-    assert measurement['result']['measurement_mode'] == 'ca'
 
 
 def test_queued_methods_forward_task_name_and_kwargs(monkeypatch):
     monkeypatch.setattr('AFL.automation.instrument.GamryHTTPDriver.Client', FakeClient)
-    driver = GamryHTTPDriver(overrides={'forward_interactive': False})
+    driver = GamryHTTPDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
 
-    result = driver.runDepositionCA(instrument_name='PSTAT-1', ca_step1_time=2.0)
+    result = driver.runCA(instrument_name='PSTAT-1', ca_step1_time=2.0)
 
-    assert result == {'task_uuid': 'remote-task-1', 'task_name': 'runDepositionCA'}
-    assert driver._client.calls[-1] == (
+    assert result.attrs['measurement_mode'] == 'ca'
+    assert driver._client.calls[0] == (
         'enqueue',
-        {'task_name': 'runDepositionCA', 'instrument_name': 'PSTAT-1', 'ca_step1_time': 2.0},
-        False,
+        {
+            'task_name': 'runCA',
+            'ca_initial_voltage': 0.0,
+            'ca_step1_voltage': 0.5,
+            'ca_step2_voltage': 0.0,
+            'ca_initial_time': 1.0,
+            'ca_step1_time': 2.0,
+            'ca_step2_time': 2.0,
+            'ca_sample_time': 0.05,
+            'ca_expected_max_v': 10.0,
+            'current_range_mode': 'auto',
+            'instrument_name': 'PSTAT-1',
+        },
+        None,
     )
 
 
-def test_remote_login_requires_username(monkeypatch):
+def test_client_login_is_skipped_without_username(monkeypatch):
     monkeypatch.setattr('AFL.automation.instrument.GamryHTTPDriver.Client', FakeClient)
-    driver = GamryHTTPDriver(overrides={'remote_login': True})
+    driver = GamryHTTPDriver(overrides={'server_ip': 'gamry-win'})
 
-    try:
-        driver.pingRemote()
-    except ValueError as exc:
-        assert 'remote_username is required' in str(exc)
-    else:
-        raise AssertionError('Expected ValueError when remote_login is enabled without remote_username')
+    result = driver.ping()
+
+    assert result['driver_status']['driver'] == 'remote-gamry'
+    assert driver._client.logged_in_username == 'GamryHTTPDriver'
