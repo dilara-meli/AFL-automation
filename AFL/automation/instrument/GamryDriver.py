@@ -1,6 +1,5 @@
 from AFL.automation.APIServer.Driver import Driver
 import atexit
-import csv
 import datetime
 import json
 import os
@@ -188,11 +187,26 @@ class GamryDriver(Driver):
     def _worker_log_path(self) -> pathlib.Path:
         return pathlib.Path.home() / '.afl' / 'gamry_worker.log'
 
+    def _resolve_env_python_path(self, env_path: pathlib.Path) -> pathlib.Path:
+        candidates = [
+            env_path / 'Scripts' / 'python.exe',
+            env_path / 'Scripts' / 'python',
+            env_path / 'bin' / 'python',
+            env_path / 'bin' / 'python3',
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
     def _listener_pid(self, port: int) -> Optional[int]:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.settimeout(0.2)
-            if probe.connect_ex((str(self.config['service_host']), int(port))) != 0:
-                return None
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.2)
+                if probe.connect_ex((str(self.config['service_host']), int(port))) != 0:
+                    return None
+        except OSError:
+            return None
 
         completed = subprocess.run(
             [
@@ -630,7 +644,7 @@ class GamryDriver(Driver):
     def _ensure_service(self) -> None:
         env_path = pathlib.Path(self.config['gamry_env_path'])
         worker_path = pathlib.Path(self.config['worker_path'])
-        python_path = env_path / 'Scripts' / 'python.exe'
+        python_path = self._resolve_env_python_path(env_path)
         if not env_path.exists():
             raise FileNotFoundError(f"Gamry virtual environment not found: {env_path}")
         if not python_path.exists():
@@ -733,7 +747,7 @@ class GamryDriver(Driver):
     def _run_worker_diagnostic(self, instrument_name: Optional[str] = None) -> Dict[str, Any]:
         env_path = pathlib.Path(self.config['gamry_env_path'])
         worker_path = pathlib.Path(self.config['worker_path'])
-        python_path = env_path / 'Scripts' / 'python.exe'
+        python_path = self._resolve_env_python_path(env_path)
         if not env_path.exists():
             raise FileNotFoundError(f"Gamry virtual environment not found: {env_path}")
         if not python_path.exists():

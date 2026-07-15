@@ -43,6 +43,19 @@ from AFL.automation.APIServer.data.DataTiled import DataTiled
 from AFL.automation.instrument.GamryDriver import GamryDriver
 
 
+def _resolve_env_python_path(env_path: Path) -> Path:
+    candidates = [
+        env_path / 'Scripts' / 'python.exe',
+        env_path / 'Scripts' / 'python',
+        env_path / 'bin' / 'python',
+        env_path / 'bin' / 'python3',
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
 def build_driver(args: argparse.Namespace) -> GamryDriver:
     overrides = {
         "process_name": args.process_name,
@@ -150,7 +163,7 @@ def run_diagnostic(args: argparse.Namespace) -> None:
 def run_worker_diagnostic(args: argparse.Namespace) -> None:
     worker_path = Path(args.worker_path) if args.worker_path else Path(__file__).resolve().parents[1] / 'automation' / 'instrument' / 'gamry_worker.py'
     env_path = Path(args.gamry_env_path)
-    python_path = env_path / 'Scripts' / 'python.exe'
+    python_path = _resolve_env_python_path(env_path)
     if not python_path.exists():
         raise FileNotFoundError(f"Gamry virtual environment interpreter not found: {python_path}")
     if not worker_path.exists():
@@ -215,7 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=5051)
     parser.add_argument(
         "--gamry-env-path",
-        default=r"C:\Users\dnm33\Documents\GamryPython\.venv",
+        default=os.environ.get('AFL_GAMRY_ENV_PATH', ''),
     )
     parser.add_argument("--worker-path", default="")
     parser.add_argument("--instrument-name", default="PSTAT")

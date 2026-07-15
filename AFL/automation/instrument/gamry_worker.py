@@ -7,15 +7,17 @@ import sys
 import time
 import traceback
 
-import rpyc
-from rpyc.utils.server import ThreadedServer
+try:
+    import rpyc
+    from rpyc.utils.server import ThreadedServer
+    _RPYC_IMPORT_ERROR = None
+except ImportError as exc:
+    rpyc = None
+    ThreadedServer = None
+    _RPYC_IMPORT_ERROR = exc
 
 
 WORKER_LOG_PATH = os.environ.get('AFL_GAMRY_WORKER_LOG')
-# GAMRY_EXPORT_DIRECTORY = os.environ.get(
-#     'AFL_GAMRY_DPV_EXPORT_DIR',
-#     r'C:\Users\dnm33\Documents\GamryData\GamryServer_trial',
-# )
 
 
 def _log_worker_event(event, **details):
@@ -31,6 +33,24 @@ def _log_worker_event(event, **details):
             handle.write(json.dumps(payload, default=str) + '\n')
     except Exception:
         pass
+
+
+def _require_rpyc():
+    if rpyc is None:
+        raise RuntimeError(
+            'RPyC is required in the AFL Python environment to use the Gamry worker bridge.'
+        ) from _RPYC_IMPORT_ERROR
+    return rpyc, ThreadedServer
+
+
+def _require_toolkitpy():
+    try:
+        import toolkitpy as tkp
+    except ImportError as exc:
+        raise RuntimeError(
+            'toolkitpy is required in the AFL Python environment to use the Gamry worker.'
+        ) from exc
+    return tkp
 
 
 def _sanitize_filename_component(value):
@@ -992,7 +1012,10 @@ def run_measurement(tkp, instrument_name, process_name, measurement_mode, parame
         }
 
 
-class GamryBridgeService(rpyc.Service):
+_RpycServiceBase = rpyc.Service if rpyc is not None else object
+
+
+class GamryBridgeService(_RpycServiceBase):
     tkp = None
     process_name = 'AFL_GamryDriver'
     active_pstat = None
@@ -1106,13 +1129,14 @@ class GamryBridgeService(rpyc.Service):
 
 
 def serve(host, port, process_name):
-    import toolkitpy as tkp
+    _, threaded_server_cls = _require_rpyc()
+    tkp = _require_toolkitpy()
 
     _log_worker_event('worker_serve_start', host=host, port=port, process_name=process_name, python_executable=sys.executable)
     tkp.toolkitpy_init(process_name)
     GamryBridgeService.tkp = tkp
     GamryBridgeService.process_name = process_name
-    server = ThreadedServer(
+    server = threaded_server_cls(
         GamryBridgeService,
         hostname=host,
         port=port,
@@ -1135,7 +1159,7 @@ def serve(host, port, process_name):
 
 
 def diagnose(process_name, instrument_name=None):
-    import toolkitpy as tkp
+    tkp = _require_toolkitpy()
 
     report = {
         'status': 'ok',
