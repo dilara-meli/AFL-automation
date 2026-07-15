@@ -1,6 +1,5 @@
 from AFL.automation.APIServer.Driver import Driver
 import atexit
-import csv
 import datetime
 import json
 import os
