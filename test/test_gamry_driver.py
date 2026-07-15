@@ -617,15 +617,15 @@ def test_queued_gamry_wrappers_stamp_task_metadata(monkeypatch, driver):
 
     driver.set_sample('electrode-sample', sample_uuid='SAM-ECHEM-001')
 
-    deposition = driver.runDepositionCA()
-    analyte = driver.runAnalyteCA()
+    deposition = driver.runCA()
+    analyte = driver.runCA()
 
-    assert deposition.attrs['task_name'] == 'runDepositionCA'
-    assert deposition.attrs['step_name'] == 'deposition_ca'
+    assert deposition.attrs['task_name'] == 'runCA'
+    assert deposition.attrs['step_name'] == 'ca'
     assert deposition.attrs['sample_uuid'] == 'SAM-ECHEM-001'
     assert deposition.attrs['sample_name'] == 'electrode-sample'
-    assert analyte.attrs['task_name'] == 'runAnalyteCA'
-    assert analyte.attrs['step_name'] == 'analyte_ca'
+    assert analyte.attrs['task_name'] == 'runCA'
+    assert analyte.attrs['step_name'] == 'ca'
     assert root.calls[0][3] == 'ca'
     assert root.calls[1][3] == 'ca'
 
@@ -662,10 +662,10 @@ def test_run_stripping_dpv_stamps_task_metadata(monkeypatch, driver):
     driver.data = DataPacket()
 
     driver.set_sample('electrode-sample', sample_uuid='SAM-ECHEM-002')
-    dataset = driver.runStrippingDPV()
+    dataset = driver.runDPV()
 
-    assert dataset.attrs['task_name'] == 'runStrippingDPV'
-    assert dataset.attrs['step_name'] == 'stripping_dpv'
+    assert dataset.attrs['task_name'] == 'runDPV'
+    assert dataset.attrs['step_name'] == 'dpv'
     assert dataset.attrs['measurement_type'] == 'differential_pulse_voltammetry'
     assert dataset.attrs['sample_uuid'] == 'SAM-ECHEM-002'
     assert root.calls[0][3] == 'dpv'
@@ -744,7 +744,7 @@ def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver):
     monkeypatch.setattr(driver, '_get_bridge_connection', lambda: connection)
     driver.data = DataPacket()
     driver.set_sample('electrode-sample', sample_uuid='SAM-ECHEM-003')
-    dataset = driver.runStrippingDPV()
+    dataset = driver.runDPV()
 
     class MockTiledContainer:
         def __init__(self, key, metadata=None):
@@ -822,13 +822,12 @@ def test_run_measurement_now_serializes_non_cv_result(monkeypatch, driver):
     monkeypatch.setattr(driver, '_ensure_service', lambda: None)
     monkeypatch.setattr(driver, '_get_bridge_connection', lambda: connection)
 
-    result = driver.runMeasurementNow(measurement_mode='sine', sine_frequency=10.0)
+    result = driver.runMeasurement(measurement_mode='sine', return_data=True, sine_frequency=10.0)
 
-    assert result['status'] == 'ok'
-    assert result['result']['attrs']['measurement_type'] == 'sine_wave'
-    assert result['result']['data']['time'] == [0.0, 0.1, 0.2]
-    assert result['result']['data']['current'] == [0.0, 1.0, 0.0]
-    assert result['result']['data']['applied_signal'] == [0.0, 0.05, 0.0]
+    assert result.attrs['measurement_type'] == 'sine_wave'
+    assert result['time'].values.tolist() == [0.0, 0.1, 0.2]
+    assert result['current'].values.tolist() == [0.0, 1.0, 0.0]
+    assert result['applied_signal'].values.tolist() == [0.0, 0.05, 0.0]
 
 
 def test_run_measurement_builds_sine_dataset_with_total_time(monkeypatch, driver):
