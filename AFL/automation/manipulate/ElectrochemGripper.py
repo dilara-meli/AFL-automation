@@ -93,7 +93,7 @@ class ElectrochemGripper(Driver):
         if data is not None and servo is not None:
             servo.data = data
 
-    @Driver.quickbar(qb={"button_text": "Connect", 'params':{}})
+    @Driver.quickbar(qb={"button_text": "Connect"})
     @Driver.unqueued()
     def connect(self) -> str:
         """Mark the gripper ready for motion commands."""
@@ -102,7 +102,7 @@ class ElectrochemGripper(Driver):
         self.log_info("ElectrochemGripper connected")
         return "connected"
 
-    @Driver.quickbar(qb={"button_text": "Home", 'params':{}})
+    @Driver.quickbar(qb={"button_text": "Home"})
     @Driver.unqueued()
     def home(self, open_gripper: Optional[bool] = None) -> Dict[str, Any]:
         """Return the driver to its software home state."""
@@ -114,7 +114,7 @@ class ElectrochemGripper(Driver):
         self.log_info("ElectrochemGripper homed")
         return self.status()
 
-    @Driver.quickbar(qb={"button_text": "Open", 'params':{}})
+    @Driver.quickbar(qb={"button_text": "Open"})
     def open(self, speed: Optional[float] = None) -> Dict[str, Any]:
         """Open the gripper servo."""
         self._ensure_connected()
@@ -123,7 +123,7 @@ class ElectrochemGripper(Driver):
         self.last_action = {"action": "open", "speed": resolved_speed}
         return self.status()
 
-    @Driver.quickbar(qb={"button_text": "Close", 'params':{}})
+    @Driver.quickbar(qb={"button_text": "Close"})
     def close(self, speed: Optional[float] = None) -> Dict[str, Any]:
         """Close the gripper servo."""
         self._ensure_connected()
@@ -222,7 +222,7 @@ class ElectrochemGripper(Driver):
         self.last_action = {"action": "set_close_angle", "angle": angle}
         return self.status()
 
-    @Driver.quickbar(qb={"button_text": "Status", 'params':{}})
+    @Driver.quickbar(qb={"button_text": "Status"})
     def status(self) -> Dict[str, Any]:
         """Return the driver and servo state."""
         return {
