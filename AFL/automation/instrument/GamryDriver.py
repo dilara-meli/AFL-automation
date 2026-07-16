@@ -140,7 +140,7 @@ class GamryDriver(Driver):
             self.config['worker_path'] = str(default_worker_path)
 
         self.config['dpv_irange_mode'] = self._normalize_dpv_irange_mode(self.config.get('dpv_irange_mode', 'fixed'))
-        self._refresh_collect_cv_quickbar()
+        self.refresh_quickbar()
         self.useful_links['Gamry Panel'] = '/gamry_panel'
         atexit.register(self.shutdownService)
 
@@ -634,7 +634,7 @@ class GamryDriver(Driver):
             self.set_config(**updates)
             if 'dpv_irange_mode' not in updates:
                 self.config['dpv_irange_mode'] = self._normalize_dpv_irange_mode(self.config.get('dpv_irange_mode', 'fixed'))
-            self._refresh_collect_cv_quickbar()
+            self.refresh_quickbar()
         return {
             'status': 'ok',
             'config': self._panel_config_snapshot(),
@@ -943,7 +943,7 @@ class GamryDriver(Driver):
 
         return ds
 
-    def _refresh_collect_cv_quickbar(self) -> None:
+    def refresh_quickbar(self) -> None:
         collect_cv_info = self.quickbar.function_info.get('collectCV')
         if not collect_cv_info:
             return

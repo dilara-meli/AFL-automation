@@ -290,8 +290,7 @@ class APIServer:
         '''
         Return the functions, params, and defaults to be shown in this server's quickbar
         '''
-        if hasattr(self.driver, '_quickbar_params_from_config') and 'collectCV' in self.driver.quickbar.function_info:
-            self.driver.quickbar.function_info['collectCV']['qb']['params'] = self.driver._quickbar_params_from_config(self.driver.config)
+        self.driver.refresh_quickbar()
         return jsonify(self.driver.quickbar.function_info),200
 
     def is_server_live(self):
