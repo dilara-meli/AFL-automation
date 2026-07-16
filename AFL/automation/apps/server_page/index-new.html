@@ -432,9 +432,6 @@
                 }
                 var command = commands[key];
                 var quickbarFields = normalizeQuickbarParams(command);
-                if (!quickbarFields.length) {
-                    continue;
-                }
                 var buttonText = command.qb && command.qb.button_text ? command.qb.button_text : key;
                 renderCommand(container, key, buttonText, command.args || [], quickbarFields);
             }

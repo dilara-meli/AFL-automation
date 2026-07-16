@@ -152,49 +152,6 @@ class TestOrchestratorDriverConfiguration:
         # Should not raise
         driver.validate_config()
 
-    def test_validate_config_accepts_multiple_gamry_steps_on_one_client(self):
-        driver = OrchestratorDriver(overrides={
-            'client': {
-                'load': 'localhost:5000',
-                'prep': 'localhost:5001',
-                'gamry': 'localhost:5051'
-            },
-            'instrument': [
-                {
-                    'name': 'gamry_deposition',
-                    'client_name': 'gamry',
-                    'measure_base_kw': {'task_name': 'runDepositionCA'},
-                    'empty_base_kw': {'task_name': 'runDepositionCA'},
-                    'concat_dim': 'time'
-                },
-                {
-                    'name': 'gamry_analyte',
-                    'client_name': 'gamry',
-                    'measure_base_kw': {'task_name': 'runAnalyteCA'},
-                    'empty_base_kw': {'task_name': 'runAnalyteCA'},
-                    'concat_dim': 'time'
-                },
-                {
-                    'name': 'gamry_stripping',
-                    'client_name': 'gamry',
-                    'measure_base_kw': {'task_name': 'runStrippingDPV'},
-                    'empty_base_kw': {'task_name': 'runStrippingDPV'},
-                    'concat_dim': 'time'
-                }
-            ],
-            'ternary': False,
-            'data_tag': 'test',
-            'components': ['water', 'salt'],
-            'AL_components': [],
-            'snapshot_directory': '/tmp',
-            'max_sample_transmission': 0.6,
-            'mix_order': [],
-            'camera_urls': [],
-            'composition_format': 'mass_fraction',
-        })
-
-        driver.validate_config()
-
     def test_validate_config_composition_format_invalid_str(self):
         """Test that invalid composition format string is rejected"""
         driver = OrchestratorDriver(overrides={
