@@ -111,7 +111,8 @@ def test_get_panel_state_returns_config_and_service_snapshot():
     assert state['config']['instrument_name'] == 'PSTAT'
     assert state['service']['bridge_ready'] is False
     assert state['last_result'] is None
-    assert 'initial_voltage' in state['quickbar']
+    assert 'runCV' in state['quickbar']
+    assert 'initial_voltage' in state['quickbar']['runCV']
 
 
 def test_update_panel_config_persists_numeric_values():

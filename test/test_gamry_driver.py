@@ -101,7 +101,7 @@ def driver(tmp_path, monkeypatch):
     driver.shutdownService()
 
 
-def test_collect_cv_builds_dataset(monkeypatch, driver):
+def test_run_cv_builds_dataset(monkeypatch, driver):
     root = FakeBridgeRoot(
         responses={
             'run_measurement': {
@@ -131,7 +131,7 @@ def test_collect_cv_builds_dataset(monkeypatch, driver):
     monkeypatch.setattr(driver, '_ensure_service', lambda: None)
     monkeypatch.setattr(driver, '_get_bridge_connection', lambda: connection)
 
-    dataset = driver.collectCV(scan_rate=0.2, step_size=0.002)
+    dataset = driver.runCV(scan_rate=0.2, step_size=0.002)
 
     assert dataset.attrs['measurement_type'] == 'cyclic_voltammetry'
     assert dataset.attrs['instrument_name'] == 'PSTAT'
@@ -142,7 +142,7 @@ def test_collect_cv_builds_dataset(monkeypatch, driver):
     assert root.calls[0][0] == 'run_measurement'
 
 
-def test_collect_cv_raises_bridge_error(monkeypatch, driver):
+def test_run_cv_raises_bridge_error(monkeypatch, driver):
     root = FakeBridgeRoot(
         responses={
             'run_measurement': {
@@ -160,7 +160,7 @@ def test_collect_cv_raises_bridge_error(monkeypatch, driver):
     monkeypatch.setattr(driver, '_get_bridge_connection', lambda: connection)
 
     with pytest.raises(RuntimeError, match='No instrument found'):
-        driver.collectCV()
+        driver.runCV()
 
 
 def test_run_measurement_builds_dpv_dataset(monkeypatch, driver):
@@ -324,10 +324,10 @@ def test_collect_dpv_allocates_curve_with_small_buffer_margin(monkeypatch):
 
 
 def test_gamry_driver_defaults_use_amp_units(driver):
-    quickbar = driver._quickbar_params_from_config(driver.config)
+    quickbar = driver._quickbar_params_from_config(driver.config, 'dpv')
 
     assert driver.config['dpv_max_current'] == pytest.approx(0.0003)
-    assert quickbar['dpv_max_current']['label'] == 'DPV Max Current (A)'
+    assert quickbar['max_current']['label'] == 'Max Current (A)'
 
 
 def test_start_service_launches_worker(monkeypatch, driver):
@@ -445,7 +445,7 @@ def test_missing_persisted_worker_path_resets_to_repo_worker(tmp_path, monkeypat
     assert pathlib.Path(driver.getWorkerPath()) == expected_worker
 
 
-def test_collect_cv_quickbar_uses_live_config_defaults(driver):
+def test_run_cv_quickbar_uses_live_config_defaults(driver):
     driver.config['initial_voltage'] = 0.25
     driver.config['apex1_voltage'] = 0.5
     driver.config['apex2_voltage'] = 0.25
@@ -458,9 +458,9 @@ def test_collect_cv_quickbar_uses_live_config_defaults(driver):
     driver.config['cycles'] = 4
     driver.config['scan_delay'] = 0.75
     driver.config['current_range_mode'] = 'manual'
-    driver.quickbar.function_info['collectCV']['qb']['params'] = driver._quickbar_params_from_config(driver.config)
+    driver.refresh_quickbar()
 
-    params = driver.quickbar.function_info['collectCV']['qb']['params']
+    params = driver.quickbar.function_info['runCV']['qb']['params']
 
     assert params['initial_voltage']['default'] == 0.25
     assert params['apex1_voltage']['default'] == 0.5
@@ -508,7 +508,7 @@ def test_apiserver_get_quickbar_returns_live_gamry_defaults(tmp_path, monkeypatc
         payload = response.get_json()
 
     assert status == 200
-    params = payload['collectCV']['qb']['params']
+    params = payload['runCV']['qb']['params']
     assert params['initial_voltage']['default'] == 0.25
     assert params['apex1_voltage']['default'] == 0.5
     assert params['apex2_voltage']['default'] == 0.25
