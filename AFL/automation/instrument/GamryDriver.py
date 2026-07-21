@@ -74,45 +74,62 @@ class GamryDriver(Driver):
         return normalized
 
     @staticmethod
-    def _quickbar_params_from_config(config):
-        return {
-            'measurement_mode': {'label': 'Measurement Mode', 'type': 'text', 'default': config['measurement_mode']},
-            'initial_voltage': {'label': 'Initial Voltage (V)', 'type': 'float', 'default': config['initial_voltage']},
-            'apex1_voltage': {'label': 'Apex 1 Voltage (V)', 'type': 'float', 'default': config['apex1_voltage']},
-            'apex2_voltage': {'label': 'Apex 2 Voltage (V)', 'type': 'float', 'default': config['apex2_voltage']},
-            'final_voltage': {'label': 'Final Voltage (V)', 'type': 'float', 'default': config['final_voltage']},
-            'apex1_hold': {'label': 'Apex 1 Hold (s)', 'type': 'float', 'default': config['apex1_hold']},
-            'apex2_hold': {'label': 'Apex 2 Hold (s)', 'type': 'float', 'default': config['apex2_hold']},
-            'final_hold': {'label': 'Final Hold (s)', 'type': 'float', 'default': config['final_hold']},
-            'scan_rate': {'label': 'Scan Rate (V/s)', 'type': 'float', 'default': config['scan_rate']},
-            'step_size': {'label': 'Step Size (V)', 'type': 'float', 'default': config['step_size']},
-            'cycles': {'label': 'Cycles', 'type': 'int', 'default': config['cycles']},
-            'scan_delay': {'label': 'Scan Delay (s)', 'type': 'float', 'default': config['scan_delay']},
-            'current_range_mode': {'label': 'Current Range Mode', 'type': 'text', 'default': config['current_range_mode']},
-            'ca_initial_voltage': {'label': 'CA Initial Voltage (V)', 'type': 'float', 'default': config['ca_initial_voltage']},
-            'ca_step1_voltage': {'label': 'CA Step 1 Voltage (V)', 'type': 'float', 'default': config['ca_step1_voltage']},
-            'ca_step2_voltage': {'label': 'CA Step 2 Voltage (V)', 'type': 'float', 'default': config['ca_step2_voltage']},
-            'ca_initial_time': {'label': 'CA Initial Time (s)', 'type': 'float', 'default': config['ca_initial_time']},
-            'ca_step1_time': {'label': 'CA Step 1 Time (s)', 'type': 'float', 'default': config['ca_step1_time']},
-            'ca_step2_time': {'label': 'CA Step 2 Time (s)', 'type': 'float', 'default': config['ca_step2_time']},
-            'ca_sample_time': {'label': 'CA Sample Time (s)', 'type': 'float', 'default': config['ca_sample_time']},
-            'ca_expected_max_v': {'label': 'CA Expected Max V', 'type': 'float', 'default': config['ca_expected_max_v']},
-            'sine_dc_offset': {'label': 'Sine DC Offset (V)', 'type': 'float', 'default': config['sine_dc_offset']},
-            'sine_amplitude': {'label': 'Sine Amplitude (V)', 'type': 'float', 'default': config['sine_amplitude']},
-            'sine_frequency': {'label': 'Sine Frequency (Hz)', 'type': 'float', 'default': config['sine_frequency']},
-            'sine_acq_frequency': {'label': 'Sine Acquisition Frequency (Hz)', 'type': 'float', 'default': config['sine_acq_frequency']},
-            'sine_total_time': {'label': 'Sine Total Time (s)', 'type': 'float', 'default': config['sine_total_time']},
-            'sine_phase_offset': {'label': 'Sine Phase Offset (rad)', 'type': 'float', 'default': config['sine_phase_offset']},
-            'dpv_initial_voltage': {'label': 'DPV Initial E (V)', 'type': 'float', 'default': config['dpv_initial_voltage']},
-            'dpv_final_voltage': {'label': 'DPV Final E (V)', 'type': 'float', 'default': config['dpv_final_voltage']},
-            'dpv_step_size': {'label': 'DPV Step Size (V)', 'type': 'float', 'default': config['dpv_step_size']},
-            'dpv_pulse_size': {'label': 'DPV Pulse Size E (V)', 'type': 'float', 'default': config['dpv_pulse_size']},
-            'dpv_sample_period': {'label': 'DPV Sample Period (s)', 'type': 'float', 'default': config['dpv_sample_period']},
-            'dpv_pulse_time': {'label': 'DPV Pulse Time (s)', 'type': 'float', 'default': config['dpv_pulse_time']},
-            'dpv_noise_rejection': {'label': 'DPV Noise Rejection', 'type': 'bool', 'default': config['dpv_noise_rejection']},
-            'dpv_irange_mode': {'label': 'DPV I/E Range Mode', 'type': 'text', 'default': config['dpv_irange_mode']},
-            'dpv_max_current': {'label': 'DPV Max Current (A)', 'type': 'float', 'default': config['dpv_max_current']},
-        }
+    def _quickbar_param(label: str, param_type: str, default: Any) -> Dict[str, Any]:
+        return {'label': label, 'type': param_type, 'default': default}
+
+    @classmethod
+    def _quickbar_params_from_config(cls, config, mode: str) -> Dict[str, Dict[str, Any]]:
+        if mode == 'cv':
+            return {
+                'initial_voltage': cls._quickbar_param('Initial Voltage (V)', 'float', config['initial_voltage']),
+                'apex1_voltage': cls._quickbar_param('Apex 1 Voltage (V)', 'float', config['apex1_voltage']),
+                'apex2_voltage': cls._quickbar_param('Apex 2 Voltage (V)', 'float', config['apex2_voltage']),
+                'final_voltage': cls._quickbar_param('Final Voltage (V)', 'float', config['final_voltage']),
+                'apex1_hold': cls._quickbar_param('Apex 1 Hold (s)', 'float', config['apex1_hold']),
+                'apex2_hold': cls._quickbar_param('Apex 2 Hold (s)', 'float', config['apex2_hold']),
+                'final_hold': cls._quickbar_param('Final Hold (s)', 'float', config['final_hold']),
+                'scan_rate': cls._quickbar_param('Scan Rate (V/s)', 'float', config['scan_rate']),
+                'step_size': cls._quickbar_param('Step Size (V)', 'float', config['step_size']),
+                'cycles': cls._quickbar_param('Cycles', 'int', config['cycles']),
+                'scan_delay': cls._quickbar_param('Scan Delay (s)', 'float', config['scan_delay']),
+                'current_range_mode': cls._quickbar_param('Current Range Mode', 'text', config['current_range_mode']),
+            }
+        if mode == 'ca':
+            return {
+                'initial_voltage': cls._quickbar_param('Initial Voltage (V)', 'float', config['ca_initial_voltage']),
+                'step1_voltage': cls._quickbar_param('Step 1 Voltage (V)', 'float', config['ca_step1_voltage']),
+                'step2_voltage': cls._quickbar_param('Step 2 Voltage (V)', 'float', config['ca_step2_voltage']),
+                'initial_time': cls._quickbar_param('Initial Time (s)', 'float', config['ca_initial_time']),
+                'step1_time': cls._quickbar_param('Step 1 Time (s)', 'float', config['ca_step1_time']),
+                'step2_time': cls._quickbar_param('Step 2 Time (s)', 'float', config['ca_step2_time']),
+                'sample_time': cls._quickbar_param('Sample Time (s)', 'float', config['ca_sample_time']),
+                'expected_max_v': cls._quickbar_param('Expected Max V', 'float', config['ca_expected_max_v']),
+                'current_range_mode': cls._quickbar_param('Current Range Mode', 'text', config['current_range_mode']),
+            }
+        if mode == 'sine':
+            return {
+                'dc_offset': cls._quickbar_param('DC Offset (V)', 'float', config['sine_dc_offset']),
+                'amplitude': cls._quickbar_param('Amplitude (V)', 'float', config['sine_amplitude']),
+                'signal_frequency': cls._quickbar_param('Signal Frequency (Hz)', 'float', config['sine_frequency']),
+                'acq_frequency': cls._quickbar_param('Acquisition Frequency (Hz)', 'float', config['sine_acq_frequency']),
+                'total_time': cls._quickbar_param('Total Time (s)', 'float', config['sine_total_time']),
+                'phase_offset': cls._quickbar_param('Phase Offset (rad)', 'float', config['sine_phase_offset']),
+                'current_range_mode': cls._quickbar_param('Current Range Mode', 'text', config['current_range_mode']),
+            }
+        if mode == 'dpv':
+            return {
+                'initial_voltage': cls._quickbar_param('Initial E (V)', 'float', config['dpv_initial_voltage']),
+                'final_voltage': cls._quickbar_param('Final E (V)', 'float', config['dpv_final_voltage']),
+                'step_size': cls._quickbar_param('Step Size (V)', 'float', config['dpv_step_size']),
+                'pulse_size': cls._quickbar_param('Pulse Size E (V)', 'float', config['dpv_pulse_size']),
+                'sample_period': cls._quickbar_param('Sample Period (s)', 'float', config['dpv_sample_period']),
+                'pulse_time': cls._quickbar_param('Pulse Time (s)', 'float', config['dpv_pulse_time']),
+                'noise_rejection': cls._quickbar_param('Noise Rejection', 'bool', config['dpv_noise_rejection']),
+                'irange_mode': cls._quickbar_param('I/E Range Mode', 'text', config['dpv_irange_mode']),
+                'max_current': cls._quickbar_param('Max Current (A)', 'float', config['dpv_max_current']),
+                'current_range_mode': cls._quickbar_param('Current Range Mode', 'text', config['current_range_mode']),
+            }
+        raise ValueError(f'Unsupported quickbar mode: {mode}')
 
     def __init__(self, gamry_env_path=None, instrument_name=None, overrides=None):
         self.app = None
@@ -317,7 +334,7 @@ class GamryDriver(Driver):
             'status': 'ok',
             'service': self._service_status(),
             'config': self._panel_config_snapshot(),
-            'quickbar': self._quickbar_params_from_config(self.config),
+            'quickbar': self._quickbar_snapshot(),
             'available_instruments': self._safe_list_instruments(),
             'last_connection': self._last_connection_snapshot(),
             'last_result': self._last_panel_result,
@@ -351,50 +368,6 @@ class GamryDriver(Driver):
             'connection': self._last_connection_snapshot(),
         }
 
-    @Driver.queued()
-    @Driver.quickbar(qb={'button_text': 'Collect CV', 'params': {}})
-    def collectCV(
-        self,
-        initial_voltage: Optional[float] = None,
-        apex1_voltage: Optional[float] = None,
-        apex2_voltage: Optional[float] = None,
-        final_voltage: Optional[float] = None,
-        apex1_hold: Optional[float] = None,
-        apex2_hold: Optional[float] = None,
-        final_hold: Optional[float] = None,
-        scan_rate: Optional[float] = None,
-        step_size: Optional[float] = None,
-        cycles: Optional[int] = None,
-        scan_delay: Optional[float] = None,
-        current_range_mode: Optional[str] = None,
-        instrument_name: Optional[str] = None,
-        return_data: bool = False,
-        measurement_mode: Optional[str] = None,
-        **kwargs,
-    ):
-        dataset = self.runMeasurement(
-            measurement_mode='cv' if measurement_mode is None else measurement_mode,
-            instrument_name=instrument_name,
-            return_data=True,
-            initial_voltage=initial_voltage,
-            apex1_voltage=apex1_voltage,
-            apex2_voltage=apex2_voltage,
-            final_voltage=final_voltage,
-            apex1_hold=apex1_hold,
-            apex2_hold=apex2_hold,
-            final_hold=final_hold,
-            scan_rate=scan_rate,
-            step_size=step_size,
-            cycles=cycles,
-            scan_delay=scan_delay,
-            current_range_mode=current_range_mode,
-            **kwargs,
-        )
-        if return_data:
-            return dataset
-        return dataset
-
-
     @Driver.unqueued()
     def runMeasurement(
         self,
@@ -421,6 +394,7 @@ class GamryDriver(Driver):
             return dataset
         return dataset
 
+    @Driver.quickbar(qb={'button_text': 'Run cyclic voltammetry', 'params': {}})
     @Driver.queued()
     def runCV(
         self,
@@ -436,6 +410,7 @@ class GamryDriver(Driver):
             **kwargs,
         )
 
+    @Driver.quickbar(qb={'button_text': 'Run chronoamperometry', 'params': {}})
     @Driver.queued()
     def runCA(
         self,
@@ -451,6 +426,7 @@ class GamryDriver(Driver):
             **kwargs,
         )
 
+    @Driver.quickbar(qb={'button_text': 'Run sine wave', 'params': {}})
     @Driver.queued()
     def runSine(
         self,
@@ -466,6 +442,7 @@ class GamryDriver(Driver):
             **kwargs,
         )
 
+    @Driver.quickbar(qb={'button_text': 'Run differential pulse voltammetry', 'params': {}})
     @Driver.queued()
     def runDPV(
         self,
@@ -481,7 +458,7 @@ class GamryDriver(Driver):
             **kwargs,
         )
 
-    @Driver.queued()
+    @Driver.unqueued()
     def enqueuePanelMeasurement(
         self,
         measurement_mode: Optional[str] = None,
@@ -510,30 +487,6 @@ class GamryDriver(Driver):
             **kwargs,
         )
 
-    # @Driver.unqueued()
-    # def runMeasurementNow(
-    #     self,
-    #     measurement_mode: Optional[str] = None,
-    #     instrument_name: Optional[str] = None,
-    #     **kwargs,
-    # ):
-    #     dataset = self.runMeasurement(
-    #         measurement_mode=measurement_mode,
-    #         instrument_name=instrument_name,
-    #         return_data=True,
-    #         **kwargs,
-    #     )
-    #     self._last_cv_dataset = dataset
-    #     if self.data is not None:
-    #         self.data['main_dataset'] = dataset
-    #         self.data.finalize()
-    #     panel_result = self._build_panel_result(dataset)
-    #     self._last_panel_result = panel_result
-    #     return {
-    #         'status': 'ok',
-    #         'service': self._service_status(),
-    #         'result': panel_result,
-    #     }
 
     @Driver.unqueued()
     def updatePanelConfig(
@@ -638,7 +591,7 @@ class GamryDriver(Driver):
         return {
             'status': 'ok',
             'config': self._panel_config_snapshot(),
-            'quickbar': self._quickbar_params_from_config(self.config),
+            'quickbar': self._quickbar_snapshot(),
         }
 
     def _ensure_service(self) -> None:
@@ -943,11 +896,20 @@ class GamryDriver(Driver):
 
         return ds
 
+    def _quickbar_snapshot(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        return {
+            'runCV': self._quickbar_params_from_config(self.config, 'cv'),
+            'runCA': self._quickbar_params_from_config(self.config, 'ca'),
+            'runSine': self._quickbar_params_from_config(self.config, 'sine'),
+            'runDPV': self._quickbar_params_from_config(self.config, 'dpv'),
+        }
+
     def refresh_quickbar(self) -> None:
-        collect_cv_info = self.quickbar.function_info.get('collectCV')
-        if not collect_cv_info:
-            return
-        collect_cv_info.setdefault('qb', {})['params'] = self._quickbar_params_from_config(self.config)
+        for function_name, params in self._quickbar_snapshot().items():
+            function_info = self.quickbar.function_info.get(function_name)
+            if function_info is None:
+                continue
+            function_info.setdefault('qb', {})['params'] = params
 
     def _measurement_parameters(self, mode: str, overrides: Dict[str, Any]) -> Dict[str, Any]:
         if mode == 'cv':

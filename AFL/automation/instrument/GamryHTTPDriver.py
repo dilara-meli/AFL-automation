@@ -200,7 +200,7 @@ class GamryHTTPDriver(Driver):
     def runSine(self, instrument_name: Optional[str] = None, **kwargs):
         return self._remote_dataset('runSine', 'sine', instrument_name=instrument_name, **kwargs)
 
-    @Driver.queued()
+    @Driver.queued(qb={'button_text': 'Run differential pulse voltammetry'})
     def runDPV(self, instrument_name: Optional[str] = None, **kwargs):
         return self._remote_dataset('runDPV', 'dpv', instrument_name=instrument_name, **kwargs)
 
