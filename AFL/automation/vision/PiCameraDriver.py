@@ -31,6 +31,7 @@ class PiCameraDriver(Driver):
         "output_dir": "camera_images",
         "image_format": "jpg",
         "stream_bitrate": 10_000_000,
+        "stream_address": "127.0.0.1:8000",
     }
 
     def __init__(self, camera=None, overrides=None):
@@ -138,7 +139,7 @@ class PiCameraDriver(Driver):
         else:
             host, separator, port = address.rpartition(":")
         if not separator or not host:
-            raise ValueError("address must have the form host:port, e.g. 0.0.0.0:8000")
+            raise ValueError(f"address must have the form host:port, e.g. 0.0.0.0:8000 not {address}")
         try:
             port = int(port)
         except ValueError as exc:
@@ -197,13 +198,17 @@ class PiCameraDriver(Driver):
                 self._stream_client = None
 
     @Driver.queued()
-    def start_streaming(self, address):
+    def start_streaming(self, address=None):
         """Start an H.264 TCP stream listener at ``address``.
 
-        ``address`` must be ``host:port`` (for example ``0.0.0.0:8000``).
-        The driver listens immediately, and begins streaming only after one
-        client connects.  It does not start automatically during driver setup.
+        When omitted, ``address`` uses the configured ``stream_address``
+        (``127.0.0.1:8000`` by default). It must be ``host:port`` (for
+        example ``0.0.0.0:8000``). The driver listens immediately, and begins
+        streaming only after one client connects. It does not start
+        automatically during driver setup.
         """
+        if address is None:
+            address = self.config["stream_address"]
         host, port = self._parse_stream_address(address)
         with self._stream_lock:
             if self._stream_thread is not None and self._stream_thread.is_alive():

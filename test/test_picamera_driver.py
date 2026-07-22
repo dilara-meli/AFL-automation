@@ -79,11 +79,11 @@ class FakeStreamServer:
         pass
 
 
-def test_start_and_stop_streaming_without_a_client(monkeypatch, capsys):
+def test_start_and_stop_streaming_uses_default_address(monkeypatch, capsys):
     monkeypatch.setattr(picamera_module.socket, "socket", lambda *args: FakeStreamServer())
     driver = PiCameraDriver(camera=FakeCamera())
 
-    result = driver.start_streaming("127.0.0.1:8000")
+    result = driver.start_streaming()
 
     assert result["streaming"] is True
     assert result["address"] == "127.0.0.1:8000"
