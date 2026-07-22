@@ -79,7 +79,7 @@ class FakeStreamServer:
         pass
 
 
-def test_start_and_stop_streaming_without_a_client(monkeypatch):
+def test_start_and_stop_streaming_without_a_client(monkeypatch, capsys):
     monkeypatch.setattr(picamera_module.socket, "socket", lambda *args: FakeStreamServer())
     driver = PiCameraDriver(camera=FakeCamera())
 
@@ -87,6 +87,8 @@ def test_start_and_stop_streaming_without_a_client(monkeypatch):
 
     assert result["streaming"] is True
     assert result["address"] == "127.0.0.1:8000"
+    assert "ffplay -fflags nobuffer" in result["viewer_command"]
+    assert result["viewer_command"] in capsys.readouterr().out
     assert driver.status()["streaming"] is True
     assert driver.stop_streaming() == {"streaming": False}
     assert driver.status()["streaming"] is False

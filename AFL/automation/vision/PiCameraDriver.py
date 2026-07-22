@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import getpass
 from pathlib import Path
 import socket
 import threading
@@ -146,6 +147,16 @@ class PiCameraDriver(Driver):
             raise ValueError("stream port must be between 0 and 65535")
         return host, port
 
+    @staticmethod
+    def _viewer_command(port):
+        """Return the SSH-tunnel command to run on a viewer computer."""
+        return (
+            f"ssh -fN -L {port}:127.0.0.1:{port} "
+            f"{getpass.getuser()}@{socket.gethostname()} && "
+            "ffplay -fflags nobuffer -flags low_delay -f h264 "
+            f"tcp://127.0.0.1:{port}"
+        )
+
     def _serve_stream_client(self):
         """Accept one TCP client and feed it an H.264 stream until stopped."""
         try:
@@ -209,6 +220,7 @@ class PiCameraDriver(Driver):
 
             self._stream_server = server
             self._stream_address = f"{server.getsockname()[0]}:{server.getsockname()[1]}"
+            bound_port = server.getsockname()[1]
             self._stream_stop_event = threading.Event()
             self._stream_thread = threading.Thread(
                 target=self._serve_stream_client,
@@ -217,7 +229,14 @@ class PiCameraDriver(Driver):
             )
             self._stream_thread.start()
 
-        return {"streaming": True, "address": self._stream_address}
+        viewer_command = self._viewer_command(bound_port)
+        print("To view this stream from another computer, run:")
+        print(viewer_command)
+        return {
+            "streaming": True,
+            "address": self._stream_address,
+            "viewer_command": viewer_command,
+        }
 
     @Driver.queued()
     def stop_streaming(self):
@@ -272,3 +291,14 @@ class PiCameraDriver(Driver):
             ),
             "stream_address": self._stream_address,
         }
+
+
+_DEFAULT_CUSTOM_CONFIG = {
+    "_classname": "AFL.automation.vision.PiCameraDriver.PiCameraDriver",
+    "overrides": {},
+}
+_DEFAULT_PORT = 5096
+
+
+if __name__ == "__main__":
+    from AFL.automation.shared.launcher import *
