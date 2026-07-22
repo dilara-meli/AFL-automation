@@ -73,6 +73,7 @@ roboctl = "AFL.automation.cli:main"
 labjack = ["labjack-ljm"]
 piplates = ["piplates"]
 rpi-gpio = ["RPi.GPIO"]
+picamera = ["picamera2"]
 serial = ["pyserial"]
 seabreeze = ["seabreeze"]
 opentrons = ["opentrons"]
