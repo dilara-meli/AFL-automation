@@ -1,4 +1,4 @@
-import os,sys,subprocess,importlib
+import os,sys,subprocess,importlib,copy
 import argparse
 from pathlib import Path
 try:
@@ -105,6 +105,10 @@ def _reconstitute_objects(obj_dict,data=None):
                 return obj_dict
         if '_classname' not in obj_dict.keys():
                 return obj_dict
+        # Reconstruction consumes _classname/_args below. Work on a copy so a
+        # debounced PersistentConfig write cannot save a stripped driver
+        # configuration and make the next launch receive a plain dict.
+        obj_dict = copy.deepcopy(obj_dict)
         class_to_make = obj_dict.pop('_classname')
         if '_args' in obj_dict.keys():
                 _args = obj_dict.pop('_args')
@@ -150,8 +154,21 @@ parser.add_argument('-i', '--interactive', action='store_true',
 args = parser.parse_args()
 
 if main_module_name in AFL_GLOBAL_CONFIG['driver_custom_configs']:
-        print(f'launching from custom config for {main_module_name}')
-        driver = _reconstitute_objects(AFL_GLOBAL_CONFIG['driver_custom_configs'][main_module_name],data=data)
+        custom_config = AFL_GLOBAL_CONFIG['driver_custom_configs'][main_module_name]
+        if isinstance(custom_config, dict) and '_classname' in custom_config:
+                print(f'launching from custom config for {main_module_name}')
+                driver = _reconstitute_objects(custom_config,data=data)
+        else:
+                print(f'Invalid custom config for {main_module_name}; launching with defaults')
+                try:
+                        driver_configs = AFL_GLOBAL_CONFIG['driver_custom_configs']
+                        driver_configs[main_module_name] = copy.deepcopy(
+                                driver_module._DEFAULT_CUSTOM_CONFIG
+                        )
+                        AFL_GLOBAL_CONFIG['driver_custom_configs'] = driver_configs
+                except AttributeError:
+                        pass
+                driver = driver_cls()
 else:
         driver = driver_cls()
 server = APIServer(main_module_name,data=data,contact=AFL_GLOBAL_CONFIG['owner_email'])
