@@ -1243,15 +1243,34 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         str
             Loaded module identifier returned by the robot.
         """
+        slot = str(slot)
         self.log_debug(f"Loading module '{name}' into slot '{slot}'")
+
+        existing_module = self.config["loaded_modules"].get(slot)
+        if existing_module is not None:
+            try:
+                existing_module_id, existing_name = existing_module
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Cannot load module {name!r} in deck slot {slot!r}: the stored "
+                    f"module record is invalid: {existing_module!r}"
+                ) from exc
+            if existing_name == name:
+                self.log_info(
+                    f"Module {name!r} is already loaded in deck slot {slot!r} "
+                    f"with ID {existing_module_id!r}; reusing it."
+                )
+                return existing_module_id
+            raise RuntimeError(
+                f"Cannot load module {name!r} in deck slot {slot!r}: slot already "
+                f"contains module {existing_name!r} with ID {existing_module_id!r}. "
+                "Unload or reset the existing module before replacing it."
+            )
+
         # Ensure we have a valid run
         run_id = self._ensure_run_exists(check_run_status=check_run_status)
 
         try:
-            if slot in self.config["loaded_modules"].keys():
-                # todo: check if same module
-                raise RuntimeError(f"Module already loaded in slot {slot}: {self.config['loaded_modules']['slot']}.  Overwrite not supported.")
-
             # Prepare the loadLabware command
             command_dict = {
                 "data": {
@@ -1273,7 +1292,12 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             )
 
             
-            self._check_cmd_success(response)
+            try:
+                self._check_cmd_success(response)
+            except RuntimeError:
+                message = self._module_load_failure_message(name, slot, response)
+                self.log_error(message)
+                raise RuntimeError(message) from None
             # Get the labware ID from the response
             response_data = response.json()
 
@@ -1305,7 +1329,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 )
 
             # Store the module information directly in config
-            self.config["loaded_modules"][str(slot)] = (module_id, name)
+            self.config["loaded_modules"][slot] = (module_id, name)
 
             self.log_info(
                 f"Successfully loaded module '{name}' in slot {slot} with ID {module_id}"
@@ -1316,6 +1340,38 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         except (requests.exceptions.RequestException, KeyError) as e:
             self.log_error(f"Error loading module: {str(e)}")
             raise RuntimeError(f"Error loading module: {str(e)}")
+
+    @staticmethod
+    def _module_load_failure_message(name, slot, response):
+        """Create an actionable error message from an OT-2 load-module response."""
+        error_type = None
+        error_code = None
+        detail = None
+        try:
+            error = response.json().get("data", {}).get("error", {})
+            error_type = error.get("errorType")
+            error_code = error.get("errorCode")
+            detail = error.get("detail")
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+        reported_error = ""
+        if error_type:
+            reported_error = f" Robot reported {error_type}"
+            if error_code:
+                reported_error += f" (code {error_code})"
+            if detail:
+                reported_error += f": {detail}"
+            reported_error += "."
+        elif detail:
+            reported_error = f" Robot reported: {detail}."
+
+        return (
+            f"Unable to load OT-2 module {name!r} in deck slot {str(slot)!r}."
+            f"{reported_error} Verify that the module is connected to the OT-2, "
+            "powered if required, matches the requested model, and is detected by "
+            "the Opentrons hardware server before retrying."
+        )
 
     def load_instrument(self, name, mount, tip_rack_slots, reload=False, check_run_status=True, update_pipettes=True, **kwargs):
         """Load a pipette and initialize tip tracking.
