@@ -56,7 +56,7 @@ class OT2RidingCam(PiCameraDriver, OT2GantryDriver):
 _DEFAULT_CUSTOM_CONFIG = {
     "_classname": "AFL.automation.vision.OT2RidingCam.OT2RidingCam",
     "overrides": {
-        "ot2_prepare_ip": "127.0.0.1",
+        "ot2_prepare_ip": "127.0.0.1", # should be the network switch where you start the AFL servers 
         "ot2_prepare_port": "5005",
         "resolution": [1920, 1080],
     },

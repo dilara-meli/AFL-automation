@@ -202,10 +202,32 @@ class ImageProcessing:
         self._background_image = self._image_from_uid(image_uid).copy()
         return {"background_set": True, "shape": [int(value) for value in self._background_image.shape]}
 
+    def _crop_measurement_image(self, image, row_crop=None, col_crop=None):
+        """Crop an image only when both rectangular ROI bounds are supplied."""
+        if row_crop is None or col_crop is None:
+            return np.asarray(image)
+        return self.crop_image(image, row_crop=row_crop, col_crop=col_crop)
+
     @Driver.unqueued()
-    def measure_mean_rgb(self, image_uid, center=None, radius=None, hough_radii=None, color_order="RGB"):
-        """Return RGB means for a captured image, optionally limited to a circle."""
-        image = self._image_from_uid(image_uid)
+    def measure_mean_rgb(
+        self,
+        image_uid,
+        center=None,
+        radius=None,
+        hough_radii=None,
+        color_order="RGB",
+        row_crop=None,
+        col_crop=None,
+    ):
+        """Return RGB means for a captured image, optionally inside a rectangular and circular ROI.
+
+        A rectangular ROI is applied only when both ``row_crop`` and
+        ``col_crop`` are provided. Circle coordinates and Hough detection are
+        relative to that rectangular crop.
+        """
+        image = self._crop_measurement_image(
+            self._image_from_uid(image_uid), row_crop=row_crop, col_crop=col_crop
+        )
         if center is None and radius is None and hough_radii is None:
             mask = None
             circle = None
@@ -219,8 +241,23 @@ class ImageProcessing:
         return result
 
     @Driver.unqueued()
-    def measure_turbidity(self, image_uid, background_uid=None, center=None, radius=None, hough_radii=None, color_order="RGB"):
-        """Return a background-normalized turbidity measurement for a capture."""
+    def measure_turbidity(
+        self,
+        image_uid,
+        background_uid=None,
+        center=None,
+        radius=None,
+        hough_radii=None,
+        color_order="RGB",
+        row_crop=None,
+        col_crop=None,
+    ):
+        """Return turbidity, optionally inside a rectangular and circular ROI.
+
+        A rectangular ROI is applied only when both ``row_crop`` and
+        ``col_crop`` are provided. The identical crop is applied to the image
+        and its background before circle detection and normalization.
+        """
         image = self._image_from_uid(image_uid)
         if background_uid is not None:
             background = self._image_from_uid(background_uid)
@@ -228,6 +265,10 @@ class ImageProcessing:
             background = self._background_image
         else:
             raise ValueError("set a background image or provide background_uid before measuring turbidity")
+        image = self._crop_measurement_image(image, row_crop=row_crop, col_crop=col_crop)
+        background = self._crop_measurement_image(
+            background, row_crop=row_crop, col_crop=col_crop
+        )
         if center is None and radius is None and hough_radii is None:
             mask = None
             circle = None

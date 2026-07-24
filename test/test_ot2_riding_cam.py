@@ -58,9 +58,9 @@ def test_ot2_riding_cam_inherits_camera_and_gantry_interfaces(monkeypatch):
     assert driver.config["resolution"] == [1920, 1080]
     assert driver.config["ot2_prepare_ip"] == "ot2-prepare.test"
     assert driver.config["ot2_prepare_port"] == "5002"
-    assert driver.config["gantry_safe_clearance_mm"] == 50.0
+    assert driver.config["gantry_reference_mount"] == "left"
 
-    assert driver.move_to_well("1A1")["owner_task_uuids"] == ["owner-task", "owner-task"]
+    assert driver.move_to_well("1A1")["owner_task_uuids"] == ["owner-task"]
     capture = driver.capture()
     assert driver.measure_mean_rgb(capture["image_uid"]) == {
         "avg_rgb": {"R": 0.0, "G": 0.0, "B": 0.0}

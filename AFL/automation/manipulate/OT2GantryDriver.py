@@ -19,8 +19,21 @@ class OT2GantryDriver(ProxyDriver):
         # Address of the APIServer running OT2Prepare, not the robot itself.
         "ot2_prepare_ip": "127.0.0.1",
         "ot2_prepare_port": "5005",
-        "gantry_relative_move_mm": 1.0,
-        "gantry_safe_clearance_mm": 50.0,
+        # OT-2's owner API requires a pipette ID to resolve a well position.
+        # This is only an internal coordinate reference; it is not exposed by
+        # the gantry API.
+        "gantry_reference_mount": "left",
+        # Parked pipette heights, relative to the selected well's origin.
+        # Set these to the calibrated Z offsets that keep each pipette clear
+        # while the shared XY gantry travels between wells.
+        "left_pipette_zero": 0.0,
+        "right_pipette_zero": 0.0,
+        # Offset of the payload carried by the gantry from the centre of the
+        # reference pipette, in millimetres.  This lets a riding camera (or
+        # another fixed payload) target a well without changing every call.
+        "offset_x": 0.0,
+        "offset_y": 0.0,
+        "offset_z": 0.0,
     }
 
     _WELL_NAME_RE = re.compile(r"^[A-Za-z]+[0-9]+$")
@@ -61,68 +74,88 @@ class OT2GantryDriver(ProxyDriver):
         if ot2_prepare_port is not None:
             self.config["ot2_prepare_port"] = str(ot2_prepare_port)
         self._ot2_prepare_client = None
-        self._gantry_locations = {}
+        self._pipette_locations = {}
+        self._gantry_location = None
 
     @Driver.queued()
     def move_to_well(
         self,
         location,
-        mount="left",
         origin="top",
-        offset_x=0.0,
-        offset_y=0.0,
-        offset_z=0.0,
+        offset_x=None,
+        offset_y=None,
+        offset_z=None,
     ):
-        """Queue a safe approach and move to a loaded OT2Prepare well."""
-        mount = self._normalize_mount(mount)
+        """Queue a gantry move to a loaded OT2Prepare well.
+
+        Unspecified offsets use the driver-level payload offsets.  Supplying
+        an individual offset overrides only that axis for this move.  Pipette
+        mounts and their Z positions are deliberately not part of this API.
+        """
         slot, well = self._parse_location(location)
         origin = self._normalize_origin(origin)
-        offset = self._offset(offset_x, offset_y, offset_z)
+        payload_offset = self._offset(
+            self.config["offset_x"] if offset_x is None else offset_x,
+            self.config["offset_y"] if offset_y is None else offset_y,
+            self.config["offset_z"] if offset_z is None else offset_z,
+        )
+        reference_mount = self._reference_mount()
+        offset = dict(payload_offset)
+        offset["z"] += self._pipette_zero(reference_mount)
         owner_config = self._owner_config()
-        target = self._resolve_target(owner_config, slot, well, mount)
-
-        safe_offset = self._safe_offset(owner_config, target["labware_id"], offset)
-        task_uuids = [
-            self._enqueue_atomic_move(target, origin="top", offset=safe_offset),
-            self._enqueue_atomic_move(target, origin=origin, offset=offset),
-        ]
-        self._gantry_locations[mount] = {
+        target = self._resolve_target(
+            owner_config,
+            slot,
+            well,
+            reference_mount,
+        )
+        result = self._queued_result([self._enqueue_atomic_move(target, origin, offset)])
+        # A well-relative command gives us the coordinate origin needed for
+        # subsequent relative moves.  Movement is shared in XY, while each
+        # pipette has its own Z position.
+        self._pipette_locations = {
+            reference_mount: offset["z"],
+        }
+        self._gantry_location = {
             "location": f"{slot}{well}",
             "origin": origin,
-            "offset": offset,
+            "x": offset["x"],
+            "y": offset["y"],
+            "payload_z": payload_offset["z"],
         }
-        return self._queued_result(task_uuids)
+        return result
 
     @Driver.queued()
-    def move_pipette_up(self, mount="left", distance=None):
-        """Queue a well-relative upward move on OT2Prepare."""
-        return self._move_relative_z(mount, distance, direction=1)
+    def move_pipette(self, mount="", dx=0.0, dy=0.0, dz=0.0):
+        """Move a loaded pipette by a well-relative displacement in millimetres.
 
-    @Driver.queued()
-    def move_pipette_down(self, mount="left", distance=None):
-        """Queue a well-relative downward move on OT2Prepare."""
-        return self._move_relative_z(mount, distance, direction=-1)
-
-    def _move_relative_z(self, mount, distance, direction):
-        mount = self._normalize_mount(mount)
-        if distance is None:
-            distance = self.config["gantry_relative_move_mm"]
-        distance = self._positive_distance(distance)
-        try:
-            previous = self._gantry_locations[mount]
-        except KeyError as exc:
-            raise ValueError(
-                f"No previous gantry target for {mount} mount. Call move_to_well first."
-            ) from exc
-
-        slot, well = self._parse_location(previous["location"])
-        owner_config = self._owner_config()
-        target = self._resolve_target(owner_config, slot, well, mount)
-        offset = dict(previous["offset"])
-        offset["z"] += direction * distance
-        task_uuid = self._enqueue_atomic_move(target, previous["origin"], offset)
-        self._gantry_locations[mount]["offset"] = offset
-        return self._queued_result([task_uuid])
+        Call :meth:`move_to_well` first to establish the well-relative origin.
+        An empty ``mount`` uses ``gantry_reference_mount``.  The OT-2 owner
+        API has no relative-motion command, so the driver accumulates the
+        requested displacement and submits the resulting ``moveToWell``
+        command for the selected pipette.
+        """
+        mount = self._reference_mount() if not str(mount).strip() else self._normalize_mount(mount)
+        delta = self._offset(dx, dy, dz)
+        if self._gantry_location is None:
+            raise ValueError("No previous gantry target. Call move_to_well first.")
+        previous_z = self._pipette_locations.get(
+            mount,
+            self._gantry_location["payload_z"] + self._pipette_zero(mount),
+        )
+        offset = {
+            "x": self._gantry_location["x"] + delta["x"],
+            "y": self._gantry_location["y"] + delta["y"],
+            "z": previous_z + delta["z"],
+        }
+        slot, well = self._parse_location(self._gantry_location["location"])
+        target = self._resolve_target(self._owner_config(), slot, well, mount)
+        result = self._queued_result(
+            [self._enqueue_atomic_move(target, self._gantry_location["origin"], offset)]
+        )
+        self._pipette_locations[mount] = offset["z"]
+        self._gantry_location.update(x=offset["x"], y=offset["y"])
+        return result
 
     def _owner_config(self):
         result = self._get_ot2_prepare_client().get_config(
@@ -146,7 +179,7 @@ class OT2GantryDriver(ProxyDriver):
         except (KeyError, IndexError, TypeError) as exc:
             raise ValueError(
                 f"OT2Prepare has no loaded labware in slot {slot!r} or no pipette on "
-                f"the {mount!r} mount"
+                f"the configured gantry reference mount {mount!r}"
             ) from exc
         if not pipette_id:
             raise ValueError(f"OT2Prepare has no active pipette ID on {mount!r} mount")
@@ -197,30 +230,6 @@ class OT2GantryDriver(ProxyDriver):
             )
         return self._ot2_prepare_client
 
-    def _safe_offset(self, config, target_labware_id, requested_offset):
-        target_height = self._labware_height(config, target_labware_id)
-        tallest_height = max(
-            (self._labware_height(config, labware[0]) for labware in config.get("loaded_labware", {}).values()),
-            default=target_height,
-        )
-        safe_offset = dict(requested_offset)
-        safe_offset["z"] = max(
-            requested_offset["z"], tallest_height - target_height
-        ) + self._positive_distance(self.config["gantry_safe_clearance_mm"])
-        return safe_offset
-
-    @staticmethod
-    def _labware_height(config, labware_id):
-        for labware in config.get("loaded_labware", {}).values():
-            if not isinstance(labware, (list, tuple)) or len(labware) < 3 or labware[0] != labware_id:
-                continue
-            try:
-                height = float(labware[2]["definition"]["dimensions"]["z"])
-            except (KeyError, TypeError, ValueError):
-                return 0.0
-            return height if math.isfinite(height) and height >= 0 else 0.0
-        return 0.0
-
     def _parse_location(self, location):
         if not isinstance(location, str):
             raise ValueError("location must be a string such as '1A1'")
@@ -235,6 +244,13 @@ class OT2GantryDriver(ProxyDriver):
         if mount not in {"left", "right"}:
             raise ValueError("mount must be 'left' or 'right'")
         return mount
+
+    def _reference_mount(self):
+        return self._normalize_mount(self.config["gantry_reference_mount"])
+
+    def _pipette_zero(self, mount):
+        """Return the configured parked Z offset for ``mount`` in millimetres."""
+        return self._offset(0.0, 0.0, self.config[f"{mount}_pipette_zero"])["z"]
 
     def _normalize_origin(self, origin):
         origin = str(origin).strip().lower()
@@ -251,17 +267,6 @@ class OT2GantryDriver(ProxyDriver):
         if not all(math.isfinite(value) for value in offset.values()):
             raise ValueError("offsets must be finite numbers in millimeters")
         return offset
-
-    @staticmethod
-    def _positive_distance(distance):
-        try:
-            distance = float(distance)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("distance must be a positive number of millimeters") from exc
-        if not math.isfinite(distance) or distance <= 0:
-            raise ValueError("distance must be a positive number of millimeters")
-        return distance
-
 
 _DEFAULT_PORT = 5006
 if __name__ == "__main__":
