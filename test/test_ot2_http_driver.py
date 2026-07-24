@@ -221,6 +221,64 @@ class _FakeResponse:
         return self._payload
 
 
+def test_load_module_reports_an_actionable_attachment_error(monkeypatch):
+    driver = StubOT2HTTPDriver()
+
+    def fake_post(url, headers=None, params=None, json=None):
+        assert json["data"]["commandType"] == "loadModule"
+        return _FakeResponse(
+            {
+                "data": {
+                    "status": "failed",
+                    "error": {
+                        "errorType": "ModuleNotAttachedError",
+                        "errorCode": "4000",
+                        "detail": "No available temperatureModuleV1 with any serial found.",
+                    },
+                }
+            }
+        )
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", fake_post)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        driver.load_module("temperatureModuleV1", "4")
+
+    message = str(exc_info.value)
+    assert "temperatureModuleV1" in message
+    assert "deck slot '4'" in message
+    assert "ModuleNotAttachedError (code 4000)" in message
+    assert "No available temperatureModuleV1 with any serial found." in message
+    assert "connected to the OT-2" in message
+    assert "detected by the Opentrons hardware server" in message
+
+
+def test_load_module_reuses_an_existing_matching_module_without_http_call(monkeypatch):
+    driver = StubOT2HTTPDriver()
+    driver.config["loaded_modules"]["4"] = ("module-4", "temperatureModuleV1")
+
+    def unexpected_post(*args, **kwargs):
+        raise AssertionError("An already-loaded matching module must not be loaded again")
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", unexpected_post)
+
+    assert driver.load_module("temperatureModuleV1", 4) == "module-4"
+
+
+def test_load_module_reports_a_conflicting_module_in_the_same_slot():
+    driver = StubOT2HTTPDriver()
+    driver.config["loaded_modules"]["4"] = ("module-4", "temperatureModuleV1")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        driver.load_module("magneticModuleV2", "4")
+
+    assert str(exc_info.value) == (
+        "Cannot load module 'magneticModuleV2' in deck slot '4': slot already "
+        "contains module 'temperatureModuleV1' with ID 'module-4'. Unload or "
+        "reset the existing module before replacing it."
+    )
+
+
 def test_set_flow_rates_updates_only_loaded_pipettes():
     driver = _configured_driver()
 
