@@ -4,10 +4,10 @@ import math
 import re
 
 from AFL.automation.APIServer.Client import Client
-from AFL.automation.APIServer.Driver import Driver
+from AFL.automation.APIServer.Driver import Driver, ProxyDriver
 
 
-class OT2GantryDriver(Driver):
+class OT2GantryDriver(ProxyDriver):
     """Translate gantry requests into OT2Prepare atomic-command queue tasks.
 
     Configure this driver with the APIServer address hosting ``OT2Prepare``.
@@ -17,8 +17,8 @@ class OT2GantryDriver(Driver):
 
     defaults = {
         # Address of the APIServer running OT2Prepare, not the robot itself.
-        "ip": "127.0.0.1",
-        "port": "5005",
+        "ot2_prepare_ip": "127.0.0.1",
+        "ot2_prepare_port": "5005",
         "gantry_relative_move_mm": 1.0,
         "gantry_safe_clearance_mm": 50.0,
     }
@@ -26,12 +26,40 @@ class OT2GantryDriver(Driver):
     _WELL_NAME_RE = re.compile(r"^[A-Za-z]+[0-9]+$")
     _WELL_ORIGINS = {"top", "bottom", "center"}
 
-    def __init__(self, overrides=None):
-        super().__init__(
-            name="OT2_Gantry_Driver",
-            defaults=self.gather_defaults(),
-            overrides=overrides,
+    def __init__(
+        self,
+        overrides=None,
+        ot2_prepare_ip=None,
+        ot2_prepare_port=None,
+        initialize_driver=True,
+    ):
+        """Initialize the gantry proxy and its OT2Prepare target settings."""
+        overrides = dict(overrides or {})
+        if ot2_prepare_ip is not None:
+            overrides["ot2_prepare_ip"] = ot2_prepare_ip
+        if ot2_prepare_port is not None:
+            overrides["ot2_prepare_port"] = str(ot2_prepare_port)
+        if initialize_driver:
+            super().__init__(
+                name="OT2_Gantry_Driver",
+                defaults=self.gather_defaults(),
+                overrides=overrides,
+            )
+        self._initialize_gantry_state(
+            ot2_prepare_ip=ot2_prepare_ip,
+            ot2_prepare_port=ot2_prepare_port,
         )
+
+    def _initialize_gantry_state(self, ot2_prepare_ip=None, ot2_prepare_port=None):
+        """Initialize local proxy state without creating a second Driver."""
+        # A composed driver may have initialized Driver through a sibling
+        # class rather than ProxyDriver.__init__.
+        if not hasattr(self, "_proxy_clients"):
+            self._proxy_clients = {}
+        if ot2_prepare_ip is not None:
+            self.config["ot2_prepare_ip"] = ot2_prepare_ip
+        if ot2_prepare_port is not None:
+            self.config["ot2_prepare_port"] = str(ot2_prepare_port)
         self._ot2_prepare_client = None
         self._gantry_locations = {}
 
@@ -153,17 +181,19 @@ class OT2GantryDriver(Driver):
 
     def _get_ot2_prepare_client(self):
         if self._ot2_prepare_client is None:
-            ip = self.config.get("ip")
+            ip = self.config.get("ot2_prepare_ip")
             if not ip:
                 raise ValueError(
                     "ip must name the APIServer running OT2Prepare"
                 )
-            self._ot2_prepare_client = Client(
+            self._ot2_prepare_client = self.get_proxy_client(
+                "ot2_prepare",
                 ip=ip,
-                port=str(self.config["port"]),
+                port=str(self.config["ot2_prepare_port"]),
+                username="OT2GantryDriver",
                 # Client logs in during construction and retains the JWT in
                 # its Authorization header for subsequent owner requests.
-                username="OT2GantryDriver",
+                client_factory=Client,
             )
         return self._ot2_prepare_client
 

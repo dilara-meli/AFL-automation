@@ -44,7 +44,7 @@ def make_driver(monkeypatch):
         return client
 
     monkeypatch.setattr("AFL.automation.manipulate.OT2GantryDriver.Client", fake_client)
-    driver = OT2GantryDriver(overrides={"ip": "ot2-prepare.test", "port": "5002"})
+    driver = OT2GantryDriver(overrides={"ot2_prepare_ip": "ot2-prepare.test", "ot2_prepare_port": "5002"})
     return driver, client, seen
 
 
@@ -95,6 +95,31 @@ def test_move_to_well_builds_client_from_ip_and_port(monkeypatch):
             },
         ),
     ]
+
+
+def test_constructor_target_settings_override_config(monkeypatch):
+    client = FakeOT2PrepareClient()
+    seen = []
+
+    def fake_client(ip, port, username):
+        seen.append((ip, port, username))
+        return client
+
+    monkeypatch.setattr(
+        "AFL.automation.manipulate.OT2GantryDriver.Client",
+        fake_client,
+    )
+
+    driver = OT2GantryDriver(
+        overrides={"ot2_prepare_ip": "ignored.test", "ot2_prepare_port": "5001"},
+        ot2_prepare_ip="ot2-prepare.test",
+        ot2_prepare_port=5002,
+    )
+
+    assert driver.config["ot2_prepare_ip"] == "ot2-prepare.test"
+    assert driver.config["ot2_prepare_port"] == "5002"
+    driver._get_ot2_prepare_client()
+    assert seen == [("ot2-prepare.test", "5002", "OT2GantryDriver")]
 
 
 def test_relative_move_uses_current_ot2_prepare_ids_without_safe_reapproach(monkeypatch):

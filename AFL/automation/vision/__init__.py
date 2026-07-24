@@ -1,6 +1,6 @@
-"""Vision drivers and camera integrations."""
+"""Vision drivers and reusable image-processing helpers."""
 
-__all__ = ["PiCameraDriver"]
+__all__ = ["ImageProcessing", "PiCameraDriver", "OT2RidingCam"]
 
 
 def __getattr__(name):
@@ -9,4 +9,12 @@ def __getattr__(name):
         from .PiCameraDriver import PiCameraDriver
 
         return PiCameraDriver
+    if name == "ImageProcessing":
+        from .ImageProcessing import ImageProcessing
+
+        return ImageProcessing
+    if name == "OT2RidingCam":
+        from .OT2RidingCam import OT2RidingCam
+
+        return OT2RidingCam
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -13,9 +13,10 @@ import uuid
 import lazy_loader as lazy
 
 from AFL.automation.APIServer.Driver import Driver
+from AFL.automation.vision.ImageProcessing import ImageProcessing
 
 
-class PiCameraDriver(Driver):
+class PiCameraDriver(ImageProcessing, Driver):
     """Capture still images from a Raspberry Pi camera.
 
     ``picamera2`` is loaded only when a real camera is constructed, so this
@@ -34,17 +35,25 @@ class PiCameraDriver(Driver):
         "stream_address": "127.0.0.1:8000",
     }
 
-    def __init__(self, camera=None, overrides=None):
+    def __init__(
+        self,
+        camera=None,
+        overrides=None,
+        name="PiCameraDriver",
+        initialize_driver=True,
+    ):
         """Create the driver and initialize a real Picamera2 when needed."""
-        Driver.__init__(
-            self,
-            name="PiCameraDriver",
-            defaults=self.gather_defaults(),
-            overrides=overrides,
-        )
+        if initialize_driver:
+            Driver.__init__(
+                self,
+                name=name,
+                defaults=self.gather_defaults(),
+                overrides=overrides,
+            )
         self.camera = camera
         self._owns_camera = camera is None
         self._last_image = None
+        self._background_image = None
         self._last_saved_path = None
         self._stream_server = None
         self._stream_client = None
