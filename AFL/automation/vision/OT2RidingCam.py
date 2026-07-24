@@ -61,7 +61,7 @@ _DEFAULT_CUSTOM_CONFIG = {
         "resolution": [1920, 1080],
     },
 }
-_DEFAULT_CUSTOM_PORT = 5007
+_DEFAULT_PORT = 5007
 
 if __name__ == "__main__":
     from AFL.automation.shared.launcher import *
