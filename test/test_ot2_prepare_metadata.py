@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2Prepare import OT2Prepare
 
 
@@ -215,6 +216,13 @@ def test_clear_sample_locations_allows_destination_reuse():
     assert cleared == ["5A1"]
     assert driver.config["occupied_sample_locations"] == ["5A2"]
     assert driver.resolve_destination("5A1") == "5A1"
+
+
+def test_clear_sample_locations_is_a_queued_driver_command():
+    assert "clear_sample_locations" in Driver.queued.functions
+    assert Driver.queued.function_info["clear_sample_locations"]["kwargs"] == [
+        ("locations", None)
+    ]
 
 
 def test_reset_clears_tip_reservations_and_occupied_samples():
