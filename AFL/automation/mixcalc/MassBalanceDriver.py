@@ -9,6 +9,7 @@ import datetime
 import uuid
 import json
 import hashlib
+from itertools import product
 
 import numpy as np
 from scipy.optimize import Bounds
@@ -838,6 +839,138 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
             sweep_config = {}
         self.config['sweep_config'] = sweep_config
         return {'success': True}
+
+    @Driver.unqueued()
+    def generate_sweep_targets(self, sweep_config=None):
+        """Generate MixDoctor targets from a serializable sweep configuration.
+
+        The configuration is the same object saved by MixDoctor's sweep editor:
+        ``prefix``, ``size_type``, ``size_value``, ``rows``, and optional
+        ``name_rules``.  Keeping generation on the driver makes it available to
+        scripts and guarantees that the UI previews the exact target list that it
+        uploads.
+        """
+        if isinstance(sweep_config, str):
+            sweep_config = json.loads(sweep_config)
+        sweep_config = sweep_config or {}
+        if not isinstance(sweep_config, dict):
+            raise ValueError('sweep_config must be a dictionary')
+
+        property_keys = {
+            'mass': 'masses',
+            'volume': 'volumes',
+            'concentration': 'concentrations',
+            'mass_fraction': 'mass_fractions',
+            'volume_fraction': 'volume_fractions',
+            'molarity': 'molarities',
+            'molality': 'molalities',
+        }
+        property_short_names = {
+            'mass': 'm',
+            'volume': 'v',
+            'concentration': 'c',
+            'mass_fraction': 'mf',
+            'volume_fraction': 'vf',
+            'molarity': 'M',
+            'molality': 'm',
+        }
+        unit_properties = {'mass', 'volume', 'concentration', 'molarity', 'molality'}
+
+        active_rows = []
+        remainder_rows = []
+        solutes = []
+        source_rows = {}
+        for row in sweep_config.get('rows', []):
+            if not isinstance(row, dict) or not row.get('use', False):
+                continue
+            component = str(row.get('name', '')).strip()
+            property_type = str(row.get('prop_type', '')).strip()
+            if not component or property_type not in property_keys:
+                continue
+            source_rows.setdefault(component, row)
+            if row.get('is_solute', False) and component not in solutes:
+                solutes.append(component)
+            if row.get('is_remainder', False):
+                remainder_rows.append((component, property_type, str(row.get('units', '')).strip()))
+                continue
+            try:
+                start = float(row.get('start'))
+                stop = float(row.get('stop'))
+                steps = int(row.get('steps'))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'Invalid sweep range for {component!r}') from exc
+            if steps < 1:
+                raise ValueError(f'Sweep steps for {component!r} must be at least 1')
+            values = np.linspace(start, stop, steps).tolist()
+            active_rows.append((component, property_type, str(row.get('units', '')).strip(), values))
+
+        if not active_rows:
+            return []
+
+        target_count = int(np.prod([len(row[3]) for row in active_rows]))
+        if target_count > 10000:
+            raise ValueError(f'Sweep would create {target_count} targets; limit is 10000')
+
+        prefix = str(sweep_config.get('prefix') or 'target').strip() or 'target'
+        size_type = str(sweep_config.get('size_type') or '').strip()
+        size_value = sweep_config.get('size_value')
+        name_rules = sweep_config.get('name_rules') or []
+        targets = []
+
+        for index, values in enumerate(product(*(row[3] for row in active_rows))):
+            target = {}
+            if size_type and size_value not in (None, ''):
+                target[size_type] = size_value
+            for (component, property_type, units, _), value in zip(active_rows, values):
+                property_key = property_keys[property_type]
+                target.setdefault(property_key, {})[component] = (
+                    f'{value:g} {units}' if property_type in unit_properties and units else value
+                )
+            for component, property_type, _ in remainder_rows:
+                target.setdefault(property_keys[property_type], {})[component] = None
+            if solutes:
+                target['solutes'] = list(solutes)
+
+            name_segments = []
+            include_index = False
+            for rule in name_rules:
+                if not isinstance(rule, dict):
+                    continue
+                component = str(rule.get('component', '')).strip()
+                source_row = source_rows.get(component)
+                if source_row is None:
+                    continue
+                property_type = source_row.get('prop_type')
+                property_key = property_keys.get(property_type)
+                raw_value = target.get(property_key, {}).get(component) if property_key else None
+                if raw_value is None:
+                    continue
+                try:
+                    value = float(str(raw_value).split()[0])
+                except (TypeError, ValueError):
+                    continue
+                formatter = str(rule.get('formatter') or '.3f')
+                try:
+                    formatted = format(value, formatter)
+                except ValueError:
+                    formatted = f'{value:.4g}'
+                units = str(source_row.get('units', '')).strip().replace(' ', '')
+                suffix = units if rule.get('include_units', False) and property_type in unit_properties else ''
+                if rule.get('show_component', True):
+                    segment = f'{component}_{property_short_names[property_type]}{formatted}{suffix}'
+                else:
+                    segment = f'{formatted}{suffix}'
+                name_segments.append(segment)
+                include_index = include_index or bool(rule.get('include_index', False))
+
+            target['name'] = (
+                f'{prefix}-' + '-'.join(name_segments)
+                if name_segments else f'{prefix}-{index + 1:04d}'
+            )
+            if include_index and name_segments:
+                target['name'] += f'-{index + 1}'
+            targets.append(target)
+        return targets
 
     @Driver.unqueued()
     def load_sweep_config(self):

@@ -700,6 +700,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 occupied.append(location)
         self.config["occupied_sample_locations"] = occupied
 
+    @Driver.queued()
     def clear_sample_locations(self, locations=None):
         """Clear occupied sample destination tracking.
 
