@@ -196,6 +196,22 @@ def test_execute_preparation_marks_destination_occupied():
     assert driver.config["occupied_sample_locations"] == ["5A1"]
 
 
+def test_execute_preparation_reorders_deck_sources_by_stock_mix_order():
+    driver = StubOT2Prepare()
+    driver.config["deck"] = {"1A1": "Water", "1A2": "Salt"}
+    driver.config["stock_mix_order"] = ["Salt", "Water"]
+    balanced_target = SimpleNamespace(
+        protocol=[
+            SimpleNamespace(source="1A1", volume=50.0),
+            SimpleNamespace(source="1A2", volume=50.0),
+        ]
+    )
+
+    assert driver.execute_preparation({}, balanced_target, "5A1") is True
+
+    assert [call["source"] for call in driver.transfer_calls] == ["1A2", "1A1"]
+
+
 def test_resolve_destination_rejects_occupied_sample_location():
     driver = StubOT2Prepare()
     driver.config["prep_targets"] = ["5A1", "5A2"]
@@ -287,6 +303,29 @@ def test_prepare_stock_volume_fractions_emits_ot2_transfers():
     assert [call["source"] for call in driver.transfer_calls] == ["1A1", "1A2", "1A3", "1A4"]
     assert [call["dest"] for call in driver.transfer_calls] == ["6A1", "6A1", "6A1", "6A1"]
     assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [300.0, 400.0, 100.0, 200.0]
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_prepare_stock_volume_fractions_honors_stock_mix_order():
+    driver = StubOT2Prepare()
+    driver.config["stock_mix_order"] = ["stock_Blue", "stock_Red"]
+    driver.config["stocks"] = [
+        {"name": "stock_Red", "masses": {"H2O": "20 g"}, "location": "1A1"},
+        {"name": "stock_Blue", "masses": {"H2O": "20 g"}, "location": "1A2"},
+    ]
+    driver.process_stocks()
+
+    driver.prepare(
+        target={
+            "name": "ordered_sample",
+            "location": "6A1",
+            "stock_volume_fractions": {"stock_Red": 0.5, "stock_Blue": 0.5},
+            "total_volume": "1000 ul",
+        },
+        dest="6A1",
+    )
+
+    assert [call["source"] for call in driver.transfer_calls] == ["1A2", "1A1"]
 
 
 @pytest.mark.usefixtures("mixdb")

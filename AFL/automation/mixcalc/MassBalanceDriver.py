@@ -1217,7 +1217,7 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
 
         try:
             result = super().balance(
-                tol=self.config['tol'],
+                tol=self.config.get('tol', 1e-3),
                 return_report=return_report,
                 enable_multistep_dilution=bool(enable_multistep_dilution),
                 multistep_max_steps=int(self.config.get('multistep_max_steps', 2)),

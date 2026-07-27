@@ -78,6 +78,7 @@ class Solution(Context):
         tip: Optional[str | List[str]] = None,
         tip_location: Optional[str | List[str]] = None,
         solutes: Optional[List[str]] = None,
+        stock_volume_fractions: Optional[Dict] = None,
         sanity_check: Optional[bool] = True,
     ):
         """
@@ -117,6 +118,10 @@ class Solution(Context):
         solutes : list of str, optional
             A list of solute names. If set, the components will be initialized as solutes and they won't contribute
             to the volume of the solution
+        stock_volume_fractions : dict, optional
+            A direct preparation recipe mapping configured stock names to
+            their requested volume fractions. This is preparation metadata,
+            distinct from ``volume_fractions`` over chemical components.
         sanity_check : bool, optional
             Whether to perform a sanity check on the solution.
 
@@ -152,6 +157,11 @@ class Solution(Context):
         self.tip = resolved_tip
         self.tip_location = resolved_tip
         self.protocol = None
+        self.stock_volume_fractions = self._normalize_stock_volume_fractions(
+            stock_volume_fractions
+        )
+        self.stock_transfer_volumes = {}
+        self.requested_total_volume = None
         self.components: Dict = {}
         self.add_self_to_context()
 
@@ -248,9 +258,12 @@ class Solution(Context):
             self.mass = total_mass
 
         if total_volume is not None:
-            self.volume = total_volume
+            if self.stock_volume_fractions and len(self.solvents) == 0:
+                self.requested_total_volume = enforce_units(total_volume, "volume")
+            else:
+                self.volume = total_volume
 
-        if sanity_check:
+        if sanity_check and not self.stock_volume_fractions:
             self._sanity_check(masses, volumes, concentrations, mass_fractions, volume_fractions, molarities, molalities, total_mass, total_volume)
 
     def _process_fractions_with_remainder(self, fractions: Dict, fraction_type: str) -> Dict:
@@ -314,6 +327,37 @@ class Solution(Context):
         result = dict(fractions)
         result[remainder_key] = max(0.0, remainder)  # Clamp to 0 for tiny negative values due to float precision
         return result
+
+    @staticmethod
+    def _normalize_stock_volume_fractions(stock_volume_fractions: Optional[Dict]) -> Dict:
+        """Validate direct stock-dispense recipe fractions."""
+        if stock_volume_fractions is None:
+            return {}
+        if not isinstance(stock_volume_fractions, dict) or not stock_volume_fractions:
+            raise ValueError(
+                "stock_volume_fractions must be a non-empty mapping of stock names to fractions"
+            )
+
+        normalized = {}
+        fraction_sum = 0.0
+        for stock_name, fraction in stock_volume_fractions.items():
+            name = str(stock_name).strip()
+            if not name:
+                raise ValueError("stock_volume_fractions contains an empty stock name")
+            fraction_value = enforce_units(fraction, "dimensionless")
+            fraction_float = float(getattr(fraction_value, "magnitude", fraction_value))
+            if fraction_float < 0.0:
+                raise ValueError(
+                    f"stock_volume_fractions[{name!r}] must be non-negative, got {fraction_float}"
+                )
+            normalized[name] = fraction_float
+            fraction_sum += fraction_float
+
+        if abs(fraction_sum - 1.0) > 1e-2:
+            raise ValueError(
+                f"stock_volume_fractions must sum to 1.0, got {fraction_sum}"
+            )
+        return normalized
 
     def _sanity_check(self, masses, volumes, concentrations, mass_fractions, volume_fractions, molarities, molalities, total_mass, total_volume):
         """
@@ -502,6 +546,16 @@ class Solution(Context):
         return id(self)
 
     def to_dict(self):
+        if self.stock_volume_fractions:
+            total_volume = self.requested_total_volume or self.volume
+            return {
+                "name": self.name,
+                "location": self.location,
+                "total_volume": f"{round(float(total_volume.to('ul').magnitude), 6)} ul",
+                "stock_volume_fractions": copy.deepcopy(self.stock_volume_fractions),
+                "stock_transfer_volumes_ul": copy.deepcopy(self.stock_transfer_volumes),
+            }
+
         out_dict = {
             "name": self.name,
             "location": self.location,
@@ -570,6 +624,9 @@ class Solution(Context):
         solution.tip = copy.deepcopy(self.tip)
         solution.tip_location = copy.deepcopy(self.tip_location)
         solution.protocol = self.protocol
+        solution.stock_volume_fractions = copy.deepcopy(self.stock_volume_fractions)
+        solution.stock_transfer_volumes = copy.deepcopy(self.stock_transfer_volumes)
+        solution.requested_total_volume = self.requested_total_volume
         solution.components = {name: component.copy() for name, component in self.components.items()}
         return solution
 
