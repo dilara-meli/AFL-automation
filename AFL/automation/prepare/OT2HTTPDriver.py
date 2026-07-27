@@ -3178,6 +3178,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         self,
         module_id,
         temperature_c,
+        hold_time = 0.0,
         wait = True,
         ):
         """Set a temperature module target and optionally wait to stabilize.
@@ -3195,12 +3196,20 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             params={"moduleId": module_id, "celsius": float(temperature_c)},
             wait_until_complete=wait,
         )
+        time.sleep(60)  # Wait for the temperature to stabilize
         data = self.get_tempmodule_status(log=False)
-        while abs(data.get("currentTemp")-data.get("targetTemp")) > 1.0:
-            time.sleep(5)
-            data = self.get_tempmodule_status(log=False)
-            self.log_debug(f"Waiting for temperature to stabilize... "
-                            f"(Current: {data.get('currentTemp')}°C, Target: {data.get('targetTemp')}°C)")
+        if data.get("currentTemp") is None or data.get("targetTemp") is None:
+            self.log_debug("Temperature module status is unavailable, returning to hold time without stabilization check.")
+        else:
+            while abs(data.get("currentTemp")-data.get("targetTemp")) > 1.0:
+                self.log_debug(f"Waiting for temperature to stabilize... "
+                                f"(Current: {data.get('currentTemp')}°C, Target: {data.get('targetTemp')}°C)")
+                time.sleep(30)
+                data = self.get_tempmodule_status(log=False)
+
+        if hold_time > 0:
+            self.log_info(f"Holding temperature for {hold_time} seconds")
+            time.sleep(hold_time)
 
         return data.get("currentTemp"), data.get("targetTemp")
 
