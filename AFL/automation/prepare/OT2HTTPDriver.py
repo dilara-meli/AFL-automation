@@ -3178,6 +3178,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         self,
         module_id,
         temperature_c,
+        hold_time = 180,
         wait = True,
         ):
         """Set a temperature module target and optionally wait to stabilize.
@@ -3195,14 +3196,37 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             params={"moduleId": module_id, "celsius": float(temperature_c)},
             wait_until_complete=wait,
         )
+        time.sleep(60) # wait for a minute before querying status
         data = self.get_tempmodule_status(log=False)
-        while abs(data.get("currentTemp")-data.get("targetTemp")) > 1.0:
-            time.sleep(5)
-            data = self.get_tempmodule_status(log=False)
-            self.log_debug(f"Waiting for temperature to stabilize... "
-                            f"(Current: {data.get('currentTemp')}°C, Target: {data.get('targetTemp')}°C)")
+        # Some OT-2 API versions report no target temperature immediately
+        # after setting it.  Return in that case so callers can perform their
+        # own equilibration hold instead of crashing on float - None.
+        current_temp = data.get("currentTemp")
+        target_temp = data.get("targetTemp")
+        if current_temp is None or target_temp is None:
+            self.log_warning(
+                "Temperature module did not report both currentTemp and targetTemp; "
+                "skipping driver-side stabilization wait."
+            )
+        else:
+            while abs(current_temp - target_temp) > 1.0:
+                time.sleep(5)
+                data = self.get_tempmodule_status(log=False)
+                current_temp = data.get("currentTemp")
+                target_temp = data.get("targetTemp")
+                if current_temp is None or target_temp is None:
+                    self.log_warning(
+                        "Temperature module stopped reporting currentTemp or targetTemp; "
+                        "skipping driver-side stabilization wait."
+                    )
+                    return current_temp, target_temp
+                self.log_debug(f"Waiting for temperature to stabilize... "
+                                f"(Current: {current_temp}°C, Target: {target_temp}°C)")
+        if hold_time > 0:
+            self.log_info(f"Holding the command exceution for {hold_time}")
+            time.sleep(hold_time)
 
-        return data.get("currentTemp"), data.get("targetTemp")
+        return current_temp, target_temp
 
     def deactivate_tempmodule(self, module_id, timeout_s=120, wait=True):
         """Deactivate a temperature module.

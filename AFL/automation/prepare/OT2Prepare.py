@@ -878,6 +878,11 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 step_tip_location=getattr(step, "tip_location", None),
             )
             try:
+                self.log_debug(
+                    "Pipette action: "
+                    f"stock={stock_name!r}, source={source!r}, dest={destination!r}, "
+                    f"volume_ul={float(volume_ul)}"
+                )
                 transfer_result = self.transfer(
                     source=source,
                     dest=destination,
@@ -1027,6 +1032,11 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             )
         else:
             transfer_params = self.get_transfer_params("default")
+        self.log_debug(
+            "Pipette action: "
+            f"stage={stage_type!r}, stock={stock_name!r}, source={source!r}, "
+            f"dest={dest!r}, volume_ul={float(volume_ul)}"
+        )
         transfer_result = self.transfer(source=source, dest=dest, volume=volume_ul, **transfer_params)
         self._activate_stock_tip_reservation(stock_name, selected_tip_location)
         depletion_info = {}
@@ -1105,54 +1115,65 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 diluent_loc = self._resolve_stage_source(stage.get("diluent_location"), intermediate_map)
                 source_mass_g = float(stage.get("total_source_mass_g", 0.0))
                 diluent_mass_g = float(stage.get("total_diluent_mass_g", 0.0))
+                dilution_actions = []
                 if source_mass_g > 0:
                     source_stock = self.stocks_by_location(source_loc)
                     source_volume = source_stock.measure_out(f"{source_mass_g} g").volume.to("ul").magnitude
-                    self._transfer_stage(
-                        source_loc,
-                        stage_dest,
-                        source_volume,
-                        stage_type="dilution",
-                        source_stock_name=stage.get("source_stock_name"),
-                        planned_transfer={
-                            "required_mass_g": source_mass_g,
+                    dilution_actions.append(
+                        {
                             "source_location": source_loc,
-                            "destination_token": dest_token,
-                        },
-                        extra={
-                            "intermediate_id": intermediate_id,
-                            "destination_token": dest_token,
-                            "dilution_factor": stage.get("dilution_factor"),
-                            "batches": stage.get("batches"),
-                            "transfer_role": "source",
-                            "intermediate_location": stage_dest,
-                        },
+                            "source_stock_name": stage.get("source_stock_name"),
+                            "volume_ul": source_volume,
+                            "planned_transfer": {
+                                "required_mass_g": source_mass_g,
+                                "source_location": source_loc,
+                                "destination_token": dest_token,
+                            },
+                            "extra": {
+                                "intermediate_id": intermediate_id,
+                                "destination_token": dest_token,
+                                "dilution_factor": stage.get("dilution_factor"),
+                                "batches": stage.get("batches"),
+                                "transfer_role": "source",
+                                "intermediate_location": stage_dest,
+                            },
+                        }
                     )
                 if diluent_mass_g > 0:
                     diluent_stock = self.stocks_by_location(diluent_loc)
                     diluent_volume = diluent_stock.measure_out(f"{diluent_mass_g} g").volume.to("ul").magnitude
-                    self._transfer_stage(
-                        diluent_loc,
-                        stage_dest,
-                        diluent_volume,
-                        stage_type="dilution",
-                        source_stock_name=stage.get("diluent_stock_name"),
-                        planned_transfer={
-                            "required_mass_g": diluent_mass_g,
+                    dilution_actions.append(
+                        {
                             "source_location": diluent_loc,
-                            "destination_token": dest_token,
-                        },
-                        extra={
-                            "intermediate_id": intermediate_id,
-                            "destination_token": dest_token,
-                            "dilution_factor": stage.get("dilution_factor"),
-                            "batches": stage.get("batches"),
-                            "transfer_role": "diluent",
-                            "intermediate_location": stage_dest,
-                        },
+                            "source_stock_name": stage.get("diluent_stock_name"),
+                            "volume_ul": diluent_volume,
+                            "planned_transfer": {
+                                "required_mass_g": diluent_mass_g,
+                                "source_location": diluent_loc,
+                                "destination_token": dest_token,
+                            },
+                            "extra": {
+                                "intermediate_id": intermediate_id,
+                                "destination_token": dest_token,
+                                "dilution_factor": stage.get("dilution_factor"),
+                                "batches": stage.get("batches"),
+                                "transfer_role": "diluent",
+                                "intermediate_location": stage_dest,
+                            },
+                        }
+                    )
+                for action in self.reorder_protocol(dilution_actions):
+                    self._transfer_stage(
+                        action["source_location"],
+                        stage_dest,
+                        action["volume_ul"],
+                        stage_type="dilution",
+                        source_stock_name=action["source_stock_name"],
+                        planned_transfer=action["planned_transfer"],
+                        extra=action["extra"],
                     )
             elif stage_type == "final_mix":
-                for transfer in stage.get("transfers", []):
+                for transfer in self.reorder_protocol(stage.get("transfers", [])):
                     source_loc = self._resolve_stage_source(transfer.get("source_location"), intermediate_map)
                     vol_ul = float(transfer.get("required_volume_ul", 0.0))
                     if vol_ul <= 0:
@@ -1285,12 +1306,15 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         return params
 
     def reorder_protocol(self, protocol):
-        """Reorder protocol steps according to configured stock order.
+        """Reorder protocol steps according to configured stock-name order.
 
         Parameters
         ----------
         protocol : sequence
-            Protocol steps with a ``source`` attribute.
+            Protocol steps with a ``source`` attribute (or procedure-plan
+            transfer dictionaries with ``source_location``).  A stock may
+            have several source wells; all of those wells are ordered using
+            the stock's configured name.
 
         Returns
         -------
@@ -1301,21 +1325,39 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         if not stock_mix_order:
             return protocol
 
-        steps_by_source = {}
+        configured_stock_names = {str(stock_name) for stock_name in stock_mix_order}
+        steps_by_stock_name = {}
+        unordered_steps = []
         for step in protocol:
-            if step.source not in steps_by_source:
-                steps_by_source[step.source] = []
-            steps_by_source[step.source].append(step)
+            if isinstance(step, dict):
+                source = step.get("source_location", step.get("source"))
+                stock_name = step.get("source_stock_name")
+            else:
+                source = step.source
+                stock_name = None
+
+            # ``stock_mix_order`` is intentionally expressed in logical
+            # stock names, rather than physical source locations.  Resolve a
+            # source well through the deck map so split-stock transfers stay
+            # together and obey the same ordering.
+            if stock_name is None:
+                stock_name = self.config.get("deck", {}).get(source)
+            if stock_name in configured_stock_names:
+                steps_by_stock_name.setdefault(stock_name, []).append(step)
+            else:
+                unordered_steps.append(step)
 
         reordered = []
+        emitted_stock_names = set()
         for stock_name in stock_mix_order:
-            if stock_name in steps_by_source:
-                reordered.extend(steps_by_source[stock_name])
-                del steps_by_source[stock_name]
+            normalized_stock_name = str(stock_name)
+            if normalized_stock_name not in emitted_stock_names:
+                reordered.extend(steps_by_stock_name.get(normalized_stock_name, []))
+                emitted_stock_names.add(normalized_stock_name)
 
-        for steps in steps_by_source.values():
-            reordered.extend(steps)
-        return reordered
+        # Keep all stocks omitted from stock_mix_order in their original
+        # protocol order.
+        return reordered + unordered_steps
 
     def transfer_to_catch(self, source=None, dest=None, **kwargs):
         """Transfer a prepared sample into the configured catch destination.
