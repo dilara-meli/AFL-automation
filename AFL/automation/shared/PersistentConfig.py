@@ -239,6 +239,20 @@ class PersistentConfig(MutableMapping):
                 self._write_timer = None
             self._pending_write = False
             self._do_write()
+
+    def write_current_config(self, path):
+        '''Write a plain, non-historical snapshot of the current configuration.'''
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + '.tmp')
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump(self.config, f, indent=4)
+            temp_path.replace(path)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
     
     def _estimate_history_size_mb(self):
         '''Estimate the size of history in MB by serializing to JSON'''

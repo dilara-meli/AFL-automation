@@ -182,6 +182,13 @@ server.create_queue(
         ca_prefix=f"AFL:{AFL_GLOBAL_CONFIG['system_serial']}:{main_module_name}:",
         ca_port=ca_status_port,
 )
+
+# Publish the resolved driver configuration for services (such as AFL-andon)
+# that need one stable, non-historical config file. The driver's normal config
+# remains timestamped so it can retain its configuration history.
+latest_config_path = driver.path / 'configs' / f'{driver.name}.config.json'
+driver.config.write_current_config(latest_config_path)
+
 #server.add_unqueued_routes()
 server.init_logging(toaddrs=AFL_GLOBAL_CONFIG['owner_email'])
 
