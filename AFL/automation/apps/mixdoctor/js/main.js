@@ -2599,7 +2599,7 @@ function updateSweepNamePreview(targets) {
         + '<div style="margin-top:4px;font-size:11px;">' + diagnostics + '</div>';
 }
 
-function generateSweepTargets() {
+function generateSweepTargetsLocal() {
     var prefix = document.getElementById('sweep-prefix').value.trim() || 'target';
     var sizeType = document.getElementById('sweep-size-type').value;
     var sizeValue = document.getElementById('sweep-size-value').value.trim();
@@ -2664,6 +2664,13 @@ function generateSweepTargets() {
 
         return target;
     });
+}
+
+async function generateSweepTargets() {
+    var params = new URLSearchParams({sweep_config: JSON.stringify(serializeSweepConfig())});
+    var response = await authedFetch('/generate_sweep_targets?' + params.toString());
+    if (!response.ok) throw new Error('Failed to generate sweep targets on the server.');
+    return await response.json();
 }
 
 function addSweepRow(prefill) {
@@ -2770,9 +2777,15 @@ function cartesianProduct(arrays) {
 }
 
 
-function previewSweep() {
-    var targets = generateSweepTargets();
+async function previewSweep() {
     var previewEl = document.getElementById('sweep-preview-area');
+    var targets = [];
+    try {
+        targets = await generateSweepTargets();
+    } catch (e) {
+        previewEl.innerHTML = '<p class="empty-state">Sweep generation failed: ' + escHtml(e.message) + '</p>';
+        return;
+    }
     updateSweepNamePreview(targets);
 
     if (targets.length === 0) {
@@ -2897,7 +2910,13 @@ async function loadSweepConfig() {
 }
 
 async function uploadTargets() {
-    var targets = generateSweepTargets();
+    var targets = [];
+    try {
+        targets = await generateSweepTargets();
+    } catch (e) {
+        showStatus('Sweep generation failed: ' + e.message, true);
+        return;
+    }
 
     if (targets.length === 0) {
         showStatus('No targets to upload.', true);

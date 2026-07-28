@@ -3178,7 +3178,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         self,
         module_id,
         temperature_c,
-        hold_time = 180,
+        hold_time = 0.0,
         wait = True,
         ):
         """Set a temperature module target and optionally wait to stabilize.

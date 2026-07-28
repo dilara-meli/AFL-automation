@@ -238,13 +238,16 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             f"No feasible OT-2 transfer volume found for requested aliquot {requested_volume_ul} uL"
         )
 
-    def _condition_stock_volume_fraction_target(self, direct_target):
+    def _condition_preparation_target(self, balanced_target):
         """Adjust undersized stock-fraction transfers to executable OT-2 aliquots."""
+        if not getattr(balanced_target, "stock_volume_fractions", None):
+            return balanced_target
+
         adjusted_transfer_volumes = {}
         adjusted_protocol = []
         adjusted_any_transfer = False
 
-        for action in direct_target.protocol:
+        for action in balanced_target.protocol:
             adjusted_volume_ul = round(
                 self._closest_feasible_transfer_volume(action.volume),
                 6,
@@ -257,23 +260,28 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             adjusted_protocol.append(adjusted_action)
 
             stock_name = self.stocks_by_location(action.source).name
-            adjusted_transfer_volumes[stock_name] = adjusted_volume_ul
+            adjusted_transfer_volumes[stock_name] = round(
+                adjusted_transfer_volumes.get(stock_name, 0.0) + adjusted_volume_ul,
+                6,
+            )
 
         if not adjusted_any_transfer:
-            return direct_target
+            return balanced_target
 
         actual_total_volume_ul = round(sum(adjusted_transfer_volumes.values()), 6)
         if actual_total_volume_ul <= 0:
             raise ValueError("Adjusted stock-fraction target has no executable transfer volume")
 
-        direct_target.protocol = adjusted_protocol
-        direct_target.stock_transfer_volumes = adjusted_transfer_volumes
-        direct_target.stock_volume_fractions = {
+        balanced_target.protocol = adjusted_protocol
+        balanced_target.stock_transfer_volumes = adjusted_transfer_volumes
+        balanced_target.stock_volume_fractions = {
             stock_name: adjusted_volume_ul / actual_total_volume_ul
             for stock_name, adjusted_volume_ul in adjusted_transfer_volumes.items()
         }
-        direct_target.volume = enforce_units(f"{actual_total_volume_ul} ul", "volume")
-        return direct_target
+        balanced_target.requested_total_volume = enforce_units(
+            f"{actual_total_volume_ul} ul", "volume"
+        )
+        return balanced_target
 
     def _normalize_locations(self, locations):
         """Normalize and deduplicate deck locations.
@@ -700,6 +708,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 occupied.append(location)
         self.config["occupied_sample_locations"] = occupied
 
+    @Driver.queued()
     def clear_sample_locations(self, locations=None):
         """Clear occupied sample destination tracking.
 
@@ -1238,8 +1247,11 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             Serialized target data with total volume included when available.
         """
         result_dict = balanced_target.to_dict()
-        if hasattr(balanced_target, "volume") and balanced_target.volume is not None:
-            total_volume_ul = round(float(balanced_target.volume.to("ul").magnitude), 6)
+        total_volume = getattr(balanced_target, "requested_total_volume", None)
+        if total_volume is None and hasattr(balanced_target, "volume"):
+            total_volume = balanced_target.volume
+        if total_volume is not None:
+            total_volume_ul = round(float(total_volume.to("ul").magnitude), 6)
             result_dict["total_volume"] = f"{total_volume_ul} ul"
         result_dict["stock_inventory_after"] = self._stock_inventory_snapshot()
         return result_dict

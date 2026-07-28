@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2Prepare import OT2Prepare
 
 
@@ -243,6 +244,13 @@ def test_clear_sample_locations_allows_destination_reuse():
     assert driver.resolve_destination("5A1") == "5A1"
 
 
+def test_clear_sample_locations_is_a_queued_driver_command():
+    assert "clear_sample_locations" in Driver.queued.functions
+    assert Driver.queued.function_info["clear_sample_locations"]["kwargs"] == [
+        ("locations", None)
+    ]
+
+
 def test_reset_clears_tip_reservations_and_occupied_samples():
     driver = StubOT2Prepare()
     driver.config["targets"] = [{"name": "Target"}]
@@ -306,6 +314,29 @@ def test_prepare_stock_volume_fractions_emits_ot2_transfers():
     assert [call["source"] for call in driver.transfer_calls] == ["1A4", "1A2", "1A1", "1A3"]
     assert [call["dest"] for call in driver.transfer_calls] == ["6A1", "6A1", "6A1", "6A1"]
     assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [200.0, 400.0, 300.0, 100.0]
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_prepare_stock_volume_fractions_honors_stock_mix_order():
+    driver = StubOT2Prepare()
+    driver.config["stock_mix_order"] = ["stock_Blue", "stock_Red"]
+    driver.config["stocks"] = [
+        {"name": "stock_Red", "masses": {"H2O": "20 g"}, "location": "1A1"},
+        {"name": "stock_Blue", "masses": {"H2O": "20 g"}, "location": "1A2"},
+    ]
+    driver.process_stocks()
+
+    driver.prepare(
+        target={
+            "name": "ordered_sample",
+            "location": "6A1",
+            "stock_volume_fractions": {"stock_Red": 0.5, "stock_Blue": 0.5},
+            "total_volume": "1000 ul",
+        },
+        dest="6A1",
+    )
+
+    assert [call["source"] for call in driver.transfer_calls] == ["1A2", "1A1"]
 
 
 @pytest.mark.usefixtures("mixdb")
