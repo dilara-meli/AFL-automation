@@ -196,20 +196,30 @@ def test_execute_preparation_marks_destination_occupied():
     assert driver.config["occupied_sample_locations"] == ["5A1"]
 
 
-def test_execute_preparation_reorders_deck_sources_by_stock_mix_order():
+def test_execute_preparation_orders_stock_sources_by_stock_name_and_logs_actions(capsys):
     driver = StubOT2Prepare()
-    driver.config["deck"] = {"1A1": "Water", "1A2": "Salt"}
-    driver.config["stock_mix_order"] = ["Salt", "Water"]
+    driver.config["deck"] = {
+        "1A1": "stock_Red",
+        "1A2": "stock_Blue",
+        "1A3": "stock_Red",
+    }
+    driver.config["stock_mix_order"] = ["stock_Blue", "stock_Red"]
     balanced_target = SimpleNamespace(
         protocol=[
-            SimpleNamespace(source="1A1", volume=50.0),
-            SimpleNamespace(source="1A2", volume=50.0),
+            SimpleNamespace(source="1A1", volume=100.0),
+            SimpleNamespace(source="1A2", volume=200.0),
+            # A second Red source models an inventory-driven split transfer.
+            SimpleNamespace(source="1A3", volume=50.0),
         ]
     )
 
     assert driver.execute_preparation({}, balanced_target, "5A1") is True
 
-    assert [call["source"] for call in driver.transfer_calls] == ["1A2", "1A1"]
+    assert [call["source"] for call in driver.transfer_calls] == ["1A2", "1A1", "1A3"]
+    debug_output = capsys.readouterr().out
+    assert debug_output.count("[DEBUG] Pipette action:") == 3
+    assert "source='1A1'" in debug_output
+    assert "source='1A3'" in debug_output
 
 
 def test_resolve_destination_rejects_occupied_sample_location():
@@ -278,6 +288,7 @@ def test_prepare_stock_volume_fractions_emits_ot2_transfers():
         {"name": "stock_Yellow", "masses": {"H2O": "20 g"}, "location": "1A4"},
     ]
     driver.process_stocks()
+    driver.config["stock_mix_order"] = ["stock_Yellow", "stock_Blue", "stock_Red"]
     target = {
         "name": "color_sample",
         "location": "6A1",
@@ -300,9 +311,9 @@ def test_prepare_stock_volume_fractions_emits_ot2_transfers():
         "stock_Green": 100.0,
         "stock_Yellow": 200.0,
     }
-    assert [call["source"] for call in driver.transfer_calls] == ["1A1", "1A2", "1A3", "1A4"]
+    assert [call["source"] for call in driver.transfer_calls] == ["1A4", "1A2", "1A1", "1A3"]
     assert [call["dest"] for call in driver.transfer_calls] == ["6A1", "6A1", "6A1", "6A1"]
-    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [300.0, 400.0, 100.0, 200.0]
+    assert [call["requested_volume_ul"] for call in driver.transfer_calls] == [200.0, 400.0, 300.0, 100.0]
 
 
 @pytest.mark.usefixtures("mixdb")
