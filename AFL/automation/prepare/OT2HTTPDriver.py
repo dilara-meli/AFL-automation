@@ -3176,8 +3176,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         
     def set_tempmodule_temperature(
         self,
-        module_id,
         temperature_c,
+        module_id = None,
         hold_time = 0.0,
         wait = True,
         ):
@@ -3188,34 +3188,36 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         tuple
             Current and target temperatures after stabilization.
         """
-        self.log_info(f"Setting temperature module to {temperature_c}°C")
+        round_temperature_c = round(float(temperature_c))
+        self.log_info(f"Setting temperature module to {round_temperature_c}°C")
         if module_id is None:
             module_id = self._find_module_by_type("tempdeck")
         self._execute_atomic_command(
             "temperatureModule/setTargetTemperature",
-            params={"moduleId": module_id, "celsius": float(temperature_c)},
+            params={"moduleId": module_id, "celsius": round_temperature_c},
             wait_until_complete=wait,
         )
+
+        # Some OT-2 API versions report no target temperature immediately
+        # after setting it.  
         time.sleep(60) # wait for a minute before querying status
         data = self.get_tempmodule_status(log=False)
-        # Some OT-2 API versions report no target temperature immediately
-        # after setting it.  Return in that case so callers can perform their
-        # own equilibration hold instead of crashing on float - None.
+
         current_temp = data.get("currentTemp")
         target_temp = data.get("targetTemp")
         if current_temp is None or target_temp is None:
-            self.log_warning(
+            self.log_debug(
                 "Temperature module did not report both currentTemp and targetTemp; "
                 "skipping driver-side stabilization wait."
             )
         else:
             while abs(current_temp - target_temp) > 1.0:
-                time.sleep(5)
+                time.sleep(30)
                 data = self.get_tempmodule_status(log=False)
                 current_temp = data.get("currentTemp")
                 target_temp = data.get("targetTemp")
                 if current_temp is None or target_temp is None:
-                    self.log_warning(
+                    self.log_debug(
                         "Temperature module stopped reporting currentTemp or targetTemp; "
                         "skipping driver-side stabilization wait."
                     )
@@ -3228,7 +3230,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
         return current_temp, target_temp
 
-    def deactivate_tempmodule(self, module_id, timeout_s=120, wait=True):
+    def deactivate_tempmodule(self, module_id=None, timeout_s=120, wait=True):
         """Deactivate a temperature module.
 
         Returns
