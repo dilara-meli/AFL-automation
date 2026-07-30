@@ -266,6 +266,10 @@ class PersistentConfig(MutableMapping):
         '''Perform the actual write to disk'''
         if not self.write:
             return
+
+        # Config paths such as ``~/.afl/config.json`` may not exist yet on a
+        # new host. Create the parent before the atomic temporary-file write.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
             
         # Trim history by count
         if len(self.history) > self.max_history:
