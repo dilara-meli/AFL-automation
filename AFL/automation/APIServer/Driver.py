@@ -79,10 +79,16 @@ class Driver(DriverWebAppsMixin):
         self.path.mkdir(exist_ok=True,parents=True)
         self.filepath = self.path / (name + '.config.json')
 
+        # The shared launcher sets this for a clean launch, allowing a driver
+        # to be constructed from its declared defaults without consuming a
+        # prior PersistentConfig history.
+        load_existing_config = os.environ.get('AFL_FRESH_DRIVER_CONFIG') != '1'
+
         self.config = PersistentConfig(
             path=self.filepath,
             defaults= defaults,
             overrides= overrides,
+            load_existing=load_existing_config,
             )
         
         # collect inherited static directories

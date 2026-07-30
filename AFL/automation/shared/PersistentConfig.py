@@ -28,7 +28,8 @@ class PersistentConfig(MutableMapping):
         max_history_size_mb=100,  # New: limit history by file size
         write_debounce_seconds=0.1,  # New: batch writes within this time window
         compact_json=True,  # New: use compact JSON for large files
-        datetime_key_format='%y/%d/%m %H:%M:%S.%f'
+        datetime_key_format='%y/%d/%m %H:%M:%S.%f',
+        load_existing=True,
                 ):
         '''Constructor
         
@@ -71,6 +72,11 @@ class PersistentConfig(MutableMapping):
             If True, use compact JSON (no indentation) for files larger than 1MB.
             This significantly reduces file size and write time for large configs.
             (default: True)
+
+        load_existing: bool
+            If False, ignore any existing configuration history at ``path`` and
+            initialize from ``defaults`` and ``overrides`` instead.  The new
+            configuration replaces the file on its first write.
         
         datetime_key_format: str
             String defining the root level keys of the json-serialized file. 
@@ -91,7 +97,7 @@ class PersistentConfig(MutableMapping):
         self._write_lock = threading.Lock()
         
         need_update=False
-        if self.path.exists():
+        if load_existing and self.path.exists():
             with open(self.path,'r') as f:
                 self.history = json.load(f)
             key = self._get_sorted_history_keys()[-1] #use latest key

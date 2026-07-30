@@ -4,6 +4,7 @@ Tests for AFL.automation.APIServer core functionality
 import pytest
 import tempfile
 import json
+import logging
 from pathlib import Path
 
 from AFL.automation.APIServer import APIServer
@@ -117,6 +118,20 @@ class TestAPIServer:
         server = APIServer(name='TestServer')
         assert hasattr(server, 'app')
         assert server.app is not None
+
+    def test_init_logging_does_not_duplicate_file_handlers(self, tmp_path):
+        server = APIServer(name='LoggingServer', afl_home=tmp_path)
+        logfile = (tmp_path / 'LoggingServer.log').resolve()
+
+        server.init_logging()
+
+        handlers = [
+            handler for handler in server.app.logger.handlers
+            if isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename).resolve() == logfile
+        ]
+        assert len(handlers) == 1
+        assert handlers[0] in logging.getLogger('werkzeug').handlers
 
     def test_apiserver_create_queue(self, dummy_driver):
         """Test that APIServer can create a queue with a driver"""
