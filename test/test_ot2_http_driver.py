@@ -1,6 +1,8 @@
 import pytest
 from pathlib import Path
 import json
+import logging
+from types import SimpleNamespace
 
 from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
 
@@ -588,6 +590,62 @@ def test_split_transfer_drops_tip_without_force_new_tip():
     assert transfer_result["subtransfers_ul"] == [300.0, 50.0]
     assert driver.has_tip is False
     assert driver.current_tip is None
+
+
+def test_split_transfer_logs_numbered_pipetting_plan(caplog):
+    driver = _configured_driver()
+    driver.app = SimpleNamespace(logger=logging.getLogger("test_ot2_transfer_plan"))
+
+    with caplog.at_level(logging.INFO, logger="test_ot2_transfer_plan"):
+        driver.transfer("1A1", "1A2", 350, drop_tip=True)
+
+    assert [record.message for record in caplog.records] == [
+        "Pipetting transfer plan 1/2: 1A1 -> 1A2 using p300_single (left), 300 uL",
+        "Pipetting transfer plan 2/2: 1A1 -> 1A2 using p300_single (left), 50 uL",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("volume_ul", "expected_volumes"),
+    [
+        (320, [300.0, 20.0]),
+        (330, [300.0, 20.0, 10.0]),
+        (340, [300.0, 20.0, 20.0]),
+        (350, [300.0, 20.0, 20.0, 10.0]),
+    ],
+)
+def test_transfer_plan_uses_small_pipette_for_accurate_remainder(
+    volume_ul, expected_volumes
+):
+    driver = _configured_driver()
+    driver.hardware_pipettes["right"] = _pipette_info(
+        "right", "right-id", min_volume=1, max_volume=20
+    )
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_instruments"]["right"] = {
+        "name": "p20_single",
+        "pipette_id": "right-id",
+        "tip_racks": ["tiprack-right"],
+    }
+    driver.config["available_tips"]["right"] = [("tiprack-right", "A1")]
+
+    transfer_result = driver.transfer("1A1", "1A2", volume_ul, drop_tip=True)
+
+    assert transfer_result["subtransfers_ul"] == expected_volumes
+    assert [step["mount"] for step in transfer_result["pipette_plan"]] == (
+        ["left"] + ["right"] * (len(expected_volumes) - 1)
+    )
+    assert [step["volume_ul"] for step in transfer_result["pipette_plan"]] == expected_volumes
+    aspirate_pipettes = [
+        params["pipetteId"]
+        for command, params in driver.executed_commands
+        if command == "aspirate"
+    ]
+    assert aspirate_pipettes == ["left-id"] + ["right-id"] * (len(expected_volumes) - 1)
 
 
 def test_split_transfer_force_new_tip_refreshes_tip_each_subtransfer():

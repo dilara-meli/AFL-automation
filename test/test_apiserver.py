@@ -142,6 +142,22 @@ class TestAPIServer:
         assert dummy_driver.app is not None
         assert dummy_driver.app == server.app
 
+    def test_driver_log_level_configures_attached_server(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('AFL_HOME', str(tmp_path))
+        driver = DummyDriver(
+            name='ConfiguredLoggingDriver',
+            overrides={'log_level': 'WARNING'},
+        )
+        server = APIServer(name='ConfiguredLoggingServer', afl_home=tmp_path)
+
+        server.create_queue(driver, add_unqueued=False)
+
+        assert driver.config['log_level'] == 'WARNING'
+        assert server.app.logger.level == logging.WARNING
+
+        driver.set_config(log_level='ERROR')
+        assert server.app.logger.level == logging.ERROR
+
     def test_apiserver_apps_static_route(self):
         server = APIServer(name='TestServer')
         client = server.app.test_client()
