@@ -54,39 +54,35 @@ function addServerToMenu(server) {
     server.getQuickbar(function(result) {
       var commands = ''; 
       var button_text, params, default_value, label, button_class, python_type;
-      $(`#${server.key}_quickbar>div.content`).empty();
       for(let function_name in result) { 
-        commands += `<div class="quickbar_group" data-server-key="${server.key}" data-task-name="${function_name}">`
+        commands += '<div class="quickbar_group">'
         button_text = result[function_name]['qb']['button_text'];
         params = result[function_name]['qb']['params'];
-        params_class = `${server.key}_${function_name.replaceAll(' ','_').toLowerCase()}_params`
+        params_class = `${function_name.replaceAll(' ','_').toLowerCase()}_params`
 
         for(let field_name in params) {
           label = params[field_name]['label']
           commands += `<label for=${name}>${label}</label>`;
 
+          // commands += `<li>`
           python_type = params[field_name]['type']
           default_value = params[field_name]['default']
           if((python_type=='float') | (python_type=='int') | (python_type=="text")){
-            const serializedValue = String(default_value ?? '');
             commands += `<input `
             commands += `type="text" `
             commands += `python_param="${field_name}" `
             commands += `python_type="${python_type}" `
             commands += `name="${label}" `
             commands += `class="${params_class}" `
-            commands += `value="${serializedValue}" `
-            commands += `placeholder="${serializedValue}" `
+            commands += `placeholder=${default_value} `
             commands += `>`
           } else if(python_type=='bool'){
-            const checked = default_value ? 'checked' : '';
             commands += `<input `
             commands += `type="checkbox" `
             commands += `python_param="${field_name}" `
             commands += `python_type="${python_type}" `
             commands += `name="${label}" `
             commands += `class="${params_class}" `
-            commands += `${checked} `
             commands += `>`
           } else {
             throw `Parameter type not recognized: ${params[field_name]['type']}`
@@ -299,14 +295,8 @@ function loadLayout() {
     setColCount(layout.columnCount || 1);
     // Remove existing containers
     $(".container").remove();
-    const restored = new Set();
     layout.columns.forEach(function(column, idx){
         column.forEach(function(item){
-            const restoreKey = `${item.serverKey}:${item.divType}`;
-            if(restored.has(restoreKey)) {
-                return;
-            }
-            restored.add(restoreKey);
             const addFunc = {
                 'status': addStatusDiv,
                 'controls': addControlsDiv,

@@ -157,10 +157,7 @@ class QueueDaemon(threading.Thread):
             # so that DataTiled can store it as the main data element
 
             if isinstance(return_val, xr.Dataset):
-                return_val = return_val.copy()
-                return_val.attrs['uuid'] = str(masked_package['uuid'])
                 self.data['main_dataset'] = return_val
-                self.driver.deposit_obj(return_val, uid=str(masked_package['uuid']))
             elif type(return_val) is np.ndarray:
                 self.data['main_array'] = return_val
             elif type(return_val) is pd.DataFrame:
