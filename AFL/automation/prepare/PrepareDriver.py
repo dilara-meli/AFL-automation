@@ -4,6 +4,7 @@ from typing import Dict, Optional
 
 from AFL.automation.mixcalc.MassBalance import MassBalance
 from AFL.automation.mixcalc.MassBalanceDriver import MassBalanceDriver
+from AFL.automation.prepare.PipetteAction import PipetteAction
 from AFL.automation.mixcalc.Solution import Solution
 from AFL.automation.shared.PersistentConfig import PersistentConfig
 from AFL.automation.shared.utilities import listify
@@ -54,6 +55,51 @@ class PrepareDriver(MassBalanceDriver):
         """Subclass hook for additional status lines."""
         return []
 
+    def _reset_prepare_state(self) -> None:
+        """Clear transient preparation bookkeeping.
+
+        This resets runtime and persisted state derived from stock processing
+        and sample execution without touching backend-specific robot/session
+        state.
+        """
+        self.stocks = []
+        self.targets = []
+        if "deck" in self.config:
+            self.config["deck"] = {}
+        if "occupied_sample_locations" in self.config:
+            self.config["occupied_sample_locations"] = []
+        if "stock_tip_locations" in self.config:
+            self.config["stock_tip_locations"] = {}
+        if "stock_tip_reservations" in self.config:
+            self.config["stock_tip_reservations"] = {}
+        if "reserved_stock_tips" in self.config:
+            self.config["reserved_stock_tips"] = []
+
+    def _condition_preparation_target(self, balanced_target: Solution) -> Solution:
+        """Backend hook to adjust a planned preparation target before validation."""
+        return balanced_target
+
+    def _balance_target(self, target: dict, enable_multistep_dilution: bool) -> dict | None:
+        """Plan one target through the common MassBalance result contract."""
+        mb = MassBalance(minimum_volume=self.config.get("minimum_volume", "100 ul"))
+        mb.stocks.extend(self.stocks)
+        target_solution = Solution(**self.apply_fixed_comps(target.copy()))
+        mb.targets.append(target_solution)
+        mb.balance(
+            tol=self.config.get("tol", 1e-3),
+            enable_multistep_dilution=bool(enable_multistep_dilution),
+            multistep_max_steps=int(self.config.get("multistep_max_steps", 2)),
+            multistep_diluent_policy=str(self.config.get("multistep_diluent_policy", "primary_solvent")),
+        )
+        if not mb.balanced or mb.balanced[0].get("balanced_target") is None:
+            return None
+        entry = mb.balanced[0]
+        entry["balanced_target"] = self._condition_preparation_target(
+            entry["balanced_target"]
+        )
+        self._validate_pipette_action_plan(entry["balanced_target"].protocol)
+        return entry
+
     def is_feasible(
         self,
         targets: dict | list[dict],
@@ -61,35 +107,14 @@ class PrepareDriver(MassBalanceDriver):
     ) -> list[dict | None]:
         targets_to_check = listify(targets)
         self.process_stocks()
-        minimum_volume = self.config.get("minimum_volume", "100 ul")
         if enable_multistep_dilution is None:
             enable_multistep_dilution = bool(self.config.get("enable_multistep_dilution", False))
 
         results: list[dict | None] = []
         for target in targets_to_check:
             try:
-                mb = MassBalance(minimum_volume=minimum_volume)
-                for stock in self.stocks:
-                    mb.stocks.append(stock)
-
-                target_with_fixed = self.apply_fixed_comps(target.copy())
-                target_solution = Solution(**target_with_fixed)
-                mb.targets.append(target_solution)
-                mb.balance(
-                    tol=self.config.get("tol", 1e-3),
-                    enable_multistep_dilution=bool(enable_multistep_dilution),
-                    multistep_max_steps=int(self.config.get("multistep_max_steps", 2)),
-                    multistep_diluent_policy=str(self.config.get("multistep_diluent_policy", "primary_solvent")),
-                )
-
-                if (
-                    mb.balanced
-                    and len(mb.balanced) > 0
-                    and mb.balanced[0].get("balanced_target") is not None
-                ):
-                    results.append(mb.balanced[0]["balanced_target"].to_dict())
-                else:
-                    results.append(None)
+                entry = self._balance_target(target, bool(enable_multistep_dilution))
+                results.append(entry["balanced_target"].to_dict() if entry else None)
             except Exception as e:
                 warnings.warn(
                     f"Exception during feasibility check for target "
@@ -129,6 +154,15 @@ class PrepareDriver(MassBalanceDriver):
 
     def before_balance(self, target: dict) -> None:
         """Subclass hook to perform backend-specific checks before solving."""
+
+
+    def _validate_pipette_action_plan(self, protocol: list[PipetteAction]) -> None:
+        """Validate a planned transfer protocol.
+
+        Subclasses may override this to enforce backend-specific pipette
+        constraints. The default implementation accepts all plans.
+        """
+        return None
 
     def resolve_destination(self, dest: Optional[str]) -> str:
         """Return destination identifier for this backend."""
@@ -330,6 +364,9 @@ class PrepareDriver(MassBalanceDriver):
             return None, None
 
         balanced_target = self.balanced[0]["balanced_target"]
+        balanced_target = self._condition_preparation_target(balanced_target)
+        self.balanced[0]["balanced_target"] = balanced_target
+        self._validate_pipette_action_plan(balanced_target.protocol)
         procedure_plan = self.balanced[0].get("procedure_plan") or {}
         planned_mass_transfers = self.balanced[0].get("transfers")
         required_intermediate_targets = int(procedure_plan.get("required_intermediate_targets", 0))

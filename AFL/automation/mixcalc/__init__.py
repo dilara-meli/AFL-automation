@@ -6,7 +6,7 @@ from AFL.automation.mixcalc.MassBalanceBase import MassBalanceBase
 from AFL.automation.mixcalc.MassBalanceDriver import MassBalanceDriver
 from AFL.automation.mixcalc.MassBalanceWebAppMixin import MassBalanceWebAppMixin
 from AFL.automation.mixcalc.MixDB import MixDB
-from AFL.automation.mixcalc.PipetteAction import PipetteAction
+from AFL.automation.prepare.PipetteAction import PipetteAction
 from AFL.automation.mixcalc.Solution import Solution
 from AFL.automation.mixcalc.TargetSolution import TargetSolution
 
