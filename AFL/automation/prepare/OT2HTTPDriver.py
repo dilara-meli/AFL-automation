@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 
 
-from math import ceil
+from math import ceil, floor
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2DeckWebAppMixin import OT2DeckWebAppMixin
 from AFL.automation.shared.utilities import listify
@@ -1812,6 +1812,26 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "subtransfers_ul": [],
                 "status": "skipped_nonpositive_volume",
             }
+
+        if self.min_transfer is not None and volume_ul < self.min_transfer:
+            self.log_info(
+                "Skipping transfer with volume "
+                f"{volume_ul}uL below the configured pipette minimum "
+                f"of {self.min_transfer}uL from {source} to {dest}"
+            )
+            return {
+                "source": source,
+                "dest": dest,
+                "requested_volume_ul": volume_ul,
+                "minimum_configured_pipette_volume_ul": self.min_transfer,
+                "subtransfers_ul": [],
+                "status": "skipped_below_minimum_pipette_volume",
+            }
+
+        # The OT-2 protocol accepts whole-microlitre transfer aliquots only.
+        # Keep this boundary normalization here so direct API calls cannot send
+        # fractional command volumes even when they bypass MassBalance.
+        volume_ul = int(floor(volume_ul + 0.5))
 
         self._ensure_run_exists()
 

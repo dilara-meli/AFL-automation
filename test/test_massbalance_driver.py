@@ -85,16 +85,24 @@ def test_massbalance_driver_mixed_solvents_mass():
         if not result['success']:
             none_count += 1
             continue
-        assert balanced.mass.to('mg').magnitude == pytest.approx(500)
-        assert balanced.concentration['NaCl'].to('mg/ml').magnitude == pytest.approx(25)
+        # Integer-ul aliquots can differ slightly from the continuous ideal
+        # mass balance; the reported solution is built from those executable
+        # aliquots and must remain within one microlitre-scale increment.
+        assert balanced.mass.to('mg').magnitude == pytest.approx(500, abs=1.0)
+        assert balanced.concentration['NaCl'].to('mg/ml').magnitude == pytest.approx(25, abs=0.2)
+        assert all(float(action.volume).is_integer() for action in balanced.protocol)
 
         sub_balanced = balanced.copy()
         sub_target = Solution(**mb.config['targets'][i])
         del sub_balanced.components['NaCl']
         del sub_target.components['NaCl']
 
-        assert sub_balanced.mass_fraction['H2O'] == pytest.approx(sub_target.mass_fraction['H2O'])
-        assert sub_balanced.mass_fraction['Hexanes'] == pytest.approx(sub_target.mass_fraction['Hexanes'])
+        assert sub_balanced.mass_fraction['H2O'] == pytest.approx(
+            sub_target.mass_fraction['H2O'], abs=0.002
+        )
+        assert sub_balanced.mass_fraction['Hexanes'] == pytest.approx(
+            sub_target.mass_fraction['Hexanes'], abs=0.002
+        )
 
     assert none_count == 1
 

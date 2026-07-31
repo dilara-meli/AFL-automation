@@ -319,6 +319,35 @@ def test_transfer_with_single_loaded_pipette_allows_rate_overrides():
     assert transfer_result["dest"] == "1A2"
 
 
+def test_transfer_below_configured_pipette_minimum_is_a_no_op():
+    driver = _configured_driver()
+
+    result = driver.transfer("1A1", "1A2", 1e-14)
+
+    assert result == {
+        "source": "1A1",
+        "dest": "1A2",
+        "requested_volume_ul": 1e-14,
+        "minimum_configured_pipette_volume_ul": 20.0,
+        "subtransfers_ul": [],
+        "status": "skipped_below_minimum_pipette_volume",
+    }
+    assert driver.executed_commands == []
+    assert driver.has_tip is False
+
+
+def test_transfer_rounds_fractional_volume_to_an_integer_ul():
+    driver = _configured_driver()
+
+    result = driver.transfer("1A1", "1A2", 50.6)
+
+    assert result["requested_volume_ul"] == 51
+    aspirate = next(params for command, params in driver.executed_commands if command == "aspirate")
+    dispense = next(params for command, params in driver.executed_commands if command == "dispense")
+    assert aspirate["volume"] == 51
+    assert dispense["volume"] == 51
+
+
 def test_transfer_rejects_drop_tip_and_return_tip_together():
     driver = _configured_driver()
 
