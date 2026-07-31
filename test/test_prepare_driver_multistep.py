@@ -278,6 +278,25 @@ def test_is_feasible_rejects_stock_volume_fraction_targets_with_invalid_protocol
 
 
 @pytest.mark.usefixtures('mixdb')
+def test_is_feasible_reports_missing_direct_recipe_stocks():
+    driver = DummyPrepare()
+    driver.config.write = False
+
+    target = {
+        'name': 'MissingStockRecipe',
+        'location': '1A4',
+        'stock_volume_fractions': {'stock_Red': 1.0},
+        'total_volume': '1000 ul',
+    }
+
+    with pytest.warns(UserWarning, match='configured stock.*stock_Red'):
+        assert driver.is_feasible(target, enable_multistep_dilution=False) == [None]
+
+    assert 'stock_Red' in driver.last_feasibility_errors[0]
+    assert 'Currently configured stocks: none' in driver.last_feasibility_errors[0]
+
+
+@pytest.mark.usefixtures('mixdb')
 def test_prepare_rejects_stock_volume_fraction_targets_with_invalid_protocol_volumes():
     driver = DummyPrepare()
     driver.config.write = False

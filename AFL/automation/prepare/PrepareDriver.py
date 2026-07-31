@@ -81,6 +81,7 @@ class PrepareDriver(MassBalanceDriver):
 
     def _balance_target(self, target: dict, enable_multistep_dilution: bool) -> dict | None:
         """Plan one target through the common MassBalance result contract."""
+        self._validate_stock_volume_fraction_sources(target)
         mb = MassBalance(minimum_volume=self.config.get("minimum_volume", "100 ul"))
         mb.stocks.extend(self.stocks)
         target_solution = Solution(**self.apply_fixed_comps(target.copy()))
@@ -100,6 +101,32 @@ class PrepareDriver(MassBalanceDriver):
         self._validate_pipette_action_plan(entry["balanced_target"].protocol)
         return entry
 
+    def _validate_stock_volume_fraction_sources(self, target: dict) -> None:
+        """Ensure a direct stock recipe only names currently available stocks."""
+        requested_stocks = target.get("stock_volume_fractions", {})
+        if not requested_stocks:
+            return
+
+        available_stocks = {
+            getattr(stock, "stock_group", stock.name)
+            for stock in self.stocks
+        }
+        missing_stocks = sorted(set(requested_stocks) - available_stocks)
+        if not missing_stocks:
+            return
+
+        configured_stocks = sorted(
+            stock.get("name", "<unnamed>")
+            for stock in self.config.get("stocks", [])
+            if isinstance(stock, dict)
+        )
+        configured_summary = ", ".join(configured_stocks) if configured_stocks else "none"
+        raise ValueError(
+            "Direct stock recipe requires available configured stock(s): "
+            f"{', '.join(missing_stocks)}. Configure or restore these stocks before "
+            f"retrying. Currently configured stocks: {configured_summary}."
+        )
+
     def is_feasible(
         self,
         targets: dict | list[dict],
@@ -107,6 +134,7 @@ class PrepareDriver(MassBalanceDriver):
     ) -> list[dict | None]:
         targets_to_check = listify(targets)
         self.process_stocks()
+        self.last_feasibility_errors = []
         if enable_multistep_dilution is None:
             enable_multistep_dilution = bool(self.config.get("enable_multistep_dilution", False))
 
@@ -116,11 +144,13 @@ class PrepareDriver(MassBalanceDriver):
                 entry = self._balance_target(target, bool(enable_multistep_dilution))
                 results.append(entry["balanced_target"].to_dict() if entry else None)
             except Exception as e:
-                warnings.warn(
-                    f"Exception during feasibility check for target "
-                    f"{target.get('name', 'Unnamed')}: {str(e)}",
-                    stacklevel=2,
+                message = (
+                    f"Feasibility check for target {target.get('name', 'Unnamed')!r} "
+                    f"failed: {e}"
                 )
+                self.last_feasibility_errors.append(message)
+                self.log_warning(message)
+                warnings.warn(message, stacklevel=2)
                 results.append(None)
         return results
 
@@ -324,18 +354,25 @@ class PrepareDriver(MassBalanceDriver):
             enable_multistep_dilution=bool(enable_multistep_dilution),
         )
         if not feasibility_results or feasibility_results[0] is None:
+            feasibility_error = (
+                self.last_feasibility_errors[0]
+                if self.last_feasibility_errors
+                else "No mass-balance solution was found."
+            )
             self._update_prepare_metadata(
                 feasible_result=None,
                 balanced_target=None,
                 planned_mass_transfers=None,
                 procedure_plan=None,
+                feasibility_error=feasibility_error,
                 execution_success=False,
             )
-            warnings.warn(
-                f"Target composition {target.get('name', 'Unnamed target')} is not feasible "
-                f"based on mass balance calculations",
-                stacklevel=2,
+            message = (
+                f"Target composition {target.get('name', 'Unnamed target')} is not feasible: "
+                f"{feasibility_error}"
             )
+            self.log_warning(message)
+            warnings.warn(message, stacklevel=2)
             return None, None
 
         feasible_result = feasibility_results[0]

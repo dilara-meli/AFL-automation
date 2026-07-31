@@ -4,6 +4,7 @@ Tests for AFL.automation.APIServer core functionality
 import pytest
 import tempfile
 import json
+import logging
 from pathlib import Path
 
 from AFL.automation.APIServer import APIServer
@@ -118,6 +119,20 @@ class TestAPIServer:
         assert hasattr(server, 'app')
         assert server.app is not None
 
+    def test_init_logging_does_not_duplicate_file_handlers(self, tmp_path):
+        server = APIServer(name='LoggingServer', afl_home=tmp_path)
+        logfile = (tmp_path / 'LoggingServer.log').resolve()
+
+        server.init_logging()
+
+        handlers = [
+            handler for handler in server.app.logger.handlers
+            if isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename).resolve() == logfile
+        ]
+        assert len(handlers) == 1
+        assert handlers[0] in logging.getLogger('werkzeug').handlers
+
     def test_apiserver_create_queue(self, dummy_driver):
         """Test that APIServer can create a queue with a driver"""
         server = APIServer(name='TestServer')
@@ -126,6 +141,22 @@ class TestAPIServer:
         assert server.driver == dummy_driver
         assert dummy_driver.app is not None
         assert dummy_driver.app == server.app
+
+    def test_driver_log_level_configures_attached_server(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('AFL_HOME', str(tmp_path))
+        driver = DummyDriver(
+            name='ConfiguredLoggingDriver',
+            overrides={'log_level': 'WARNING'},
+        )
+        server = APIServer(name='ConfiguredLoggingServer', afl_home=tmp_path)
+
+        server.create_queue(driver, add_unqueued=False)
+
+        assert driver.config['log_level'] == 'WARNING'
+        assert server.app.logger.level == logging.WARNING
+
+        driver.set_config(log_level='ERROR')
+        assert server.app.logger.level == logging.ERROR
 
     def test_apiserver_apps_static_route(self):
         server = APIServer(name='TestServer')

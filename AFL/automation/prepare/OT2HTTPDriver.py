@@ -7,6 +7,7 @@ import hashlib
 import json
 import shutil
 from pathlib import Path
+from itertools import combinations_with_replacement
 
 
 from math import ceil
@@ -597,7 +598,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         )
             
             if self.app is not None:
-                self.log_info(f"Pipette information updated: {self.pipette_info}")
+                self.log_debug(f"Pipette information updated: {self.pipette_info}")
 
         except Exception as e:
             raise RuntimeError(f"Error getting pipettes: {str(e)}")
@@ -1792,8 +1793,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         ...     tip_rack_offset={"x": 0, "y": 0, "z": -1},
         ... )
         """
-        self.log_info(f"Transferring {volume}uL from {source} to {dest}")
-
         if drop_tip and return_tip:
             raise ValueError("Only one of drop_tip and return_tip can be True")
 
@@ -1821,7 +1820,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         if dispense_rate is not None:
             self.set_dispense_rate(dispense_rate)
 
-        pipette = self.get_pipette(volume_ul)
+        transfer_plan = self._plan_transfer(volume_ul)
+        pipette = transfer_plan[0]["pipette"]
         pipette_mount = pipette["mount"]
         resolve_tip_rack_offset = getattr(self, "_resolve_tip_rack_offset", None)
         if resolve_tip_rack_offset is not None:
@@ -1875,11 +1875,15 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         elif to_center:
             dest_position = "center"
 
-        split_up_transfers = getattr(self, "_split_up_transfers", None)
-        if split_up_transfers is not None:
-            transfers = split_up_transfers(volume_ul)
-        else:
-            transfers = [volume_ul]
+        transfers = [step["volume_ul"] for step in transfer_plan]
+        for transfer_index, step in enumerate(transfer_plan, start=1):
+            planned_pipette = step["pipette"]
+            sub_volume = step["volume_ul"]
+            self.log_info(
+                f"Pipetting transfer plan {transfer_index}/{len(transfers)}: "
+                f"{source} -> {dest} using {planned_pipette.get('name')} "
+                f"({planned_pipette['mount']}), {sub_volume:g} uL"
+            )
         transfer_record = {
             "source": source,
             "dest": dest,
@@ -1889,6 +1893,15 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             "pipette_mount": pipette_mount,
             "pipette_name": pipette.get("name"),
             "pipette_id": pipette_id,
+            "pipette_plan": [
+                {
+                    "mount": step["pipette"]["mount"],
+                    "name": step["pipette"].get("name"),
+                    "pipette_id": step["pipette"].get("pipette_id"),
+                    "volume_ul": step["volume_ul"],
+                }
+                for step in transfer_plan
+            ],
             "source_well": {
                 "labware_id": source_well["labwareId"],
                 "well_name": source_well["wellName"],
@@ -1925,10 +1938,35 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             },
             "status": "executed",
         }
-        if requested_tip is not None:
-            transfer_record["requested_tip"] = requested_tip.copy()
+        initial_pipette_mount = pipette_mount
+        initial_requested_tip = requested_tip
+        if initial_requested_tip is not None:
+            transfer_record["requested_tip"] = initial_requested_tip.copy()
 
-        for i, sub_volume in enumerate(transfers):
+        for i, step in enumerate(transfer_plan):
+            pipette = step["pipette"]
+            pipette_mount = pipette["mount"]
+            pipette_id = pipette["pipette_id"]
+            sub_volume = step["volume_ul"]
+            if resolve_tip_rack_offset is not None:
+                resolved_tip_rack_offset = resolve_tip_rack_offset(
+                    tip_rack_offset,
+                    mount=pipette_mount,
+                )
+            elif tip_rack_offset is None:
+                resolved_tip_rack_offset = dict(
+                    self.config.get("tip_rack_offset", {"x": 0, "y": 0, "z": 0})
+                )
+            else:
+                resolved_tip_rack_offset = dict(tip_rack_offset)
+            # A stock-reserved tip is assigned for the primary pipette.  A
+            # secondary pipette in a mixed plan uses its normal available-tip
+            # pool rather than trying to pick up an incompatible reserved tip.
+            requested_tip = (
+                initial_requested_tip
+                if pipette_mount == initial_pipette_mount
+                else None
+            )
             if sub_volume <= 0:
                 self.log_warning(
                     f"Skipping nonpositive sub-transfer volume {sub_volume}uL from {source} to {dest}"
@@ -2289,7 +2327,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         return transfer_record
 
     def _split_up_transfers(self, volume):
-        """Split a requested transfer volume into pipette-safe subtransfers.
+        """Split a requested transfer using the multi-pipette transfer planner.
 
         Parameters
         ----------
@@ -2301,19 +2339,132 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         list of float
             One or more subtransfer volumes.
         """
+        return [step["volume_ul"] for step in self._plan_transfer(volume)]
+
+    def _available_pipette_options(self):
+        """Return loaded pipettes with the volume limits needed for planning."""
+        self._update_pipettes()
+        options = []
+        for mount, pipette_data in self._get_active_pipettes().items():
+            if not pipette_data or pipette_data.get("id") is None:
+                continue
+            min_volume = float(pipette_data.get("min_volume", 1))
+            max_volume = float(pipette_data.get("max_volume", 300))
+            if min_volume <= 0 or max_volume < min_volume:
+                continue
+            options.append({
+                "mount": mount,
+                "min_volume": min_volume,
+                "max_volume": max_volume,
+                "name": pipette_data.get("name"),
+                "model": pipette_data.get("model"),
+                "channels": pipette_data.get("channels", 1),
+                "pipette_id": pipette_data.get("id"),
+            })
+        return options
+
+    @staticmethod
+    def _typical_pipette_error(pipette, volume_ul):
+        """Estimate a conservative absolute error from typical OT-2 tolerances.
+
+        The coefficients are the Gen1 white-paper random and systematic error
+        fits retained from the legacy OT2 driver.  They are used solely to
+        choose between plans with the same number of transfers; they are not a
+        substitute for a pipette's calibration certificate.
+        """
+        profiles = {
+            10: (0.00491803278688525, 0.0737704918032787,
+                 0.00491803278688525, 0.173770491803279),
+            20: (0.00491803278688525, 0.0737704918032787,
+                 0.00491803278688525, 0.173770491803279),
+            50: (-0.000983606557377049, 0.226229508196721,
+                 0.0055327868852459, 0.227459016393443),
+            300: (0.00168032786885246, 0.381147540983607,
+                  0.00327868852459016, 0.875409836065574),
+            1000: (0.000573770491803279, 0.860655737704918,
+                   0.00549180327868852, 1.73770491803279),
+        }
+        nominal_size = min(profiles, key=lambda size: abs(size - pipette["max_volume"]))
+        random_a, random_b, systematic_a, systematic_b = profiles[nominal_size]
+        return abs(random_a * volume_ul + random_b) + abs(
+            systematic_a * volume_ul + systematic_b
+        )
+
+    def _plan_transfer(self, volume):
+        """Plan the most accurate practical aliquots across loaded pipettes.
+
+        Plans within four steps of the mathematical minimum are considered so
+        that a small remainder can use a more accurate small-volume pipette.
+        Expected error is minimized first; transfer count then breaks ties.
+        """
         volume_ul = float(volume)
         if volume_ul <= 0:
             return []
-        if self.max_transfer is None or volume_ul <= self.max_transfer:
-            return [volume_ul]
 
-        transfers = []
-        remaining = volume_ul
-        while remaining > 0:
-            sub_volume = min(self.max_transfer, remaining)
-            transfers.append(float(sub_volume))
-            remaining -= sub_volume
-        return transfers
+        pipettes = self._available_pipette_options()
+        if not pipettes:
+            raise ValueError("No suitable loaded pipettes found!")
+
+        min_steps = max(1, ceil(volume_ul / max(p["max_volume"] for p in pipettes)))
+        max_steps = ceil(volume_ul / min(p["min_volume"] for p in pipettes))
+        practical_max_steps = min(max_steps, min_steps + 4)
+        best_plan = None
+        for transfer_count in range(min_steps, practical_max_steps + 1):
+            for selected_indices in combinations_with_replacement(
+                range(len(pipettes)), transfer_count
+            ):
+                selected = [pipettes[index] for index in selected_indices]
+                min_total = sum(pipette["min_volume"] for pipette in selected)
+                max_total = sum(pipette["max_volume"] for pipette in selected)
+                if volume_ul < min_total - 1e-9 or volume_ul > max_total + 1e-9:
+                    continue
+
+                volumes = [pipette["min_volume"] for pipette in selected]
+                remaining = volume_ul - min_total
+                # Allocate additional volume to the pipette with the lowest
+                # typical incremental error, using larger pipettes as a stable
+                # tie-breaker to keep the plan compact.
+                ordered = sorted(
+                    range(len(selected)),
+                    key=lambda index: (
+                        self._typical_pipette_error(selected[index], selected[index]["min_volume"] + 1)
+                        - self._typical_pipette_error(selected[index], selected[index]["min_volume"]),
+                        -selected[index]["max_volume"],
+                    ),
+                )
+                for index in ordered:
+                    added_volume = min(
+                        remaining,
+                        selected[index]["max_volume"] - volumes[index],
+                    )
+                    volumes[index] += added_volume
+                    remaining -= added_volume
+                    if remaining <= 1e-9:
+                        break
+                if remaining > 1e-9:
+                    continue
+
+                plan = [
+                    {"pipette": pipette, "volume_ul": float(aliquot)}
+                    for pipette, aliquot in zip(selected, volumes)
+                ]
+                score = sum(
+                    self._typical_pipette_error(step["pipette"], step["volume_ul"])
+                    for step in plan
+                )
+                plan_key = (
+                    score,
+                    transfer_count,
+                    tuple((step["pipette"]["mount"], step["volume_ul"]) for step in plan),
+                )
+                if best_plan is None or plan_key < best_plan[0]:
+                    best_plan = (plan_key, plan)
+        if best_plan is not None:
+            return best_plan[1]
+
+        raise ValueError(
+            f"Cannot plan {volume_ul} uL within the volume limits of the loaded pipettes."
+        )
 
     def _resolve_tip_rack_offset(self, tip_rack_offset=None, mount=None):
         """Resolve the configured tip-rack offset mapping.
