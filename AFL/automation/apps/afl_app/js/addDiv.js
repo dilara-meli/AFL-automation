@@ -423,13 +423,7 @@ function addQueueDiv(key, column=1) {
  */
 function addQuickbarDiv(key, column=1) {
     var server = getServer(key);
-    var existing = $('#' + server.quickbarDiv.id);
-    if(existing.length) {
-        existing.appendTo('#column' + column);
-        server.quickbarDiv.setOnScreen(true);
-    } else {
-        server.quickbarDiv.display(column);
-    }
+    server.quickbarDiv.display(column);
 
     var id = '#'+server.quickbarDiv.addBtnID;
     disableBtn($(id));
