@@ -49,16 +49,20 @@ def test_mixed_solvents_mass():
         if not result['success']:
             none_count += 1
             continue
-        assert balanced.mass.to('mg').magnitude == pytest.approx(500)
-        assert balanced.concentration['NaCl'].to('mg/ml').magnitude == pytest.approx(25)
+        # Balancing now produces executable whole-microlitre aliquots.  At this
+        # scale, rounding each stock transfer can shift the final composition
+        # slightly from the continuous solver result.
+        assert balanced.mass.to('mg').magnitude == pytest.approx(500, abs=1)
+        assert balanced.concentration['NaCl'].to('mg/ml').magnitude == pytest.approx(25, abs=0.2)
+        assert all(action.volume == int(action.volume) for action in balanced.protocol)
 
         sub_balanced = balanced.copy()
         sub_target = target.copy()
         del sub_balanced.components['NaCl']
         del sub_target.components['NaCl']
 
-        assert sub_balanced.mass_fraction['H2O'] == pytest.approx(sub_target.mass_fraction['H2O'])
-        assert sub_balanced.mass_fraction['Hexanes'] == pytest.approx(sub_target.mass_fraction['Hexanes'])
+        assert sub_balanced.mass_fraction['H2O'] == pytest.approx(sub_target.mass_fraction['H2O'], abs=2e-3)
+        assert sub_balanced.mass_fraction['Hexanes'] == pytest.approx(sub_target.mass_fraction['Hexanes'], abs=2e-3)
 
     assert none_count == 1
 
