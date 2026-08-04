@@ -164,13 +164,6 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         """Return candidate positive minimum transfer volumes for active pipettes."""
         minima = []
 
-        update_pipettes = getattr(self, "_update_pipettes", None)
-        if update_pipettes is not None:
-            try:
-                update_pipettes()
-            except Exception:
-                pass
-
         get_active_pipettes = getattr(self, "_get_active_pipettes", None)
         if get_active_pipettes is not None:
             try:
@@ -638,6 +631,15 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         )
         if selected_tip_location is not None:
             transfer_params["tip_location"] = selected_tip_location
+            # A stock-specific tip is reusable inventory.  Return it to its
+            # tracked rack well instead of discarding it after this transfer.
+            transfer_params["drop_tip"] = False
+            transfer_params["return_tip"] = True
+        tip_location_candidates = self._ordered_stock_tip_candidates(
+            stock_name, step_tip_location
+        )
+        if len(tip_location_candidates) > 1:
+            transfer_params["tip_locations"] = tip_location_candidates
         return transfer_params, selected_tip_location
 
     def _occupied_sample_locations(self):
@@ -887,10 +889,14 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 step_tip_location=getattr(step, "tip_location", None),
             )
             try:
+                self.log_info(
+                    "Transfer requested: "
+                    f"source={source!r}, dest={destination!r}, volume_ul={float(volume_ul)}"
+                )
                 self.log_debug(
                     "Pipette action: "
                     f"stock={stock_name!r}, source={source!r}, dest={destination!r}, "
-                    f"volume_ul={float(volume_ul)}"
+                    f"volume_ul={float(volume_ul)}, tip_location={selected_tip_location!r}"
                 )
                 transfer_result = self.transfer(
                     source=source,
@@ -919,6 +925,13 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 )
                 self._activate_stock_tip_reservation(stock_name, selected_tip_location)
             except Exception as e:
+                error_message = str(e).lower()
+                if isinstance(e, ValueError) and "tip" in error_message and (
+                    "not available" in error_message
+                    or "does not match" in error_message
+                    or "match the" in error_message
+                ):
+                    raise
                 warnings.warn(f"Transfer failed from {source} to {destination}: {str(e)}", stacklevel=2)
                 return False
 
@@ -1041,10 +1054,15 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             )
         else:
             transfer_params = self.get_transfer_params("default")
+        self.log_info(
+            "Transfer requested: "
+            f"source={source!r}, dest={dest!r}, volume_ul={float(volume_ul)}"
+        )
         self.log_debug(
             "Pipette action: "
             f"stage={stage_type!r}, stock={stock_name!r}, source={source!r}, "
-            f"dest={dest!r}, volume_ul={float(volume_ul)}"
+            f"dest={dest!r}, volume_ul={float(volume_ul)}, "
+            f"tip_location={selected_tip_location!r}"
         )
         transfer_result = self.transfer(source=source, dest=dest, volume=volume_ul, **transfer_params)
         self._activate_stock_tip_reservation(stock_name, selected_tip_location)

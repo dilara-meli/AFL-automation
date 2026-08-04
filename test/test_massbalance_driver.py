@@ -334,6 +334,37 @@ def test_upload_stocks_preserves_multi_source_schema_and_list_stocks_reports_rem
 
 
 @pytest.mark.usefixtures("mixdb")
+def test_multi_source_stock_preserves_recipe_volume_and_uses_source_inventory():
+    mb = MassBalanceDriver()
+    mb.config.write = False
+    mb.reset_stocks()
+
+    mb.add_stock(
+        {
+            "name": "stock_NaCl",
+            "total_volume": "20 ml",
+            "volumes": {"H2O": "20 ml"},
+            "concentrations": {"NaCl": "1 mg/ml"},
+            "solutes": ["NaCl"],
+            "sources": [
+                {"location": "2A1", "initial_volume": "350 ul"},
+                {"location": "2A2", "initial_volume": "100 ul"},
+                {"location": "2B1", "initial_volume": "100 ul"},
+            ],
+        }
+    )
+
+    assert mb.config["stocks"][0]["total_volume"] == "20 ml"
+    assert [float(stock.volume.to("ul").magnitude) for stock in mb.stocks] == pytest.approx(
+        [350.0, 100.0, 100.0]
+    )
+    assert all(
+        float(stock.concentration["NaCl"].to("mg/ml").magnitude) == pytest.approx(1.0)
+        for stock in mb.stocks
+    )
+
+
+@pytest.mark.usefixtures("mixdb")
 def test_massbalance_driver_balance_report_includes_status_metadata():
     mb = _build_balanced_massbalance_driver()
 

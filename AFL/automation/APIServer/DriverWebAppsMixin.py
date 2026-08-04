@@ -1,12 +1,13 @@
 import datetime
 import io
 import json
-import pathlib
 from collections import defaultdict
 
 from flask import render_template
 from tiled.client import from_uri
 from tiled.queries import Contains, In
+
+from AFL.automation.shared.tiled import TiledConfigurationError, resolve_tiled_config
 
 
 class DriverWebAppsMixin:
@@ -30,59 +31,12 @@ class DriverWebAppsMixin:
         Returns:
             dict with status and config values or error message
         """
-        config_path = pathlib.Path.home() / '.afl' / 'config.json'
-
-        if not config_path.exists():
-            return {
-                'status': 'error',
-                'message': 'Config file not found at ~/.afl/config.json. Please create this file with tiled_server and tiled_api_key settings.'
-            }
-
         try:
-            with open(config_path, 'r') as f:
-                config_data = json.load(f)
-        except (json.JSONDecodeError, ValueError) as e:
+            tiled_server, tiled_api_key = resolve_tiled_config()
+        except TiledConfigurationError as exc:
             return {
                 'status': 'error',
-                'message': f'Invalid JSON in config file: {str(e)}'
-            }
-
-        # Search through config entries (newest first) to find tiled settings
-        if not config_data:
-            return {
-                'status': 'error',
-                'message': 'Config file is empty.'
-            }
-
-        # Try entries in reverse sorted order to find one with tiled config
-        # Use datetime parsing to properly sort date keys (format: YY/DD/MM HH:MM:SS.ffffff)
-        datetime_key_format = '%y/%d/%m %H:%M:%S.%f'
-        try:
-            keys = sorted(
-                config_data.keys(),
-                key=lambda k: datetime.datetime.strptime(k, datetime_key_format),
-                reverse=True
-            )
-        except ValueError:
-            # Fallback to lexicographic sort if datetime parsing fails
-            keys = sorted(config_data.keys(), reverse=True)
-        tiled_server = ''
-        tiled_api_key = ''
-
-        for key in keys:
-            entry = config_data[key]
-            if isinstance(entry, dict):
-                server = entry.get('tiled_server', '')
-                api_key = entry.get('tiled_api_key', '')
-                if server and api_key:
-                    tiled_server = server
-                    tiled_api_key = api_key
-                    break
-
-        if not tiled_server:
-            return {
-                'status': 'error',
-                'message': 'tiled_server not configured in ~/.afl/config.json. Please add a tiled_server URL to your config.'
+                'message': str(exc),
             }
 
         if not tiled_api_key:

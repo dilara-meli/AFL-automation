@@ -23,7 +23,8 @@ class DataTiled(DataPacket):
             structure_clients="dask",
         )
         super().__init__()
-        
+        self.last_tiled_entry_id = None
+        self.last_tiled_error = None
         self.arrays = {}
 
     def _get_or_create_container(self, name):
@@ -35,6 +36,8 @@ class DataTiled(DataPacket):
         return self.tiled_client[name]
         
     def finalize(self):
+        self.last_tiled_entry_id = None
+        self.last_tiled_error = None
         self.transmit()
         self.reset()
         
@@ -133,7 +136,12 @@ class DataTiled(DataPacket):
                 fxn = run_document_container.write_array
                 self._sanitize()
                 fxn(main_data, key=entry_uuid, metadata=self._dict())
+            self.last_tiled_entry_id = entry_uuid
+            self.last_tiled_error = None
+            return entry_uuid
         except Exception as e:
+            self.last_tiled_entry_id = None
+            self.last_tiled_error = str(e)
             print(f'Exception while transmitting to Tiled! {e}. Saving data in backup store.')
             if 'main_data' not in locals():
                 if 'main_dataset' in self._dict().keys():
@@ -158,3 +166,4 @@ class DataTiled(DataPacket):
                     json.dump(self._dict(),f)
             except Exception as backup_error:
                 print(f'Failed to write backup JSON to {self.backup_path}: {backup_error}')
+            return None

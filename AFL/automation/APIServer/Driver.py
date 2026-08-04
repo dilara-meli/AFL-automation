@@ -84,10 +84,11 @@ class Driver(DriverWebAppsMixin):
         load_existing_config = os.environ.get('AFL_FRESH_DRIVER_CONFIG') != '1'
 
         # Every driver can control the verbosity of the APIServer it is
-        # attached to.  Copy the supplied defaults so adding this common
-        # option does not mutate a driver's class-level ``defaults`` mapping.
+        # attached to.  Keep the framework default out of PersistentConfig:
+        # launcher snapshots must contain only the driver's declared defaults
+        # (and any explicit overrides), rather than an implicit extra key.
         config_defaults = dict(defaults) if defaults is not None else {}
-        config_defaults.setdefault('log_level', 'DEBUG')
+        log_level = config_defaults.get('log_level', 'DEBUG')
 
         self.config = PersistentConfig(
             path=self.filepath,
@@ -95,7 +96,7 @@ class Driver(DriverWebAppsMixin):
             overrides= overrides,
             load_existing=load_existing_config,
             )
-        self._set_log_level(self.config['log_level'])
+        self._set_log_level(self.config.get('log_level', log_level))
         
         # collect inherited static directories
         self.static_dirs = self.gather_static_dirs()
