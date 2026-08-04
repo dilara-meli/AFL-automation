@@ -460,6 +460,24 @@ class TestDataTiled:
             dp.subtransmit_array('test_array', np.array([1, 2, 3]))
             assert captured['client'] is mock_tiled_server['run_documents']
             assert captured['key'] == 'QD-123'
+            assert dp.last_tiled_entry_id == 'QD-123'
+            assert dp.last_tiled_error is None
+
+    def test_tiled_write_failure_does_not_publish_an_entry_id(self, mock_tiled_server, monkeypatch):
+        tiled_mod = importlib.import_module('AFL.automation.APIServer.data.DataTiled')
+
+        def fail_write(*args, **kwargs):
+            raise RuntimeError('Tiled unavailable')
+
+        monkeypatch.setattr(tiled_mod, 'write_xarray_dataset', fail_write)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dp = DataTiled('http://localhost:8000', 'test-api-key', tmpdir)
+            dp['uuid'] = 'QD-failed'
+            dp.subtransmit_array('test_array', np.array([1, 2, 3]))
+
+            assert dp.last_tiled_entry_id is None
+            assert 'Tiled unavailable' in dp.last_tiled_error
 
 
 # Integration test to verify import works

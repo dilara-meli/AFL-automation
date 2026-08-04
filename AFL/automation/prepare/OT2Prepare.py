@@ -631,6 +631,10 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         )
         if selected_tip_location is not None:
             transfer_params["tip_location"] = selected_tip_location
+            # A stock-specific tip is reusable inventory.  Return it to its
+            # tracked rack well instead of discarding it after this transfer.
+            transfer_params["drop_tip"] = False
+            transfer_params["return_tip"] = True
         tip_location_candidates = self._ordered_stock_tip_candidates(
             stock_name, step_tip_location
         )
@@ -885,6 +889,10 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                 step_tip_location=getattr(step, "tip_location", None),
             )
             try:
+                self.log_info(
+                    "Transfer requested: "
+                    f"source={source!r}, dest={destination!r}, volume_ul={float(volume_ul)}"
+                )
                 self.log_debug(
                     "Pipette action: "
                     f"stock={stock_name!r}, source={source!r}, dest={destination!r}, "
@@ -1046,6 +1054,10 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             )
         else:
             transfer_params = self.get_transfer_params("default")
+        self.log_info(
+            "Transfer requested: "
+            f"source={source!r}, dest={dest!r}, volume_ul={float(volume_ul)}"
+        )
         self.log_debug(
             "Pipette action: "
             f"stage={stage_type!r}, stock={stock_name!r}, source={source!r}, "

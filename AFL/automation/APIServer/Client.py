@@ -113,7 +113,14 @@ class Client:
                     break
             time.sleep(interval)
 
-        #check the return info of the command we waited on
+        # Return the completed task that was requested, including verified
+        # Tiled write metadata when the server has a DataTiled backend.
+        if target_uuid is not None:
+            completed_task = next(
+                task for task in reversed(history)
+                if str(task['uuid']) == str(target_uuid)
+            )
+            return completed_task['meta']
         return history[-1]['meta']
 
     def get_quickbar(self):

@@ -711,7 +711,12 @@ def test_mixed_pipette_transfer_uses_configured_tip_for_each_mount():
     driver._update_pipette_ranges()
 
     result = driver.transfer(
-        "1A1", "1A2", 350, drop_tip=True, tip_locations=["1A1", "2A1"]
+        "1A1",
+        "1A2",
+        350,
+        drop_tip=False,
+        return_tip=True,
+        tip_locations=["1A1", "2A1"],
     )
 
     pickups = [params for command, params in driver.executed_commands if command == "pickUpTip"]
@@ -721,6 +726,12 @@ def test_mixed_pipette_transfer_uses_configured_tip_for_each_mount():
     ]
     assert result["requested_tips"]["left"]["location"] == "1A1"
     assert result["requested_tips"]["right"]["location"] == "2A1"
+    assert not any(
+        command == "moveToAddressableAreaForDropTip"
+        for command, _ in driver.executed_commands
+    )
+    assert ("tiprack-left", "A1") in driver.config["available_tips"]["left"]
+    assert ("tiprack-right", "A1") in driver.config["available_tips"]["right"]
 
 
 def test_split_transfer_force_new_tip_refreshes_tip_each_subtransfer():

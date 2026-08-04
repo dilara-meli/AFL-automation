@@ -6,10 +6,13 @@ import tempfile
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 from AFL.automation.APIServer import APIServer
+from AFL.automation.APIServer.Client import Client
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.APIServer.DummyDriver import DummyDriver
+from AFL.automation.APIServer.QueueDaemon import QueueDaemon
 
 
 class TestDriver:
@@ -214,6 +217,50 @@ class TestAPIServer:
 
         assert response.status_code == 200
         assert b'nested' in response.data
+
+
+@pytest.mark.parametrize(
+    ("entry_id", "has_tiled_backend", "expected_status"),
+    [
+        ("QD-123", True, "written"),
+        (None, True, "fallback"),
+        (None, False, "not_configured"),
+    ],
+)
+def test_queue_metadata_reports_tiled_write_outcome(
+    entry_id, has_tiled_backend, expected_status
+):
+    daemon = object.__new__(QueueDaemon)
+    daemon.data = SimpleNamespace(last_tiled_entry_id=entry_id)
+    if has_tiled_backend:
+        daemon.data.last_tiled_error = None
+    package = {"meta": {}}
+
+    daemon._attach_tiled_result_metadata(package)
+
+    assert package["meta"]["tiled_entry_id"] == entry_id
+    assert package["meta"]["tiled_status"] == expected_status
+
+
+def test_client_wait_returns_requested_task_tiled_entry_id(monkeypatch):
+    client = object.__new__(Client)
+    client.url = "http://afl.test"
+    client.headers = {}
+    queue_history = [
+        {"uuid": "QD-earlier", "meta": {"tiled_entry_id": "QD-earlier"}},
+        {"uuid": "QD-requested", "meta": {"tiled_entry_id": "QD-requested"}},
+        {"uuid": "QD-later", "meta": {"tiled_entry_id": "QD-later"}},
+    ]
+
+    class Response:
+        def json(self):
+            return [queue_history, [], []]
+
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: Response())
+
+    result = client.wait(target_uuid="QD-requested", first_check_delay=0)
+
+    assert result["tiled_entry_id"] == "QD-requested"
 
 
 def test_import_apiserver():
