@@ -52,17 +52,6 @@ class StubOT2HTTPDriver(OT2HTTPDriver):
         self.pipette_info = {
             mount: info.copy() for mount, info in self.hardware_pipettes.items()
         }
-        self.min_transfer = None
-        self.max_transfer = None
-
-        for info in self._get_active_pipettes().values():
-            min_volume = info.get("min_volume")
-            max_volume = info.get("max_volume")
-
-            if self.min_transfer is None or self.min_transfer > min_volume:
-                self.min_transfer = min_volume
-            if self.max_transfer is None or self.max_transfer < max_volume:
-                self.max_transfer = max_volume
 
     def get_wells(self, location):
         return [{"labwareId": "labware_1", "wellName": location[-2:]}]
@@ -302,6 +291,21 @@ def test_get_pipette_ignores_attached_but_unloaded_mount():
     assert pipette["pipette_id"] == "left-id"
 
 
+def test_pipette_selection_uses_cached_loaded_metadata_without_refreshing():
+    driver = _configured_driver()
+    refresh_calls = []
+
+    def unexpected_refresh():
+        refresh_calls.append(True)
+        raise AssertionError("pipette selection must not refresh robot metadata")
+
+    driver._update_pipettes = unexpected_refresh
+
+    assert driver.get_pipette(50)["mount"] == "left"
+    assert driver._available_pipette_options()[0]["mount"] == "left"
+    assert refresh_calls == []
+
+
 def test_transfer_with_single_loaded_pipette_allows_rate_overrides():
     driver = _configured_driver()
 
@@ -359,6 +363,12 @@ def test_transfer_rejects_drop_tip_and_return_tip_together():
 
 def test_transfer_with_tip_location_uses_requested_tip():
     driver = _configured_driver()
+    # PersistentConfig JSON serialization restores tuple-like tip entries as
+    # lists.  A requested tip must work with that persisted representation.
+    driver.config["available_tips"]["left"] = [
+        ["tiprack-left", "A1"],
+        ["tiprack-left", "A2"],
+    ]
 
     transfer_result = driver.transfer(
         "1A1",
@@ -372,7 +382,7 @@ def test_transfer_with_tip_location_uses_requested_tip():
     assert pick_up["labwareId"] == "tiprack-left"
     assert pick_up["wellName"] == "A2"
     assert driver.current_tip["well_name"] == "A2"
-    assert driver.config["available_tips"]["left"] == [("tiprack-left", "A1")]
+    assert driver.config["available_tips"]["left"] == [["tiprack-left", "A1"]]
     assert transfer_result["requested_tip"]["location"] == "1A2"
 
 
@@ -661,6 +671,10 @@ def test_transfer_plan_uses_small_pipette_for_accurate_remainder(
         "tip_racks": ["tiprack-right"],
     }
     driver.config["available_tips"]["right"] = [("tiprack-right", "A1")]
+    # Mirror the state change performed by load_instrument after loading the
+    # second pipette into the active run.
+    driver._update_pipettes()
+    driver._update_pipette_ranges()
 
     transfer_result = driver.transfer("1A1", "1A2", volume_ul, drop_tip=True)
 
@@ -675,6 +689,38 @@ def test_transfer_plan_uses_small_pipette_for_accurate_remainder(
         if command == "aspirate"
     ]
     assert aspirate_pipettes == ["left-id"] + ["right-id"] * (len(expected_volumes) - 1)
+
+
+def test_mixed_pipette_transfer_uses_configured_tip_for_each_mount():
+    driver = _configured_driver()
+    driver.hardware_pipettes["right"] = _pipette_info(
+        "right", "right-id", min_volume=1, max_volume=20
+    )
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_instruments"]["right"] = {
+        "name": "p20_single",
+        "pipette_id": "right-id",
+        "tip_racks": ["tiprack-right"],
+    }
+    driver.config["available_tips"]["right"] = [("tiprack-right", "A1")]
+    driver._update_pipettes()
+    driver._update_pipette_ranges()
+
+    result = driver.transfer(
+        "1A1", "1A2", 350, drop_tip=True, tip_locations=["1A1", "2A1"]
+    )
+
+    pickups = [params for command, params in driver.executed_commands if command == "pickUpTip"]
+    assert [(params["pipetteMount"], params["labwareId"], params["wellName"]) for params in pickups] == [
+        ("left", "tiprack-left", "A1"),
+        ("right", "tiprack-right", "A1"),
+    ]
+    assert result["requested_tips"]["left"]["location"] == "1A1"
+    assert result["requested_tips"]["right"]["location"] == "2A1"
 
 
 def test_split_transfer_force_new_tip_refreshes_tip_each_subtransfer():
@@ -1219,6 +1265,27 @@ def test_driver_does_not_reseed_existing_user_labware_dir(monkeypatch, tmp_path)
     assert driver.custom_labware_dir == expected_dir
     assert persisted["wells"]["A1"]["z"] == 9.9
     assert not (expected_dir / "seed_only.json").exists()
+
+
+def test_get_available_wells_returns_sorted_unoccupied_locations():
+    driver = StubOT2HTTPDriver()
+    driver.config["loaded_labware"]["5"] = (
+        "plate-5",
+        "custom_plate",
+        {"definition": {"wells": {"B2": {}, "A10": {}, "A2": {}, "A1": {}, "B1": {}}}},
+    )
+    driver.config["occupied_sample_locations"] = ["5A2", "5b1"]
+
+    result = driver.get_available_wells(5)
+
+    assert result == ["5A1", "5A10", "5B2"]
+
+
+def test_get_available_wells_raises_for_missing_slot():
+    driver = StubOT2HTTPDriver()
+
+    with pytest.raises(ValueError, match="No labware loaded in slot 9"):
+        driver.get_available_wells("9")
 
 
 def test_send_labware_persists_to_user_labware_dir(monkeypatch, tmp_path):

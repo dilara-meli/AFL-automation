@@ -343,6 +343,7 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
         if location is not None and sources:
             raise ValueError("Specify either top-level location or sources, not both")
 
+        has_explicit_sources = bool(sources)
         if sources:
             normalized_sources = [
                 cls._normalize_stock_source(source)
@@ -370,7 +371,11 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
             seen_locations.add(location_key)
 
         normalized.pop('location', None)
-        normalized.pop('total_volume', None)
+        # A stock-level total volume defines the composition used by every
+        # source.  Preserve it for explicit multi-source stocks; each
+        # source's initial_volume is inventory, not a separate recipe.
+        if not has_explicit_sources:
+            normalized.pop('total_volume', None)
         normalized['sources'] = normalized_sources
         return normalized
 
@@ -431,7 +436,10 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
                 remaining_volume_qty = enforce_units(remaining_volume, 'volume')
                 if float(remaining_volume_qty.to('ul').magnitude) <= 0:
                     continue
-                runtime_config['total_volume'] = remaining_volume
+                if runtime_config.get('total_volume') is None:
+                    runtime_config['total_volume'] = remaining_volume
+                else:
+                    runtime_config['_source_remaining_volume'] = remaining_volume
             runtime_configs.append(runtime_config)
         return runtime_configs
 
@@ -452,12 +460,17 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
                     source_locations[0] if len(source_locations) == 1 else source_locations
                 )
             for runtime_config in self._runtime_stock_configs(stock_config):
+                source_remaining_volume = runtime_config.pop(
+                    '_source_remaining_volume', None
+                )
                 if capture_diagnostics:
                     stock, diag = self._build_solution_with_diagnostics(runtime_config, idx)
                     if diag:
                         diagnostics.append(diag)
                 else:
                     stock = Solution(**runtime_config)
+                if source_remaining_volume is not None:
+                    stock = stock.measure_out(source_remaining_volume)
                 stock.stock_group = stock_config['name']
                 stock.stock_id = (
                     self._make_stock_source_id(stock_config['name'], stock.location)
