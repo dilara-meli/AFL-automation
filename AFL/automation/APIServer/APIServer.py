@@ -119,7 +119,7 @@ class APIServer:
         self.driver.app = self.app
         # ``init_logging`` runs before a driver is available.  Apply the
         # driver's persistent setting once the server and driver are paired.
-        self.driver._set_log_level(self.driver.config['log_level'])
+        self.driver._set_log_level(self.driver.config.get('log_level', 'DEBUG'))
         self.driver.data = self.data
         if self.driver.dropbox is None:
             self.driver.dropbox = {}
