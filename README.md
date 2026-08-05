@@ -1,3 +1,12 @@
+> ## ⚠️ Warning:
+> 
+> This is a development branch. While it provides additional functionality, breaking changes, incomplete features, and interface changes should be expected.
+> 
+> If you are a previous AFL software user, please continue to use the `main` branch unless you require some of the updated functionality implemented in the `dev` branch.
+>
+> If you have questions or run into issues, please contact: **[Kiran Vaddi](mailto:kiran.vaddi@nist.gov)** or **[Dilara Meli]**(mailto:dilara.meli@nist.gov).
+
+
 NIST Autonomous Formulation Laboratory - Automation Software
 
 This package contains the core laboratory automation software used in the NIST AFL platform.
