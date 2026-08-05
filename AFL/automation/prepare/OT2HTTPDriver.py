@@ -2,6 +2,9 @@ import requests
 import time
 import logging
 import re
+import threading
+import uuid
+from datetime import datetime, timezone
 
 import copy
 import hashlib
@@ -10,6 +13,8 @@ import shutil
 from pathlib import Path
 from itertools import combinations_with_replacement
 
+import numpy as np
+import lazy_loader as lazy
 
 from math import ceil, floor
 from AFL.automation.APIServer.Driver import Driver
@@ -59,6 +64,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         "p300_single": "300ul",
         "p1000_single": "1000ul",
     }
+    DECK_STREAM_REQUEST_TIMEOUT_SECONDS = 15
     defaults = {}
     defaults["robot_ip"] = "127.0.0.1"  # Default to localhost, should be overridden
     defaults["robot_port"] = "31950"  # Default Opentrons HTTP API port
@@ -72,6 +78,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
     defaults["occupied_sample_locations"] = []  # Sample destinations already populated on deck
     defaults["prep_targets"] = []  # Persistent storage for prep target well locations
     defaults["tip_rack_offset"] = {"x": 0, "y": 0, "z": 0}  # Default offset for tip pickup/return at tiprack wells
+    defaults["enable_deck_stream"] = True
+    defaults["deck_stream_video_fps"] = 1
+    defaults["deck_stream_time"] = 120
 
     def __init__(self, overrides=None):
         """Initialize the OT-2 HTTP driver.
@@ -105,6 +114,19 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         self.last_pipette = None
         self.current_tip = None
         self.modules = {}
+        self._deck_stream_thread = None
+        self._deck_stream_stop_event = None
+        self._deck_stream_lock = threading.Lock()
+        self._deck_stream_state = {
+            "running": False,
+            "current_window_started_at": None,
+            "last_completed_at": None,
+            "last_video_path": None,
+            "last_frame_count": 0,
+            "last_error": None,
+            "stopped_for_run_status": None,
+            "task_name": None,
+        }
             
         self.pipette_info = {}
 
@@ -120,8 +142,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
         # Initialize the robot connection
         self._initialize_robot()
-
-
         self.useful_links['View Deck'] = '/visualize_deck'
 
 
@@ -670,6 +690,316 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         """
         return self.config["prep_targets"].pop(0)
 
+    def _deck_stream_settings(self):
+        """Resolve and validate the settings for one deck-stream window."""
+        output_dir = Path(getattr(self, "path", Path.cwd())) / "ot2_deck_stream"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            video_fps = float(self.config["deck_stream_video_fps"])
+            duration_seconds = float(self.config["deck_stream_time"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("deck stream timing values must be numeric") from exc
+
+        if video_fps <= 0:
+            raise ValueError("deck stream video FPS must be positive")
+        if duration_seconds <= 0:
+            raise ValueError("deck stream time must be positive")
+
+        return {
+            "directory": output_dir,
+            "capture_period_seconds": 1 / video_fps,
+            "duration_seconds": duration_seconds,
+            "video_fps": video_fps,
+            "request_timeout": self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS,
+        }
+
+    @staticmethod
+    def _deck_stream_cv2():
+        """Load OpenCV only when deck-stream video encoding is requested."""
+        try:
+            return lazy.load("cv2", require="AFL-automation[vision]")
+        except Exception as exc:
+            raise ImportError(
+                "opencv-python is required for deck stream video encoding. "
+                "Install with: pip install AFL-automation[vision]."
+            ) from exc
+
+    def _ensure_deck_lights_on(self):
+        """Turn on OT-2 deck lights when deck-stream recording needs them."""
+        try:
+            light_state_response = requests.get(
+                url=f"{self.base_url}/robot/lights",
+                headers=self.headers,
+                timeout=self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS,
+            )
+            light_state_response.raise_for_status()
+            lights_on = bool(light_state_response.json().get("on", False))
+            if lights_on:
+                return False
+
+            self.log_info("Turning on OT-2 deck lights for deck stream")
+            lights_on_response = requests.post(
+                url=f"{self.base_url}/robot/lights",
+                headers=self.headers,
+                json={"on": True},
+                timeout=self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS,
+            )
+            lights_on_response.raise_for_status()
+            return True
+        except (requests.exceptions.RequestException, ValueError, AttributeError) as exc:
+            self.log_warning(f"Unable to ensure OT-2 deck lights are on: {exc}")
+            return None
+
+    def _capture_deck_picture(self, cv2_module, timeout):
+        """Request and decode one image from the OT-2 deck camera."""
+        response = requests.post(
+            url=f"{self.base_url}/camera/picture",
+            headers=self.headers,
+            timeout=timeout,
+        )
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            detail = response.text.strip()
+            if detail:
+                detail = detail[:1000]
+                raise RuntimeError(
+                    "OT-2 deck camera request failed "
+                    f"({response.status_code}): {detail}"
+                ) from exc
+            raise
+        if not response.content:
+            raise RuntimeError("OT-2 deck camera returned an empty image")
+        image = cv2_module.imdecode(
+            np.frombuffer(response.content, dtype=np.uint8),
+            cv2_module.IMREAD_COLOR,
+        )
+        if image is None:
+            raise RuntimeError("OT-2 deck camera returned an undecodable image")
+        return image
+
+    def _record_deck_stream_window(self, settings, stop_event=None, stop_reason_callback=None):
+        """Collect one configured capture window and atomically replace its video."""
+        cv2_module = self._deck_stream_cv2()
+        started_at = datetime.now(timezone.utc)
+        duration_seconds = settings.get("duration_seconds")
+        deadline = (
+            None
+            if duration_seconds is None
+            else time.monotonic() + duration_seconds
+        )
+        frames = []
+        first_error = None
+
+        with self._deck_stream_lock:
+            self._deck_stream_state.update({
+                "current_window_started_at": started_at.isoformat(),
+                "last_error": None,
+            })
+
+        while deadline is None or time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if stop_reason_callback is not None:
+                stop_reason = stop_reason_callback()
+                if stop_reason is not None:
+                    with self._deck_stream_lock:
+                        self._deck_stream_state["stopped_for_run_status"] = stop_reason
+                    self.log_warning(f"Deck stream stopped: {stop_reason}")
+                    break
+            try:
+                frame = self._capture_deck_picture(cv2_module, settings["request_timeout"])
+                if frames and frame.shape[:2] != frames[0].shape[:2]:
+                    frame = cv2_module.resize(frame, (frames[0].shape[1], frames[0].shape[0]))
+                frames.append(frame)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = str(exc)
+                self.log_warning(f"Deck stream picture capture failed: {exc}")
+
+            remaining = (
+                settings["capture_period_seconds"]
+                if deadline is None
+                else deadline - time.monotonic()
+            )
+            if remaining <= 0:
+                break
+            if stop_event is None:
+                time.sleep(min(settings["capture_period_seconds"], remaining))
+            elif stop_event.wait(min(settings["capture_period_seconds"], remaining)):
+                break
+
+        if not frames:
+            error = first_error or "No deck camera images were captured"
+            with self._deck_stream_lock:
+                self._deck_stream_state.update({
+                    "current_window_started_at": None,
+                    "last_frame_count": 0,
+                    "last_error": error,
+                })
+            raise RuntimeError(error)
+
+        output_path = settings.get("output_path", settings["directory"] / "deck_stream.mp4")
+        temporary_path = settings["directory"] / f".deck_stream-{uuid.uuid4().hex}.mp4"
+        writer = cv2_module.VideoWriter(
+            str(temporary_path),
+            cv2_module.VideoWriter_fourcc(*"mp4v"),
+            settings["video_fps"],
+            (frames[0].shape[1], frames[0].shape[0]),
+        )
+        try:
+            try:
+                if not writer.isOpened():
+                    raise RuntimeError(f"Unable to open deck stream video writer for {temporary_path}")
+                for frame in frames:
+                    writer.write(frame)
+            finally:
+                writer.release()
+            if not temporary_path.exists():
+                raise RuntimeError("Deck stream video writer did not create an output file")
+            temporary_path.replace(output_path)
+        except Exception:
+            if temporary_path.exists():
+                temporary_path.unlink()
+            raise
+        completed_at = datetime.now(timezone.utc).isoformat()
+        with self._deck_stream_lock:
+            self._deck_stream_state.update({
+                "current_window_started_at": None,
+                "last_completed_at": completed_at,
+                "last_video_path": str(output_path),
+                "last_frame_count": len(frames),
+                "last_error": first_error,
+            })
+        return {
+            "path": str(output_path),
+            "frame_count": len(frames),
+            "started_at": started_at.isoformat(),
+            "completed_at": completed_at,
+        }
+
+    @Driver.queued()
+    def get_deck_stream(self):
+        """Capture one deck-camera timelapse and replace ``deck_stream.mp4``.
+
+        ``deck_stream_video_fps`` controls both snapshot frequency and output
+        video frame rate; ``deck_stream_time`` controls total capture time.
+        """
+        settings = self._deck_stream_settings()
+        return self._record_deck_stream_window(settings)
+
+    def _task_video_stop_reason(self):
+        """Return a reason to finalize a task video when its OT-2 run pauses."""
+        run_id = getattr(self, "run_id", None)
+        if run_id is None:
+            return None
+        try:
+            response = requests.get(
+                url=f"{self.base_url}/runs/{run_id}",
+                headers=self.headers,
+                timeout=self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            run_status = response.json().get("data", {}).get("status")
+        except (requests.exceptions.RequestException, ValueError, AttributeError) as exc:
+            self.log_warning(f"Unable to check OT-2 run {run_id} for task video: {exc}")
+            return None
+        if run_status in {"paused", "failed", "error"}:
+            return f"OT-2 run {run_id} is {run_status}"
+        return None
+
+    def _deck_stream_worker(self, settings):
+        """Record one task's video until the owning task signals completion."""
+        stop_event = self._deck_stream_stop_event
+        try:
+            self._record_deck_stream_window(
+                settings,
+                stop_event=stop_event,
+                stop_reason_callback=self._task_video_stop_reason,
+            )
+        except Exception as exc:
+            with self._deck_stream_lock:
+                self._deck_stream_state["last_error"] = str(exc)
+                self._deck_stream_state["current_window_started_at"] = None
+            self.log_error(f"Deck stream task video failed: {exc}")
+        with self._deck_stream_lock:
+            self._deck_stream_state["running"] = False
+            self._deck_stream_state["current_window_started_at"] = None
+
+    def _start_task_video(self, task_name, output_filename=None):
+        """Start recording a video dedicated to one opted-in driver task."""
+        if not self.config.get("enable_deck_stream", False):
+            return False
+        with self._deck_stream_lock:
+            if self._deck_stream_thread is not None and self._deck_stream_thread.is_alive():
+                return False
+        self._ensure_deck_lights_on()
+        settings = self._deck_stream_settings()
+        if output_filename is None:
+            started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            safe_task_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_name)
+            output_filename = f"deck_stream_{safe_task_name}_{started_at}.mp4"
+        settings.update({
+            "duration_seconds": None,
+            "output_path": settings["directory"] / output_filename,
+        })
+        self.log_info(f"Deck stream task video: {settings['output_path']}")
+        with self._deck_stream_lock:
+            if self._deck_stream_thread is not None and self._deck_stream_thread.is_alive():
+                return False
+            self._deck_stream_stop_event = threading.Event()
+            self._deck_stream_state["running"] = True
+            self._deck_stream_state["stopped_for_run_status"] = None
+            self._deck_stream_state["task_name"] = task_name
+            self._deck_stream_thread = threading.Thread(
+                target=self._deck_stream_worker,
+                args=(settings,),
+                name="OT2HTTPDriver-deck-stream",
+                daemon=True,
+            )
+            self._deck_stream_thread.start()
+        return True
+
+    def _finish_task_video(self):
+        """Stop and finalize the current task video without disabling capture."""
+        with self._deck_stream_lock:
+            stop_event = self._deck_stream_stop_event
+            stream_thread = self._deck_stream_thread
+            if stop_event is not None:
+                stop_event.set()
+        if stream_thread is not None and stream_thread is not threading.current_thread():
+            stream_thread.join(timeout=self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS + 2)
+        with self._deck_stream_lock:
+            if stream_thread is None or not stream_thread.is_alive():
+                self._deck_stream_thread = None
+                self._deck_stream_stop_event = None
+                self._deck_stream_state["running"] = False
+            self._deck_stream_state["task_name"] = None
+
+    @Driver.queued()
+    def stop_deck_stream(self):
+        """Disable deck-stream recording and stop an active task video."""
+        with self._deck_stream_lock:
+            stop_event = self._deck_stream_stop_event
+            stream_thread = self._deck_stream_thread
+            if stop_event is None:
+                self.config["enable_deck_stream"] = False
+                self.config._update_history()
+                return {"running": False}
+            else:
+                stop_event.set()
+        if stream_thread is not None and stream_thread is not threading.current_thread():
+            stream_thread.join(timeout=2)
+        with self._deck_stream_lock:
+            if stream_thread is None or not stream_thread.is_alive():
+                self._deck_stream_thread = None
+                self._deck_stream_stop_event = None
+                self._deck_stream_state["running"] = False
+            self.config["enable_deck_stream"] = False
+            self.config._update_history()
+            return {"running": self._deck_stream_state["running"]}
+
     def status(self):
         """Return human-readable OT-2 status lines.
 
@@ -718,6 +1048,30 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 status.append(f"Labware in slot {slot}: {name}")
         except Exception:
             print(self.config["loaded_labware"])
+
+        if hasattr(self, "_deck_stream_lock"):
+            with self._deck_stream_lock:
+                deck_stream_state = dict(self._deck_stream_state)
+        else:
+            deck_stream_state = {
+                "running": False,
+                "last_video_path": None,
+                "last_error": None,
+            }
+        status.append(
+            "Deck stream: "
+            f"{'running' if deck_stream_state['running'] else 'stopped'} "
+            f"(task-scoped, enabled={bool(self.config.get('enable_deck_stream', False))})"
+        )
+        if deck_stream_state["last_video_path"] is not None:
+            status.append(f"Deck stream video: {deck_stream_state['last_video_path']}")
+        if deck_stream_state["last_error"] is not None:
+            status.append(f"Deck stream error: {deck_stream_state['last_error']}")
+        if deck_stream_state.get("stopped_for_run_status") is not None:
+            status.append(
+                "Deck stream stopped to preserve video: "
+                f"{deck_stream_state['stopped_for_run_status']}"
+            )
         return status
 
     @Driver.quickbar(
