@@ -163,6 +163,19 @@ def test_rgb_camera_opens_on_initialization_and_can_be_closed(monkeypatch):
     assert len(fake_cv2.captures) == 2
 
 
+def test_rgb_camera_initializes_without_the_optional_opencv_dependency(monkeypatch):
+    def missing_cv2(*args, **kwargs):
+        raise ModuleNotFoundError("No module named 'cv2'")
+
+    monkeypatch.setattr("AFL.automation.vision.RGBCamera.lazy.load", missing_cv2)
+
+    driver = RGBCamera(overrides={"background_capture_on_init": False})
+
+    assert driver._opencv_capture is None
+    with pytest.raises(ImportError, match="opencv-python"):
+        driver.open()
+
+
 def test_neutron_sample_cell_extracts_shared_crop_and_circle(monkeypatch):
     cell = NeutronSampleCell()
     image = np.zeros((6, 6, 3), dtype=np.uint8)

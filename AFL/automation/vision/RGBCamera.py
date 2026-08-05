@@ -53,7 +53,13 @@ class RGBCamera(NeutronSampleCell, Driver):
             overrides=overrides,
         )
         self._configure_direct_logging()
-        self.open()
+        try:
+            self.open()
+        except ImportError as exc:
+            self.log_warning(
+                "OpenCV is unavailable; RGB camera will remain closed until "
+                f"the vision extra is installed. {exc}"
+            )
         if self.config.get("background_capture_on_init", True):
             try:
                 self.refresh_background()
