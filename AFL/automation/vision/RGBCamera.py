@@ -53,6 +53,13 @@ class RGBCamera(NeutronSampleCell, Driver):
             overrides=overrides,
         )
         self._configure_direct_logging()
+        try:
+            self.open()
+        except ImportError as exc:
+            self.log_warning(
+                "OpenCV is unavailable; RGB camera will remain closed until "
+                f"the vision extra is installed. {exc}"
+            )
         if self.config.get("background_capture_on_init", True):
             try:
                 self.refresh_background()
@@ -97,15 +104,20 @@ class RGBCamera(NeutronSampleCell, Driver):
             raise ValueError("camera_index must be set in config when camera_interface='opencv'")
 
         camera_index = self.config["camera_index"]
-        if self._opencv_capture is None:
-            self._opencv_capture = cv2_module.VideoCapture(camera_index)
+        if self._opencv_capture is None or not self._opencv_capture.isOpened():
+            self.open()
 
         return self._opencv_capture.read()
 
-    def _reset_camera(self):
-        """Reset the configured camera connection."""
-        if self._opencv_capture is not None:
-            self._opencv_capture.release()
+    @Driver.queued()
+    def open(self):
+        """Open the configured OpenCV camera and retain its capture handle."""
+        if self._opencv_capture is not None and self._opencv_capture.isOpened():
+            return {
+                "camera_index": self.config.get("camera_index", 0),
+                "opened": True,
+            }
+        self.close()
         try:
             cv2_module = lazy.load("cv2", require="AFL-automation[vision]")
         except Exception as exc:
@@ -115,6 +127,23 @@ class RGBCamera(NeutronSampleCell, Driver):
             )
         camera_index = self.config.get("camera_index", 0)
         self._opencv_capture = cv2_module.VideoCapture(camera_index)
+        return {
+            "camera_index": camera_index,
+            "opened": bool(self._opencv_capture.isOpened()),
+        }
+
+    @Driver.queued()
+    def close(self):
+        """Release the OpenCV camera handle so another process can use it."""
+        if self._opencv_capture is not None:
+            self._opencv_capture.release()
+            self._opencv_capture = None
+        return {"closed": True}
+
+    def _reset_camera(self):
+        """Reset the configured camera connection."""
+        self.close()
+        self.open()
 
     def _capture_processed_frame(self, **kwargs):
         """
@@ -137,7 +166,7 @@ class RGBCamera(NeutronSampleCell, Driver):
         )
         self.log_debug("Attempting to collect camera image.")
 
-        self._reset_camera()
+        self.open()
         time.sleep(warmup_delay)
         collected, img = self._collect_image(**kwargs)
 
