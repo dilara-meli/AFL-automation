@@ -2,7 +2,11 @@ import pytest
 from pathlib import Path
 import json
 import logging
+import threading
 from types import SimpleNamespace
+
+import numpy as np
+import requests
 
 from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
 
@@ -1330,3 +1334,249 @@ def test_send_labware_persists_to_user_labware_dir(monkeypatch, tmp_path):
 
     assert expected_file.exists()
     assert persisted["wells"]["A1"]["z"] == 6.5
+
+
+class _DeckPictureResponse:
+    content = b"fake-jpeg"
+
+    def raise_for_status(self):
+        return None
+
+
+class _DeckPictureErrorResponse:
+    status_code = 500
+    text = '{"message":"camera service unavailable"}'
+
+    def raise_for_status(self):
+        raise requests.exceptions.HTTPError("500 Server Error")
+
+
+class _DeckLightResponse:
+    def __init__(self, on):
+        self.on = on
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"on": self.on}
+
+
+class _DeckStreamWriter:
+    def __init__(self, path, *args):
+        self.path = Path(path)
+        self.frames = []
+
+    def isOpened(self):
+        return True
+
+    def write(self, frame):
+        self.frames.append(frame.copy())
+
+    def release(self):
+        self.path.write_bytes(b"video-" + str(len(self.frames)).encode())
+
+
+class _DeckStreamCV2:
+    IMREAD_COLOR = 1
+
+    def __init__(self):
+        self.writers = []
+
+    def imdecode(self, encoded, mode):
+        assert encoded.tobytes() == b"fake-jpeg"
+        return np.zeros((2, 3, 3), dtype=np.uint8)
+
+    def resize(self, frame, dimensions):
+        return np.zeros((dimensions[1], dimensions[0], 3), dtype=np.uint8)
+
+    def VideoWriter_fourcc(self, *codec):
+        assert codec == ("m", "p", "4", "v")
+        return 0
+
+    def VideoWriter(self, *args):
+        writer = _DeckStreamWriter(*args)
+        self.writers.append(writer)
+        return writer
+
+
+def _deck_stream_driver(tmp_path):
+    driver = StubOT2HTTPDriver()
+    driver.path = tmp_path
+    driver.config.update({
+        "deck_stream_video_fps": 1,
+        "enable_deck_stream": False,
+    })
+    driver._deck_stream_thread = None
+    driver._deck_stream_stop_event = None
+    driver._deck_stream_lock = threading.Lock()
+    driver._deck_stream_state = {
+        "running": False,
+        "current_window_started_at": None,
+        "last_completed_at": None,
+        "last_video_path": None,
+        "last_frame_count": 0,
+        "last_error": None,
+        "stopped_for_run_status": None,
+        "task_name": None,
+    }
+    return driver
+
+
+def test_task_video_settings_use_fps(tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+
+    settings = driver._task_video_settings()
+
+    assert settings["directory"] == tmp_path / "ot2_deck_stream"
+    assert settings["capture_period_seconds"] == 1
+    driver.config["deck_stream_video_fps"] = 0
+    with pytest.raises(ValueError, match="FPS must be positive"):
+        driver._task_video_settings()
+
+
+def test_standalone_deck_stream_tasks_are_not_exposed(tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+
+    assert not hasattr(driver, "get_deck_stream")
+    assert not hasattr(driver, "stop_deck_stream")
+
+
+def test_task_video_can_use_a_fixed_overwrite_path(monkeypatch, tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+    driver.config["enable_deck_stream"] = True
+    logged = []
+    monkeypatch.setattr(driver, "log_info", logged.append)
+    monkeypatch.setattr(driver, "_ensure_deck_lights_on", lambda: False)
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.threading.Thread", FakeThread
+    )
+
+    assert driver._start_task_video("prepare", output_filename="prepare.mp4") is True
+    assert driver._deck_stream_state["task_name"] == "prepare"
+    expected_directory = tmp_path / "ot2_deck_stream"
+    assert expected_directory.is_dir()
+    assert len(logged) == 1
+    assert logged == [f"Deck stream task video: {expected_directory}/prepare.mp4"]
+
+
+def test_deck_stream_turns_lights_on_only_when_needed(monkeypatch, tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+    requests_sent = []
+
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.requests.get",
+        lambda **kwargs: _DeckLightResponse(on=False),
+    )
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.requests.post",
+        lambda **kwargs: requests_sent.append(kwargs) or _DeckLightResponse(on=True),
+    )
+
+    assert driver._ensure_deck_lights_on() is True
+    assert requests_sent == [{
+        "url": "http://ot2.test/robot/lights",
+        "headers": {"Opentrons-Version": "2"},
+        "json": {"on": True},
+        "timeout": 15,
+    }]
+
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.requests.get",
+        lambda **kwargs: _DeckLightResponse(on=True),
+    )
+    assert driver._ensure_deck_lights_on() is False
+    assert len(requests_sent) == 1
+
+
+def test_enabled_deck_stream_does_not_start_worker_during_initialization(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(OT2HTTPDriver, "_initialize_robot", lambda self: None)
+    monkeypatch.setattr(OT2HTTPDriver, "_get_seed_custom_labware_dir", lambda self: None)
+    driver = OT2HTTPDriver({"enable_deck_stream": True})
+
+    assert driver._deck_stream_thread is None
+
+
+def test_deck_stream_window_fetches_camera_picture_and_replaces_video(monkeypatch, tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+    cv2_module = _DeckStreamCV2()
+    captured_request = {}
+
+    def fake_post(**kwargs):
+        captured_request.update(kwargs)
+        return _DeckPictureResponse()
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", fake_post)
+    monkeypatch.setattr(driver, "_deck_stream_cv2", lambda: cv2_module)
+    output_dir = tmp_path / "ot2_deck_stream"
+    output_dir.mkdir()
+    output_path = output_dir / "deck_stream.mp4"
+    output_path.write_bytes(b"old-video")
+
+    result = driver._record_deck_stream_window({
+        "directory": output_dir,
+        "capture_period_seconds": 0.001,
+        "duration_seconds": 0.002,
+        "video_fps": 1,
+        "request_timeout": 15,
+    })
+
+    assert captured_request == {
+        "url": "http://ot2.test/camera/picture",
+        "headers": {"Opentrons-Version": "2"},
+        "timeout": 15,
+    }
+    assert result["path"] == str(output_path)
+    assert output_path.read_bytes().startswith(b"video-")
+    assert driver._deck_stream_state["last_video_path"] == str(output_path)
+    assert driver._deck_stream_state["last_frame_count"] >= 1
+
+
+def test_deck_stream_includes_ot2_camera_error_details(monkeypatch, tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.requests.post",
+        lambda **kwargs: _DeckPictureErrorResponse(),
+    )
+
+    with pytest.raises(RuntimeError, match="camera service unavailable"):
+        driver._capture_deck_picture(_DeckStreamCV2(), timeout=15)
+
+
+
+
+def test_deck_stream_empty_window_preserves_previous_video(monkeypatch, tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+    output_dir = tmp_path / "ot2_deck_stream"
+    output_dir.mkdir()
+    output_path = output_dir / "deck_stream.mp4"
+    output_path.write_bytes(b"old-video")
+    monkeypatch.setattr(driver, "_deck_stream_cv2", lambda: _DeckStreamCV2())
+
+    def failing_post(**kwargs):
+        raise requests.exceptions.ConnectionError("camera unavailable")
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", failing_post)
+    with pytest.raises(RuntimeError, match="camera unavailable"):
+        driver._record_deck_stream_window({
+            "directory": output_dir,
+            "capture_period_seconds": 0.001,
+            "duration_seconds": 0.002,
+            "video_fps": 1,
+            "request_timeout": 15,
+        })
+
+    assert output_path.read_bytes() == b"old-video"
+    assert "camera unavailable" in driver._deck_stream_state["last_error"]

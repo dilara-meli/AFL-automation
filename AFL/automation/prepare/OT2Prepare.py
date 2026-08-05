@@ -2,7 +2,7 @@ import warnings
 
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
-from AFL.automation.prepare.PrepareDriver import PrepareDriver
+from AFL.automation.prepare.PrepareDriver import PrepareDriver, capture_task_video
 from AFL.automation.shared.utilities import listify
 from AFL.automation.shared.units import enforce_units
 
@@ -1389,7 +1389,14 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         # protocol order.
         return reordered + unordered_steps
 
-    def transfer_to_catch(self, source=None, dest=None, **kwargs):
+    @capture_task_video("transfer_to_catch.mp4")
+    def transfer_to_catch(
+        self,
+        source=None,
+        dest=None,
+        capture_task_video=False,
+        **kwargs,
+    ):
         """Transfer a prepared sample into the configured catch destination.
 
         Parameters

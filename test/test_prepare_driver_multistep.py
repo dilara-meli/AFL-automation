@@ -1,6 +1,6 @@
 import pytest
 
-from AFL.automation.prepare.PrepareDriver import PrepareDriver
+from AFL.automation.prepare.PrepareDriver import PrepareDriver, capture_task_video
 
 
 class DummyPrepare(PrepareDriver):
@@ -70,6 +70,36 @@ class DummyPrepare(PrepareDriver):
         ]
         if self.raise_on_protocol_validation:
             raise ValueError('protocol contains infeasible transfer volume')
+
+
+def test_capture_task_video_decorator_is_opt_in_and_finalizes_on_failure():
+    class VideoDriver:
+        def __init__(self):
+            self.events = []
+
+        def _start_task_video(self, task_name, output_filename):
+            self.events.append(("start", task_name, output_filename))
+
+        def _finish_task_video(self):
+            self.events.append(("finish",))
+
+        @capture_task_video("example.mp4")
+        def operation(self, capture_task_video=False, fail=False):
+            if fail:
+                raise RuntimeError("planned failure")
+            return "complete"
+
+    driver = VideoDriver()
+
+    assert driver.operation() == "complete"
+    assert driver.events == []
+
+    assert driver.operation(capture_task_video=True) == "complete"
+    assert driver.events == [("start", "operation", "example.mp4"), ("finish",)]
+
+    with pytest.raises(RuntimeError, match="planned failure"):
+        driver.operation(capture_task_video=True, fail=True)
+    assert driver.events[-2:] == [("start", "operation", "example.mp4"), ("finish",)]
 
 
 

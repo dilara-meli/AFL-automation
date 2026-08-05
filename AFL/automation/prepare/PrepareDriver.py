@@ -1,5 +1,6 @@
 import copy
 import warnings
+from functools import wraps
 from typing import Dict, Optional
 
 from AFL.automation.mixcalc.MassBalance import MassBalance
@@ -8,6 +9,22 @@ from AFL.automation.prepare.PipetteAction import PipetteAction
 from AFL.automation.mixcalc.Solution import Solution
 from AFL.automation.shared.PersistentConfig import PersistentConfig
 from AFL.automation.shared.utilities import listify
+
+
+def capture_task_video(output_filename):
+    """Optionally record one driver task when its runtime flag is enabled."""
+    def decorator(func):
+        @wraps(func)
+        def wrapped(self, *args, **kwargs):
+            if not kwargs.get("capture_task_video", False):
+                return func(self, *args, **kwargs)
+            self._start_task_video(func.__name__, output_filename=output_filename)
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                self._finish_task_video()
+        return wrapped
+    return decorator
 
 
 class PrepareDriver(MassBalanceDriver):
@@ -325,11 +342,13 @@ class PrepareDriver(MassBalanceDriver):
         queue = list(self.config.get(queue_key, []))
         self.config[queue_key] = consumed + queue
 
+    @capture_task_video("prepare.mp4")
     def prepare(
         self,
         target: dict,
         dest: str | None = None,
         enable_multistep_dilution: bool | None = None,
+        capture_task_video: bool = False,
     ) -> tuple[dict, str] | tuple[None, None]:
         requested_target = copy.deepcopy(target)
         target = self.apply_fixed_comps(target)
