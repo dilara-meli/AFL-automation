@@ -14,6 +14,28 @@ class FakeCamera:
         return np.zeros((2, 3, 3), dtype=np.uint8)
 
 
+class FakeOpenCVCapture:
+    def __init__(self, camera_index):
+        self.camera_index = camera_index
+        self.released = False
+
+    def isOpened(self):
+        return not self.released
+
+    def release(self):
+        self.released = True
+
+
+class FakeCV2:
+    def __init__(self):
+        self.captures = []
+
+    def VideoCapture(self, camera_index):
+        capture = FakeOpenCVCapture(camera_index)
+        self.captures.append(capture)
+        return capture
+
+
 def test_image_processing_crops_circular_region_and_calculates_rgb():
     processor = ImageProcessing()
     image = np.zeros((5, 5, 3), dtype=np.uint8)
@@ -112,6 +134,33 @@ def test_rgb_camera_uses_image_processing_mixin_and_vision_loader(monkeypatch):
     assert "col_crop" not in driver.config
     assert "row_crop" not in _DEFAULT_CUSTOM_CONFIG["overrides"]
     assert "col_crop" not in _DEFAULT_CUSTOM_CONFIG["overrides"]
+
+
+def test_rgb_camera_opens_on_initialization_and_can_be_closed(monkeypatch):
+    fake_cv2 = FakeCV2()
+    monkeypatch.setattr(
+        "AFL.automation.vision.RGBCamera.lazy.load", lambda *args, **kwargs: fake_cv2
+    )
+
+    driver = RGBCamera(overrides={
+        "background_capture_on_init": False,
+        "camera_index": 4,
+    })
+
+    assert len(fake_cv2.captures) == 1
+    assert driver._opencv_capture is fake_cv2.captures[0]
+    assert driver._opencv_capture.camera_index == 4
+    assert "open" in driver.queued.functions
+    assert "close" in driver.queued.functions
+    assert driver.open() == {"camera_index": 4, "opened": True}
+    assert len(fake_cv2.captures) == 1
+
+    assert driver.close() == {"closed": True}
+    assert fake_cv2.captures[0].released is True
+    assert driver._opencv_capture is None
+
+    assert driver.open() == {"camera_index": 4, "opened": True}
+    assert len(fake_cv2.captures) == 2
 
 
 def test_neutron_sample_cell_extracts_shared_crop_and_circle(monkeypatch):
