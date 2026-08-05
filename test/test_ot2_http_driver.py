@@ -1405,7 +1405,6 @@ def _deck_stream_driver(tmp_path):
     driver.path = tmp_path
     driver.config.update({
         "deck_stream_video_fps": 1,
-        "deck_stream_time": 60,
         "enable_deck_stream": False,
     })
     driver._deck_stream_thread = None
@@ -1424,21 +1423,23 @@ def _deck_stream_driver(tmp_path):
     return driver
 
 
-def test_deck_stream_settings_use_fps_and_total_capture_time(tmp_path):
+def test_task_video_settings_use_fps(tmp_path):
     driver = _deck_stream_driver(tmp_path)
 
-    settings = driver._deck_stream_settings()
+    settings = driver._task_video_settings()
 
     assert settings["directory"] == tmp_path / "ot2_deck_stream"
     assert settings["capture_period_seconds"] == 1
-    assert settings["duration_seconds"] == 60
     driver.config["deck_stream_video_fps"] = 0
     with pytest.raises(ValueError, match="FPS must be positive"):
-        driver._deck_stream_settings()
-    driver.config["deck_stream_video_fps"] = 1
-    driver.config["deck_stream_time"] = 0
-    with pytest.raises(ValueError, match="time must be positive"):
-        driver._deck_stream_settings()
+        driver._task_video_settings()
+
+
+def test_standalone_deck_stream_tasks_are_not_exposed(tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+
+    assert not hasattr(driver, "get_deck_stream")
+    assert not hasattr(driver, "stop_deck_stream")
 
 
 def test_task_video_can_use_a_fixed_overwrite_path(monkeypatch, tmp_path):

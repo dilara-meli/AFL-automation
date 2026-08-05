@@ -80,7 +80,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
     defaults["tip_rack_offset"] = {"x": 0, "y": 0, "z": 0}  # Default offset for tip pickup/return at tiprack wells
     defaults["enable_deck_stream"] = True
     defaults["deck_stream_video_fps"] = 1
-    defaults["deck_stream_time"] = 120
 
     def __init__(self, overrides=None):
         """Initialize the OT-2 HTTP driver.
@@ -690,26 +689,22 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         """
         return self.config["prep_targets"].pop(0)
 
-    def _deck_stream_settings(self):
-        """Resolve and validate the settings for one deck-stream window."""
+    def _task_video_settings(self):
+        """Resolve and validate settings used by an opted-in task video."""
         output_dir = Path(getattr(self, "path", Path.cwd())) / "ot2_deck_stream"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             video_fps = float(self.config["deck_stream_video_fps"])
-            duration_seconds = float(self.config["deck_stream_time"])
         except (TypeError, ValueError) as exc:
-            raise ValueError("deck stream timing values must be numeric") from exc
+            raise ValueError("task video FPS must be numeric") from exc
 
         if video_fps <= 0:
-            raise ValueError("deck stream video FPS must be positive")
-        if duration_seconds <= 0:
-            raise ValueError("deck stream time must be positive")
+            raise ValueError("task video FPS must be positive")
 
         return {
             "directory": output_dir,
             "capture_period_seconds": 1 / video_fps,
-            "duration_seconds": duration_seconds,
             "video_fps": video_fps,
             "request_timeout": self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS,
         }
@@ -879,16 +874,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             "completed_at": completed_at,
         }
 
-    @Driver.queued()
-    def get_deck_stream(self):
-        """Capture one deck-camera timelapse and replace ``deck_stream.mp4``.
-
-        ``deck_stream_video_fps`` controls both snapshot frequency and output
-        video frame rate; ``deck_stream_time`` controls total capture time.
-        """
-        settings = self._deck_stream_settings()
-        return self._record_deck_stream_window(settings)
-
     def _task_video_stop_reason(self):
         """Return a reason to finalize a task video when its OT-2 run pauses."""
         run_id = getattr(self, "run_id", None)
@@ -935,7 +920,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             if self._deck_stream_thread is not None and self._deck_stream_thread.is_alive():
                 return False
         self._ensure_deck_lights_on()
-        settings = self._deck_stream_settings()
+        settings = self._task_video_settings()
         if output_filename is None:
             started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             safe_task_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_name)
@@ -976,29 +961,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 self._deck_stream_stop_event = None
                 self._deck_stream_state["running"] = False
             self._deck_stream_state["task_name"] = None
-
-    @Driver.queued()
-    def stop_deck_stream(self):
-        """Disable deck-stream recording and stop an active task video."""
-        with self._deck_stream_lock:
-            stop_event = self._deck_stream_stop_event
-            stream_thread = self._deck_stream_thread
-            if stop_event is None:
-                self.config["enable_deck_stream"] = False
-                self.config._update_history()
-                return {"running": False}
-            else:
-                stop_event.set()
-        if stream_thread is not None and stream_thread is not threading.current_thread():
-            stream_thread.join(timeout=2)
-        with self._deck_stream_lock:
-            if stream_thread is None or not stream_thread.is_alive():
-                self._deck_stream_thread = None
-                self._deck_stream_stop_event = None
-                self._deck_stream_state["running"] = False
-            self.config["enable_deck_stream"] = False
-            self.config._update_history()
-            return {"running": self._deck_stream_state["running"]}
 
     def status(self):
         """Return human-readable OT-2 status lines.
