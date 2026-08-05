@@ -17,8 +17,9 @@ class _DummyCamera:
         return True, self._image
 
 
-def test_optical_turbidity_set_empty_returns_dataset(tmp_path):
+def test_optical_turbidity_set_empty_returns_dataset(tmp_path, monkeypatch):
     from AFL.automation.instrument.OpticalTurbidity import OpticalTurbidity
+    from AFL.automation.shared.samplecells import NeutronSampleCell
 
     rgb_image = np.zeros((4, 4, 3), dtype=np.uint8)
     rgb_image[..., 0] = 25
@@ -37,6 +38,8 @@ def test_optical_turbidity_set_empty_returns_dataset(tmp_path):
 
     driver.data = {'sample_uuid': 'empty-sample-uuid'}
 
+    assert isinstance(driver, NeutronSampleCell)
+
     dataset = driver.measure(set_empty=True, name='empty-reference')
 
     assert isinstance(dataset, xr.Dataset)
@@ -51,3 +54,9 @@ def test_optical_turbidity_set_empty_returns_dataset(tmp_path):
     np.testing.assert_array_equal(dataset['img'].values, driver.empty_img)
     np.testing.assert_array_equal(dataset['img_MT'].values, driver.empty_img)
     np.testing.assert_array_equal(dataset['mask'].values, np.ones_like(driver.empty_img, dtype=bool))
+
+    monkeypatch.setattr(driver, 'find_circular_region', lambda image, radii: (1, 1, 1))
+    measurement = driver.measure(name='sample')
+
+    assert measurement.attrs['located_center'] == [1, 1]
+    assert measurement.attrs['turbidity_metric'] == pytest.approx(1.0)

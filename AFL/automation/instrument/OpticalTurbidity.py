@@ -1,19 +1,14 @@
 import copy
 import datetime
-import pathlib
 import time
 import warnings
 
 import lazy_loader as lazy
-import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
-from skimage.color import rgb2gray
-from skimage.feature import canny
-from skimage.transform import hough_circle, hough_circle_peaks
-from skimage.util import img_as_ubyte
 
 from AFL.automation.APIServer.Driver import Driver
+from AFL.automation.shared.samplecells import NeutronSampleCell
 
 try:
     from tiled.queries import Eq
@@ -22,16 +17,15 @@ except ImportError:
     warnings.warn("Cannot import from tiled...empty UUID lookup will not work", stacklevel=2)
 
 
-class OpticalTurbidity(Driver):
-    defaults = {}
-    defaults["hough_radii"] = 98
-    defaults["row_crop"] = [0, 479]
-    defaults["col_crop"] = [0, 479]
-    defaults["save_path"] = "/home/afl642/2305_SINQ_TurbidityImages/"
-    defaults["camera_interface"] = "http"
-    defaults["camera_url"] = "http://afl-video:8081/103/current"
-    defaults["camera_index"] = 0
-    defaults["empty_uuid"] = ""
+class OpticalTurbidity(NeutronSampleCell, Driver):
+    defaults = {
+        **NeutronSampleCell.geometry_defaults,
+        "save_path": "/home/afl642/2305_SINQ_TurbidityImages/",
+        "camera_interface": "http",
+        "camera_url": "http://afl-video:8081/103/current",
+        "camera_index": 0,
+        "empty_uuid": "",
+    }
 
     def __init__(self, camera=None, overrides=None):
         """
@@ -170,13 +164,6 @@ class OpticalTurbidity(Driver):
             Dataset with turbidity measurements and images. When
             `set_empty=True`, the dataset contains the captured empty image.
         """
-        row_crop = self.config["row_crop"]
-        col_crop = self.config["col_crop"]
-        hough_radii = self.config["hough_radii"]
-
-        print("crops: ", row_crop, col_crop)
-        print("hough_radii", hough_radii)
-
         name = kwargs.pop("name", "")
 
         print("attempting to collect camera image")
@@ -187,13 +174,13 @@ class OpticalTurbidity(Driver):
 
         if collected:
             print("collected image")
-            measurement_img = img_as_ubyte(rgb2gray(img))
+            measurement_img = self.to_grayscale(img, color_order="RGB")
         else:
             self._reset_camera()
             print("trying to reset camera connection")
             collected, img = self._collect_image(**kwargs)
             if collected:
-                measurement_img = img_as_ubyte(rgb2gray(img))
+                measurement_img = self.to_grayscale(img, color_order="RGB")
                 print("success on retry")
             else:
                 raise RuntimeError(
@@ -221,13 +208,11 @@ class OpticalTurbidity(Driver):
             )
 
         print("measuring turbidity")
-        measurement_img = measurement_img[row_crop[0] : row_crop[1], col_crop[0] : col_crop[1]]
-        print("measurement image: ", measurement_img.shape, type(measurement_img))
 
         empty_img = None
         empty_from_measurement = False
         if self.empty_img is not None:
-            empty_img = self.empty_img[row_crop[0] : row_crop[1], col_crop[0] : col_crop[1]]
+            empty_img = self.empty_img
         elif self.config.get("empty_uuid"):
             if Eq is None:
                 self.log_warning("Cannot load empty image without tiled. Using measurement image for mask.")
@@ -251,70 +236,46 @@ class OpticalTurbidity(Driver):
                         empty_img = ds["img_MT"].values
                     elif "img" in ds:
                         empty_img = ds["img"].values
-                    if empty_img is not None:
-                        empty_img = empty_img[row_crop[0] : row_crop[1], col_crop[0] : col_crop[1]]
 
         if empty_img is None:
             self.log_warning("No empty image available. Using measurement image for mask and normalization.")
             empty_img = measurement_img
             empty_from_measurement = True
 
-        edges = canny(empty_img, sigma=2, low_threshold=10, high_threshold=50)
-
-        hough_radii = [hough_radii]
-        hough_res = hough_circle(edges, hough_radii)
-        _, cx, cy, radii = hough_circle_peaks(hough_res, hough_radii, total_num_peaks=1)
-
-        y = np.arange(empty_img.shape[0])
-        x = np.arange(empty_img.shape[1])
-        X, Y = np.meshgrid(x, y)
-
-        XX = X - cx
-        YY = Y - cy
-        R = np.sqrt(XX * XX + YY * YY)
-        mask = R < radii
-
-        empty_intensity = empty_img[mask]
-        filled_intensity = measurement_img[mask]
-
-        pedestal = np.abs(np.min(empty_intensity)) + 1
-        norm_intensity = (np.array(filled_intensity, dtype=float) + pedestal) / (
-            np.array(empty_intensity, dtype=float) + pedestal
+        reference_sample = self.extract_sample_image(empty_img, color_order="RGB")
+        measurement_img = self.crop_image(
+            measurement_img,
+            row_crop=reference_sample["row_crop"],
+            col_crop=reference_sample["col_crop"],
         )
-        norm_intensity = np.nan_to_num(norm_intensity, nan=1)
-        turbidity_metric = np.average(norm_intensity)
-
-        if isinstance(turbidity_metric, np.ndarray):
-            turbidity_metric = turbidity_metric.tolist()
-        if isinstance(cx, np.ndarray):
-            cx = cx.tolist()
-        if isinstance(cy, np.ndarray):
-            cy = cy.tolist()
+        empty_img = reference_sample["cropped_img"]
+        mask = reference_sample["mask"]
+        cx = reference_sample["cx"]
+        cy = reference_sample["cy"]
+        turbidity_metric = self.turbidity_measurement(
+            measurement_img, empty_img, mask, color_order="RGB"
+        )["turbidity_metric"]
 
         if plotting:
-            fig, ax = plt.subplots(1, 2)
-            ax[0].imshow(empty_img)
-            ax[0].imshow(np.where(mask, 0.0, np.nan))
-            ax[1].imshow(measurement_img)
-            ax[1].imshow(np.where(mask, 0.0, np.nan))
-            fig.suptitle(f"Turbidity metric {np.round(turbidity_metric, 2)}")
-            plt.savefig(
-                pathlib.Path(self.config["save_path"])
-                / f'{datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}-turbidity0.png'
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+            title = f"Turbidity metric {np.round(turbidity_metric, 2)}"
+            self.save_mask_comparison_plot(
+                empty_img,
+                measurement_img,
+                mask,
+                save_path=self.config["save_path"],
+                filename=f"{timestamp}-turbidity0.png",
+                title=title,
             )
-            plt.close(fig)
-
-            fig, ax = plt.subplots(1, 2)
-            ax[0].imshow(empty_img)
-            ax[0].imshow(np.where(~mask, 0.0, np.nan))
-            ax[1].imshow(measurement_img)
-            ax[1].imshow(np.where(~mask, 0.0, np.nan))
-            fig.suptitle(f"Turbidity metric {np.round(turbidity_metric, 2)}")
-            plt.savefig(
-                pathlib.Path(self.config["save_path"])
-                / f'{datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}-turbidity1.png'
+            self.save_mask_comparison_plot(
+                empty_img,
+                measurement_img,
+                mask,
+                save_path=self.config["save_path"],
+                filename=f"{timestamp}-turbidity1.png",
+                title=title,
+                invert_mask=True,
             )
-            plt.close(fig)
 
         return self._build_dataset(
             name=name,
