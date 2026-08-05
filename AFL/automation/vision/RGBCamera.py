@@ -21,11 +21,10 @@ class RGBCamera(NeutronSampleCell, Driver):
     """
     
     defaults = {
-        **NeutronSampleCell.geometry_defaults,
         "camera_index": 0,
         "save_path": "/home/afl642/rgb_images/",
-        "row_crop": [120, 250],
-        "col_crop": [220, 350],
+        "px_crop": [220, 350],
+        "py_crop": [120, 250],
         "hough_radii": 40,
         "subtract_background": True,
         "show_background_pipeline": False,
@@ -127,14 +126,14 @@ class RGBCamera(NeutronSampleCell, Driver):
             `(img, processed)` where `img` is the raw BGR frame and `processed`
             is the payload returned by `_process_image`.
         """
-        row_crop = self.config["row_crop"]
-        col_crop = self.config["col_crop"]
+        px_crop = self.config["px_crop"]
+        py_crop = self.config["py_crop"]
         hough_radii = self.config["hough_radii"]
         warmup_delay = self.config.get("camera_warmup_delay", 0.2)
 
         self.log_info(
             "Capturing RGB image with circular ROI detection "
-            f"(row_crop={row_crop}, col_crop={col_crop}, hough_radii={hough_radii})."
+            f"(px_crop={px_crop}, py_crop={py_crop}, hough_radii={hough_radii})."
         )
         self.log_debug("Attempting to collect camera image.")
 
@@ -189,11 +188,11 @@ class RGBCamera(NeutronSampleCell, Driver):
         img : np.ndarray
             Input image in BGR format (from OpenCV).
         px_crop : list, optional
-            Legacy pixel range [start, end] for cropping along the x-axis.
-            New callers should configure ``col_crop`` on the sample cell.
+            Pixel range [start, end] for cropping along the x-axis. Defaults to
+            the driver's ``px_crop`` configuration.
         py_crop : list, optional
-            Legacy pixel range [start, end] for cropping along the y-axis.
-            New callers should configure ``row_crop`` on the sample cell.
+            Pixel range [start, end] for cropping along the y-axis. Defaults to
+            the driver's ``py_crop`` configuration.
         hough_radii : int or list, optional
             Radius or radii to use for Hough circle detection.
 
@@ -203,8 +202,8 @@ class RGBCamera(NeutronSampleCell, Driver):
             Processed image payload including cropped image, mask, center, radius,
             and average RGB values computed inside the mask.
         """
-        # ``px_crop``/``py_crop`` remain accepted for direct legacy callers;
-        # all crop and circle geometry lives in NeutronSampleCell.
+        px_crop = self.config["px_crop"] if px_crop is None else px_crop
+        py_crop = self.config["py_crop"] if py_crop is None else py_crop
         sample = self.extract_sample_image(
             img,
             row_crop=py_crop,
@@ -509,6 +508,9 @@ class RGBCamera(NeutronSampleCell, Driver):
                     filename=f"{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}-rgb-capture.png",
                     title="Detected neutron sample cell",
                     color_order="BGR",
+                    show_full_image_axes=True,
+                    full_image_x_label="px",
+                    full_image_y_label="py",
                     overlay_mask=(
                         None if background_processed is None else background_processed["mask"]
                     ),
@@ -523,8 +525,8 @@ _DEFAULT_CUSTOM_CONFIG = {
     "_classname": "AFL.automation.vision.RGBCamera.RGBCamera",
     "overrides": {
         "camera_index": 0,
-        "row_crop": [120, 250],
-        "col_crop": [220, 350],
+        "px_crop": [220, 350],
+        "py_crop": [120, 250],
         "hough_radii": 40,
         "save_path": "/home/afl642/rgb_camera/",
         "subtract_background": True,

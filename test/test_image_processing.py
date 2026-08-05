@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import matplotlib.pyplot as plt
 
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.shared.samplecells import NeutronSampleCell
@@ -83,7 +84,11 @@ def test_picamera_measurements_apply_rectangular_crop_only_when_both_bounds_give
 
 
 def test_rgb_camera_uses_image_processing_mixin_and_vision_loader(monkeypatch):
-    driver = RGBCamera(overrides={"background_capture_on_init": False})
+    driver = RGBCamera(overrides={
+        "background_capture_on_init": False,
+        "px_crop": [1, 5],
+        "py_crop": [1, 5],
+    })
     image = np.zeros((6, 6, 3), dtype=np.uint8)
     image[..., 0] = 30  # B
     image[..., 1] = 20  # G
@@ -91,14 +96,22 @@ def test_rgb_camera_uses_image_processing_mixin_and_vision_loader(monkeypatch):
 
     monkeypatch.setattr(driver, "find_circular_region", lambda image, radii: (3, 3, 2))
     processed = driver._process_image(image, px_crop=[1, 5], py_crop=[1, 5], hough_radii=2)
+    configured_crop = driver._process_image(image, hough_radii=2)
 
     assert isinstance(driver, (NeutronSampleCell, ImageProcessing, Driver))
     assert processed["avg_rgb"] == {"R": 10.0, "G": 20.0, "B": 30.0}
     assert processed["mask"].shape == (4, 4)
+    assert configured_crop["mask"].shape == (4, 4)
     assert "measure_mean_rgb" in driver.unqueued.functions
     assert "set_background" in driver.queued.functions
     assert RGBCamera.__module__ == "AFL.automation.vision.RGBCamera"
     assert _DEFAULT_CUSTOM_CONFIG["_classname"] == "AFL.automation.vision.RGBCamera.RGBCamera"
+    assert "px_crop" in driver.config
+    assert "py_crop" in driver.config
+    assert "row_crop" not in driver.config
+    assert "col_crop" not in driver.config
+    assert "row_crop" not in _DEFAULT_CUSTOM_CONFIG["overrides"]
+    assert "col_crop" not in _DEFAULT_CUSTOM_CONFIG["overrides"]
 
 
 def test_neutron_sample_cell_extracts_shared_crop_and_circle(monkeypatch):
@@ -118,3 +131,38 @@ def test_neutron_sample_cell_extracts_shared_crop_and_circle(monkeypatch):
     assert sample["mask"].shape == (4, 4)
     assert sample["row_crop"] == [1, 5]
     assert sample["col_crop"] == [1, 5]
+
+
+def test_rgb_geometry_plot_keeps_full_image_pixel_axes(monkeypatch, tmp_path):
+    driver = RGBCamera(overrides={"background_capture_on_init": False})
+    captured = {}
+
+    original_subplots = plt.subplots
+
+    def capture_subplots(*args, **kwargs):
+        figure, axes = original_subplots(*args, **kwargs)
+        captured["axes"] = axes
+        return figure, axes
+
+    monkeypatch.setattr(plt, "subplots", capture_subplots)
+    sample = {
+        "cropped_img": np.zeros((2, 2, 3), dtype=np.uint8),
+        "cx": 1,
+        "cy": 1,
+        "radius": 1,
+        "row_crop": [1, 3],
+        "col_crop": [2, 4],
+    }
+
+    driver.save_geometry_plot(
+        np.zeros((5, 5, 3), dtype=np.uint8),
+        sample,
+        save_path=tmp_path,
+        filename="geometry.png",
+        show_full_image_axes=True,
+    )
+
+    assert captured["axes"][0].get_xlabel() == "px"
+    assert captured["axes"][0].get_ylabel() == "py"
+    assert captured["axes"][0].get_xticks().size > 0
+    assert captured["axes"][0].get_yticks().size > 0

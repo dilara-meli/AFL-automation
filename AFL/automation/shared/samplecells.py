@@ -75,8 +75,15 @@ class NeutronSampleCell(ImageProcessing):
         title="Detected neutron sample-cell region",
         color_order="RGB",
         overlay_mask=None,
+        show_full_image_axes=True,
+        full_image_x_label="px",
+        full_image_y_label="py",
     ):
-        """Save a raw-frame crop and circular-ROI diagnostic plot."""
+        """Save a raw-frame crop and circular-ROI diagnostic plot.
+
+        When ``show_full_image_axes`` is true, retain the full-frame pixel
+        coordinate ticks and label its x/y axes with the supplied labels.
+        """
         import matplotlib.pyplot as plt
         from matplotlib.patches import Circle, Rectangle
 
@@ -96,7 +103,11 @@ class NeutronSampleCell(ImageProcessing):
             )
         )
         axes[0].set_title("Captured image with cell crop")
-        axes[0].axis("off")
+        if show_full_image_axes:
+            axes[0].set_xlabel(full_image_x_label)
+            axes[0].set_ylabel(full_image_y_label)
+        else:
+            axes[0].axis("off")
 
         axes[1].imshow(self._display_image(sample_image["cropped_img"], color_order))
         if overlay_mask is not None:
