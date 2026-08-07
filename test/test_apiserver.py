@@ -4,11 +4,15 @@ Tests for AFL.automation.APIServer core functionality
 import pytest
 import tempfile
 import json
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 from AFL.automation.APIServer import APIServer
+from AFL.automation.APIServer.Client import Client
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.APIServer.DummyDriver import DummyDriver
+from AFL.automation.APIServer.QueueDaemon import QueueDaemon
 
 
 class TestDriver:
@@ -118,6 +122,20 @@ class TestAPIServer:
         assert hasattr(server, 'app')
         assert server.app is not None
 
+    def test_init_logging_does_not_duplicate_file_handlers(self, tmp_path):
+        server = APIServer(name='LoggingServer', afl_home=tmp_path)
+        logfile = (tmp_path / 'LoggingServer.log').resolve()
+
+        server.init_logging()
+
+        handlers = [
+            handler for handler in server.app.logger.handlers
+            if isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename).resolve() == logfile
+        ]
+        assert len(handlers) == 1
+        assert handlers[0] in logging.getLogger('werkzeug').handlers
+
     def test_apiserver_create_queue(self, dummy_driver):
         """Test that APIServer can create a queue with a driver"""
         server = APIServer(name='TestServer')
@@ -126,6 +144,22 @@ class TestAPIServer:
         assert server.driver == dummy_driver
         assert dummy_driver.app is not None
         assert dummy_driver.app == server.app
+
+    def test_driver_log_level_configures_attached_server(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('AFL_HOME', str(tmp_path))
+        driver = DummyDriver(
+            name='ConfiguredLoggingDriver',
+            overrides={'log_level': 'WARNING'},
+        )
+        server = APIServer(name='ConfiguredLoggingServer', afl_home=tmp_path)
+
+        server.create_queue(driver, add_unqueued=False)
+
+        assert driver.config['log_level'] == 'WARNING'
+        assert server.app.logger.level == logging.WARNING
+
+        driver.set_config(log_level='ERROR')
+        assert server.app.logger.level == logging.ERROR
 
     def test_apiserver_apps_static_route(self):
         server = APIServer(name='TestServer')
@@ -183,6 +217,50 @@ class TestAPIServer:
 
         assert response.status_code == 200
         assert b'nested' in response.data
+
+
+@pytest.mark.parametrize(
+    ("entry_id", "has_tiled_backend", "expected_status"),
+    [
+        ("QD-123", True, "written"),
+        (None, True, "fallback"),
+        (None, False, "not_configured"),
+    ],
+)
+def test_queue_metadata_reports_tiled_write_outcome(
+    entry_id, has_tiled_backend, expected_status
+):
+    daemon = object.__new__(QueueDaemon)
+    daemon.data = SimpleNamespace(last_tiled_entry_id=entry_id)
+    if has_tiled_backend:
+        daemon.data.last_tiled_error = None
+    package = {"meta": {}}
+
+    daemon._attach_tiled_result_metadata(package)
+
+    assert package["meta"]["tiled_entry_id"] == entry_id
+    assert package["meta"]["tiled_status"] == expected_status
+
+
+def test_client_wait_returns_requested_task_tiled_entry_id(monkeypatch):
+    client = object.__new__(Client)
+    client.url = "http://afl.test"
+    client.headers = {}
+    queue_history = [
+        {"uuid": "QD-earlier", "meta": {"tiled_entry_id": "QD-earlier"}},
+        {"uuid": "QD-requested", "meta": {"tiled_entry_id": "QD-requested"}},
+        {"uuid": "QD-later", "meta": {"tiled_entry_id": "QD-later"}},
+    ]
+
+    class Response:
+        def json(self):
+            return [queue_history, [], []]
+
+    monkeypatch.setattr("requests.get", lambda *args, **kwargs: Response())
+
+    result = client.wait(target_uuid="QD-requested", first_check_delay=0)
+
+    assert result["tiled_entry_id"] == "QD-requested"
 
 
 def test_import_apiserver():

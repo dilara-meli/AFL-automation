@@ -1,15 +1,22 @@
 import requests
 import time
 import logging
+import re
+import threading
+import uuid
+from datetime import datetime, timezone
 
 import copy
 import hashlib
 import json
 import shutil
 from pathlib import Path
+from itertools import combinations_with_replacement
 
+import numpy as np
+import lazy_loader as lazy
 
-from math import ceil
+from math import ceil, floor
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2DeckWebAppMixin import OT2DeckWebAppMixin
 from AFL.automation.shared.utilities import listify
@@ -57,6 +64,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         "p300_single": "300ul",
         "p1000_single": "1000ul",
     }
+    DECK_STREAM_REQUEST_TIMEOUT_SECONDS = 15
     defaults = {}
     defaults["robot_ip"] = "127.0.0.1"  # Default to localhost, should be overridden
     defaults["robot_port"] = "31950"  # Default Opentrons HTTP API port
@@ -70,6 +78,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
     defaults["occupied_sample_locations"] = []  # Sample destinations already populated on deck
     defaults["prep_targets"] = []  # Persistent storage for prep target well locations
     defaults["tip_rack_offset"] = {"x": 0, "y": 0, "z": 0}  # Default offset for tip pickup/return at tiprack wells
+    defaults["enable_deck_stream"] = True
+    defaults["deck_stream_video_fps"] = 1
 
     def __init__(self, overrides=None):
         """Initialize the OT-2 HTTP driver.
@@ -103,6 +113,19 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         self.last_pipette = None
         self.current_tip = None
         self.modules = {}
+        self._deck_stream_thread = None
+        self._deck_stream_stop_event = None
+        self._deck_stream_lock = threading.Lock()
+        self._deck_stream_state = {
+            "running": False,
+            "current_window_started_at": None,
+            "last_completed_at": None,
+            "last_video_path": None,
+            "last_frame_count": 0,
+            "last_error": None,
+            "stopped_for_run_status": None,
+            "task_name": None,
+        }
             
         self.pipette_info = {}
 
@@ -118,8 +141,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
         # Initialize the robot connection
         self._initialize_robot()
-
-
         self.useful_links['View Deck'] = '/visualize_deck'
 
 
@@ -530,7 +551,12 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             )
 
     def _update_pipettes(self):
-        """Get information about attached pipettes and their settings"""
+        """Refresh cached metadata for pipettes attached to the robot.
+
+        This intentionally does not change transfer ranges.  Those settings
+        describe the pipettes loaded into the current run and are updated only
+        by :meth:`load_instrument` after a successful ``loadPipette`` command.
+        """
         try:
             if self.app is not None:
                 self.log_info("Fetching pipette information from robot")
@@ -545,10 +571,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
             pipettes_data = response.json()['data']
             self.pipette_info = {}
-
-            # Update min/max transfer values based on attached pipettes
-            self.min_transfer = None
-            self.max_transfer = None
 
             for pipette in pipettes_data:
                 mount = pipette['mount']
@@ -575,29 +597,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     ).get("value",150),
                     "channels": pipette.get("data",{}).get("channels", 1),
                         }
-                if pipette_id is None:
-                    continue
-                    
-                # Update global min/max transfer values
-                min_volume = self.pipette_info[mount]['min_volume']
-                max_volume = self.pipette_info[mount]['max_volume']
-
-                if (self.min_transfer is None) or (self.min_transfer > min_volume):
-                        self.min_transfer = min_volume
-                        if self.app is not None:
-                            self.log_info(
-                                f"Setting minimum transfer to {self.min_transfer}"
-                            )
-
-                if (self.max_transfer is None) or (self.max_transfer < max_volume):
-                    self.max_transfer = max_volume
-                    if self.app is not None:
-                        self.log_info(
-                            f"Setting maximum transfer to {self.max_transfer}"
-                        )
-            
             if self.app is not None:
-                self.log_info(f"Pipette information updated: {self.pipette_info}")
+                self.log_debug(f"Pipette information updated: {self.pipette_info}")
 
         except Exception as e:
             raise RuntimeError(f"Error getting pipettes: {str(e)}")
@@ -688,6 +689,279 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         """
         return self.config["prep_targets"].pop(0)
 
+    def _task_video_settings(self):
+        """Resolve and validate settings used by an opted-in task video."""
+        output_dir = Path(getattr(self, "path", Path.cwd())) / "ot2_deck_stream"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            video_fps = float(self.config["deck_stream_video_fps"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("task video FPS must be numeric") from exc
+
+        if video_fps <= 0:
+            raise ValueError("task video FPS must be positive")
+
+        return {
+            "directory": output_dir,
+            "capture_period_seconds": 1 / video_fps,
+            "video_fps": video_fps,
+            "request_timeout": self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS,
+        }
+
+    @staticmethod
+    def _deck_stream_cv2():
+        """Load OpenCV only when deck-stream video encoding is requested."""
+        try:
+            return lazy.load("cv2", require="AFL-automation[vision]")
+        except Exception as exc:
+            raise ImportError(
+                "opencv-python is required for deck stream video encoding. "
+                "Install with: pip install AFL-automation[vision]."
+            ) from exc
+
+    def _ensure_deck_lights_on(self):
+        """Turn on OT-2 deck lights when deck-stream recording needs them."""
+        try:
+            light_state_response = requests.get(
+                url=f"{self.base_url}/robot/lights",
+                headers=self.headers,
+                timeout=self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS,
+            )
+            light_state_response.raise_for_status()
+            lights_on = bool(light_state_response.json().get("on", False))
+            if lights_on:
+                return False
+
+            self.log_info("Turning on OT-2 deck lights for deck stream")
+            lights_on_response = requests.post(
+                url=f"{self.base_url}/robot/lights",
+                headers=self.headers,
+                json={"on": True},
+                timeout=self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS,
+            )
+            lights_on_response.raise_for_status()
+            return True
+        except (requests.exceptions.RequestException, ValueError, AttributeError) as exc:
+            self.log_warning(f"Unable to ensure OT-2 deck lights are on: {exc}")
+            return None
+
+    def _capture_deck_picture(self, cv2_module, timeout):
+        """Request and decode one image from the OT-2 deck camera."""
+        response = requests.post(
+            url=f"{self.base_url}/camera/picture",
+            headers=self.headers,
+            timeout=timeout,
+        )
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            detail = response.text.strip()
+            if detail:
+                detail = detail[:1000]
+                raise RuntimeError(
+                    "OT-2 deck camera request failed "
+                    f"({response.status_code}): {detail}"
+                ) from exc
+            raise
+        if not response.content:
+            raise RuntimeError("OT-2 deck camera returned an empty image")
+        image = cv2_module.imdecode(
+            np.frombuffer(response.content, dtype=np.uint8),
+            cv2_module.IMREAD_COLOR,
+        )
+        if image is None:
+            raise RuntimeError("OT-2 deck camera returned an undecodable image")
+        return image
+
+    def _record_deck_stream_window(self, settings, stop_event=None, stop_reason_callback=None):
+        """Collect one configured capture window and atomically replace its video."""
+        cv2_module = self._deck_stream_cv2()
+        started_at = datetime.now(timezone.utc)
+        duration_seconds = settings.get("duration_seconds")
+        deadline = (
+            None
+            if duration_seconds is None
+            else time.monotonic() + duration_seconds
+        )
+        frames = []
+        first_error = None
+
+        with self._deck_stream_lock:
+            self._deck_stream_state.update({
+                "current_window_started_at": started_at.isoformat(),
+                "last_error": None,
+            })
+
+        while deadline is None or time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if stop_reason_callback is not None:
+                stop_reason = stop_reason_callback()
+                if stop_reason is not None:
+                    with self._deck_stream_lock:
+                        self._deck_stream_state["stopped_for_run_status"] = stop_reason
+                    self.log_warning(f"Deck stream stopped: {stop_reason}")
+                    break
+            try:
+                frame = self._capture_deck_picture(cv2_module, settings["request_timeout"])
+                if frames and frame.shape[:2] != frames[0].shape[:2]:
+                    frame = cv2_module.resize(frame, (frames[0].shape[1], frames[0].shape[0]))
+                frames.append(frame)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = str(exc)
+                self.log_warning(f"Deck stream picture capture failed: {exc}")
+
+            remaining = (
+                settings["capture_period_seconds"]
+                if deadline is None
+                else deadline - time.monotonic()
+            )
+            if remaining <= 0:
+                break
+            if stop_event is None:
+                time.sleep(min(settings["capture_period_seconds"], remaining))
+            elif stop_event.wait(min(settings["capture_period_seconds"], remaining)):
+                break
+
+        if not frames:
+            error = first_error or "No deck camera images were captured"
+            with self._deck_stream_lock:
+                self._deck_stream_state.update({
+                    "current_window_started_at": None,
+                    "last_frame_count": 0,
+                    "last_error": error,
+                })
+            raise RuntimeError(error)
+
+        output_path = settings.get("output_path", settings["directory"] / "deck_stream.mp4")
+        temporary_path = settings["directory"] / f".deck_stream-{uuid.uuid4().hex}.mp4"
+        writer = cv2_module.VideoWriter(
+            str(temporary_path),
+            cv2_module.VideoWriter_fourcc(*"mp4v"),
+            settings["video_fps"],
+            (frames[0].shape[1], frames[0].shape[0]),
+        )
+        try:
+            try:
+                if not writer.isOpened():
+                    raise RuntimeError(f"Unable to open deck stream video writer for {temporary_path}")
+                for frame in frames:
+                    writer.write(frame)
+            finally:
+                writer.release()
+            if not temporary_path.exists():
+                raise RuntimeError("Deck stream video writer did not create an output file")
+            temporary_path.replace(output_path)
+        except Exception:
+            if temporary_path.exists():
+                temporary_path.unlink()
+            raise
+        completed_at = datetime.now(timezone.utc).isoformat()
+        with self._deck_stream_lock:
+            self._deck_stream_state.update({
+                "current_window_started_at": None,
+                "last_completed_at": completed_at,
+                "last_video_path": str(output_path),
+                "last_frame_count": len(frames),
+                "last_error": first_error,
+            })
+        return {
+            "path": str(output_path),
+            "frame_count": len(frames),
+            "started_at": started_at.isoformat(),
+            "completed_at": completed_at,
+        }
+
+    def _task_video_stop_reason(self):
+        """Return a reason to finalize a task video when its OT-2 run pauses."""
+        run_id = getattr(self, "run_id", None)
+        if run_id is None:
+            return None
+        try:
+            response = requests.get(
+                url=f"{self.base_url}/runs/{run_id}",
+                headers=self.headers,
+                timeout=self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            run_status = response.json().get("data", {}).get("status")
+        except (requests.exceptions.RequestException, ValueError, AttributeError) as exc:
+            self.log_warning(f"Unable to check OT-2 run {run_id} for task video: {exc}")
+            return None
+        if run_status in {"paused", "failed", "error"}:
+            return f"OT-2 run {run_id} is {run_status}"
+        return None
+
+    def _deck_stream_worker(self, settings):
+        """Record one task's video until the owning task signals completion."""
+        stop_event = self._deck_stream_stop_event
+        try:
+            self._record_deck_stream_window(
+                settings,
+                stop_event=stop_event,
+                stop_reason_callback=self._task_video_stop_reason,
+            )
+        except Exception as exc:
+            with self._deck_stream_lock:
+                self._deck_stream_state["last_error"] = str(exc)
+                self._deck_stream_state["current_window_started_at"] = None
+            self.log_error(f"Deck stream task video failed: {exc}")
+        with self._deck_stream_lock:
+            self._deck_stream_state["running"] = False
+            self._deck_stream_state["current_window_started_at"] = None
+
+    def _start_task_video(self, task_name, output_filename=None):
+        """Start recording a video dedicated to one opted-in driver task."""
+        if not self.config.get("enable_deck_stream", False):
+            return False
+        with self._deck_stream_lock:
+            if self._deck_stream_thread is not None and self._deck_stream_thread.is_alive():
+                return False
+        self._ensure_deck_lights_on()
+        settings = self._task_video_settings()
+        if output_filename is None:
+            started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            safe_task_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_name)
+            output_filename = f"deck_stream_{safe_task_name}_{started_at}.mp4"
+        settings.update({
+            "duration_seconds": None,
+            "output_path": settings["directory"] / output_filename,
+        })
+        self.log_info(f"Deck stream task video: {settings['output_path']}")
+        with self._deck_stream_lock:
+            if self._deck_stream_thread is not None and self._deck_stream_thread.is_alive():
+                return False
+            self._deck_stream_stop_event = threading.Event()
+            self._deck_stream_state["running"] = True
+            self._deck_stream_state["stopped_for_run_status"] = None
+            self._deck_stream_state["task_name"] = task_name
+            self._deck_stream_thread = threading.Thread(
+                target=self._deck_stream_worker,
+                args=(settings,),
+                name="OT2HTTPDriver-deck-stream",
+                daemon=True,
+            )
+            self._deck_stream_thread.start()
+        return True
+
+    def _finish_task_video(self):
+        """Stop and finalize the current task video without disabling capture."""
+        with self._deck_stream_lock:
+            stop_event = self._deck_stream_stop_event
+            stream_thread = self._deck_stream_thread
+            if stop_event is not None:
+                stop_event.set()
+        if stream_thread is not None and stream_thread is not threading.current_thread():
+            stream_thread.join(timeout=self.DECK_STREAM_REQUEST_TIMEOUT_SECONDS + 2)
+        with self._deck_stream_lock:
+            if stream_thread is None or not stream_thread.is_alive():
+                self._deck_stream_thread = None
+                self._deck_stream_stop_event = None
+                self._deck_stream_state["running"] = False
+            self._deck_stream_state["task_name"] = None
+
     def status(self):
         """Return human-readable OT-2 status lines.
 
@@ -736,6 +1010,30 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 status.append(f"Labware in slot {slot}: {name}")
         except Exception:
             print(self.config["loaded_labware"])
+
+        if hasattr(self, "_deck_stream_lock"):
+            with self._deck_stream_lock:
+                deck_stream_state = dict(self._deck_stream_state)
+        else:
+            deck_stream_state = {
+                "running": False,
+                "last_video_path": None,
+                "last_error": None,
+            }
+        status.append(
+            "Deck stream: "
+            f"{'running' if deck_stream_state['running'] else 'stopped'} "
+            f"(task-scoped, enabled={bool(self.config.get('enable_deck_stream', False))})"
+        )
+        if deck_stream_state["last_video_path"] is not None:
+            status.append(f"Deck stream video: {deck_stream_state['last_video_path']}")
+        if deck_stream_state["last_error"] is not None:
+            status.append(f"Deck stream error: {deck_stream_state['last_error']}")
+        if deck_stream_state.get("stopped_for_run_status") is not None:
+            status.append(
+                "Deck stream stopped to preserve video: "
+                f"{deck_stream_state['stopped_for_run_status']}"
+            )
         return status
 
     @Driver.quickbar(
@@ -933,6 +1231,66 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         assert well in self.config["loaded_labware"][slot][2]['definition']['wells'].keys(), f"Well {well} is not a valid well for slot {slot}, {self.config['loaded_labware'][slot][2]['definition']['metadata']['displayName']}"
         
         return wells
+
+    @Driver.unqueued()
+    def get_available_wells(self, slot):
+        """Return unoccupied well locations for the labware loaded in a slot.
+
+        Parameters
+        ----------
+        slot : str or int
+            OT-2 deck slot containing loaded labware.
+
+        Returns
+        -------
+        list of str
+            Deck locations in ``slot+well`` form for wells not listed in
+            ``occupied_sample_locations``.
+
+        Raises
+        ------
+        ValueError
+            If no labware is loaded in the requested slot.
+        """
+        slot = str(slot).strip()
+        loaded_labware = self.config.get("loaded_labware", {})
+
+        if slot not in loaded_labware:
+            raise ValueError(f"No labware loaded in slot {slot}")
+
+        labware_def = loaded_labware[slot][2]["definition"]
+        well_names = list(labware_def.get("wells", {}).keys())
+
+        def well_sort_key(well_name):
+            match = re.fullmatch(r"([A-Za-z]+)(\d+)", str(well_name).strip())
+            if match is None:
+                return (str(well_name), 0)
+            row, col = match.groups()
+            return (row.upper(), int(col))
+
+        normalize_locations = getattr(self, "_normalize_locations", None)
+        occupied_locations = self.config.get("occupied_sample_locations", [])
+        if normalize_locations is not None:
+            occupied = set(normalize_locations(occupied_locations))
+        else:
+            occupied = {
+                str(location).strip().upper()
+                for location in occupied_locations
+                if location is not None
+            }
+
+        available = []
+        for well_name in sorted(well_names, key=well_sort_key):
+            location = f"{slot}{well_name}"
+            normalized_location = (
+                normalize_locations([location])[0]
+                if normalize_locations is not None
+                else location.strip().upper()
+            )
+            if normalized_location not in occupied:
+                available.append(location)
+        return available
+
     def _check_cmd_success(self, response):
         """Raise when an HTTP command response indicates failure.
 
@@ -1544,7 +1902,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             )
 
     def _update_pipette_ranges(self):
-        """Update helper ranges used for transfer splitting across pipettes."""
+        """Update transfer ranges after loading an instrument into this run."""
+        self.min_transfer = None
+        self.max_transfer = None
         self.min_largest_pipette = None
         self.max_smallest_pipette = None
 
@@ -1561,6 +1921,15 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 mount: info.get("max_volume", 0)
                 for mount, info in available_pipettes.items()
             }
+
+            valid_min_vols = [value for value in min_vols.values() if value is not None]
+            valid_max_vols = [value for value in max_vols.values() if value is not None]
+            if valid_min_vols:
+                self.min_transfer = min(valid_min_vols)
+                self.log_info(f"Setting minimum transfer to {self.min_transfer}")
+            if valid_max_vols:
+                self.max_transfer = max(valid_max_vols)
+                self.log_info(f"Setting maximum transfer to {self.max_transfer}")
 
             # Find the smallest and largest pipettes
             if max_vols:
@@ -1700,6 +2069,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         fast_mixing=False,
         touch_tip=False,
         tip_location=None,
+        tip_locations=None,
         **kwargs,
     ):
         """Transfer liquid between two deck locations.
@@ -1763,6 +2133,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             If ``True``, touch the tip to the destination well after dispense.
         tip_location : str, optional
             Explicit tip location to use, for example ``"1A1"``.
+        tip_locations : sequence of str, optional
+            Candidate explicit tip locations.  When a transfer plan uses more
+            than one pipette mount, the matching candidate is used for each
+            mount.
         **kwargs
             Additional compatibility aliases such as ``blowout`` and
             ``touchTip``.
@@ -1792,8 +2166,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         ...     tip_rack_offset={"x": 0, "y": 0, "z": -1},
         ... )
         """
-        self.log_info(f"Transferring {volume}uL from {source} to {dest}")
-
         if drop_tip and return_tip:
             raise ValueError("Only one of drop_tip and return_tip can be True")
 
@@ -1813,6 +2185,26 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "status": "skipped_nonpositive_volume",
             }
 
+        if self.min_transfer is not None and volume_ul < self.min_transfer:
+            self.log_info(
+                "Skipping transfer with volume "
+                f"{volume_ul}uL below the configured pipette minimum "
+                f"of {self.min_transfer}uL from {source} to {dest}"
+            )
+            return {
+                "source": source,
+                "dest": dest,
+                "requested_volume_ul": volume_ul,
+                "minimum_configured_pipette_volume_ul": self.min_transfer,
+                "subtransfers_ul": [],
+                "status": "skipped_below_minimum_pipette_volume",
+            }
+
+        # The OT-2 protocol accepts whole-microlitre transfer aliquots only.
+        # Keep this boundary normalization here so direct API calls cannot send
+        # fractional command volumes even when they bypass MassBalance.
+        volume_ul = int(floor(volume_ul + 0.5))
+
         self._ensure_run_exists()
 
         if aspirate_rate is not None:
@@ -1821,7 +2213,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         if dispense_rate is not None:
             self.set_dispense_rate(dispense_rate)
 
-        pipette = self.get_pipette(volume_ul)
+        transfer_plan = self._plan_transfer(volume_ul)
+        pipette = transfer_plan[0]["pipette"]
         pipette_mount = pipette["mount"]
         resolve_tip_rack_offset = getattr(self, "_resolve_tip_rack_offset", None)
         if resolve_tip_rack_offset is not None:
@@ -1833,18 +2226,71 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             resolved_tip_rack_offset = dict(self.config.get("tip_rack_offset", {"x": 0, "y": 0, "z": 0}))
         else:
             resolved_tip_rack_offset = dict(tip_rack_offset)
-        requested_tip = None
-        if tip_location is not None:
-            tip_location_str = str(tip_location).strip().upper()
-            resolve_tip_location = getattr(self, "_resolve_tip_location", None)
-            if resolve_tip_location is not None:
-                requested_tip = resolve_tip_location(pipette_mount, tip_location_str)
+        requested_tips_by_mount = {}
+        raw_tip_locations = tip_locations if tip_locations is not None else tip_location
+        if raw_tip_locations is not None:
+            use_per_mount_tip_candidates = tip_locations is not None or not isinstance(
+                raw_tip_locations, str
+            )
+            if isinstance(raw_tip_locations, str):
+                tip_location_candidates = [raw_tip_locations]
             else:
-                requested_tip = {
-                    "labware_id": self.config["loaded_labware"][str(tip_location_str[0])][0],
-                    "well_name": tip_location_str[1:],
-                }
-            requested_tip["location"] = tip_location_str
+                tip_location_candidates = list(raw_tip_locations)
+            tip_location_candidates = [
+                str(location).strip().upper()
+                for location in tip_location_candidates
+            ]
+            resolve_tip_location = getattr(self, "_resolve_tip_location", None)
+            if use_per_mount_tip_candidates:
+                planned_mounts = []
+                for step in transfer_plan:
+                    mount = step["pipette"]["mount"]
+                    if mount not in planned_mounts:
+                        planned_mounts.append(mount)
+            else:
+                # Preserve the established single-tip behavior: the explicit
+                # location must be valid for the plan's initial pipette.
+                planned_mounts = [pipette_mount]
+
+            used_tip_locations = set()
+            for mount in planned_mounts:
+                for candidate in tip_location_candidates:
+                    if candidate in used_tip_locations:
+                        continue
+                    try:
+                        if resolve_tip_location is not None:
+                            requested_tip = resolve_tip_location(mount, candidate)
+                        else:
+                            requested_tip = {
+                                "labware_id": self.config["loaded_labware"][str(candidate[0])][0],
+                                "well_name": candidate[1:],
+                            }
+                        requested_tip["location"] = candidate
+                        requested_tips_by_mount[mount] = requested_tip
+                        used_tip_locations.add(candidate)
+                        break
+                    except ValueError:
+                        continue
+
+            if pipette_mount not in requested_tips_by_mount:
+                raise ValueError(
+                    f"Requested tip location {tip_location_candidates[0]} is not available"
+                )
+
+            # A list of configured stock tips is an explicit mount-to-tip
+            # assignment.  Never silently substitute a general tip when a
+            # planned mount has no compatible configured candidate.
+            if use_per_mount_tip_candidates and len(tip_location_candidates) > 1:
+                missing_mounts = [
+                    mount for mount in planned_mounts if mount not in requested_tips_by_mount
+                ]
+                if missing_mounts:
+                    raise ValueError(
+                        "No configured tip location is available for planned pipette mount(s): "
+                        + ", ".join(missing_mounts)
+                    )
+
+        requested_tip = requested_tips_by_mount.get(pipette_mount)
 
         pipette_id = None
         for mount, data in self.pipette_info.items():
@@ -1875,11 +2321,21 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         elif to_center:
             dest_position = "center"
 
-        split_up_transfers = getattr(self, "_split_up_transfers", None)
-        if split_up_transfers is not None:
-            transfers = split_up_transfers(volume_ul)
-        else:
-            transfers = [volume_ul]
+        transfers = [step["volume_ul"] for step in transfer_plan]
+        for transfer_index, step in enumerate(transfer_plan, start=1):
+            planned_pipette = step["pipette"]
+            sub_volume = step["volume_ul"]
+            planned_tip = requested_tips_by_mount.get(planned_pipette["mount"])
+            tip_suffix = (
+                f", tip_location={planned_tip['location']}"
+                if planned_tip is not None
+                else ""
+            )
+            self.log_info(
+                f"Pipetting transfer plan {transfer_index}/{len(transfers)}: "
+                f"{source} -> {dest} using {planned_pipette.get('name')} "
+                f"({planned_pipette['mount']}), {sub_volume:g} uL{tip_suffix}"
+            )
         transfer_record = {
             "source": source,
             "dest": dest,
@@ -1889,6 +2345,15 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             "pipette_mount": pipette_mount,
             "pipette_name": pipette.get("name"),
             "pipette_id": pipette_id,
+            "pipette_plan": [
+                {
+                    "mount": step["pipette"]["mount"],
+                    "name": step["pipette"].get("name"),
+                    "pipette_id": step["pipette"].get("pipette_id"),
+                    "volume_ul": step["volume_ul"],
+                }
+                for step in transfer_plan
+            ],
             "source_well": {
                 "labware_id": source_well["labwareId"],
                 "well_name": source_well["wellName"],
@@ -1922,13 +2387,35 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "fast_mixing": fast_mixing,
                 "touch_tip": touch_tip,
                 "tip_location": tip_location,
+                "tip_locations": tip_locations,
             },
             "status": "executed",
         }
-        if requested_tip is not None:
-            transfer_record["requested_tip"] = requested_tip.copy()
+        initial_requested_tip = requested_tip
+        if initial_requested_tip is not None:
+            transfer_record["requested_tip"] = initial_requested_tip.copy()
+        if requested_tips_by_mount:
+            transfer_record["requested_tips"] = {
+                mount: tip.copy() for mount, tip in requested_tips_by_mount.items()
+            }
 
-        for i, sub_volume in enumerate(transfers):
+        for i, step in enumerate(transfer_plan):
+            pipette = step["pipette"]
+            pipette_mount = pipette["mount"]
+            pipette_id = pipette["pipette_id"]
+            sub_volume = step["volume_ul"]
+            if resolve_tip_rack_offset is not None:
+                resolved_tip_rack_offset = resolve_tip_rack_offset(
+                    tip_rack_offset,
+                    mount=pipette_mount,
+                )
+            elif tip_rack_offset is None:
+                resolved_tip_rack_offset = dict(
+                    self.config.get("tip_rack_offset", {"x": 0, "y": 0, "z": 0})
+                )
+            else:
+                resolved_tip_rack_offset = dict(tip_rack_offset)
+            requested_tip = requested_tips_by_mount.get(pipette_mount)
             if sub_volume <= 0:
                 self.log_warning(
                     f"Skipping nonpositive sub-transfer volume {sub_volume}uL from {source} to {dest}"
@@ -2289,7 +2776,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         return transfer_record
 
     def _split_up_transfers(self, volume):
-        """Split a requested transfer volume into pipette-safe subtransfers.
+        """Split a requested transfer using the multi-pipette transfer planner.
 
         Parameters
         ----------
@@ -2301,19 +2788,131 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         list of float
             One or more subtransfer volumes.
         """
+        return [step["volume_ul"] for step in self._plan_transfer(volume)]
+
+    def _available_pipette_options(self):
+        """Return loaded pipettes with the volume limits needed for planning."""
+        options = []
+        for mount, pipette_data in self._get_active_pipettes().items():
+            if not pipette_data or pipette_data.get("id") is None:
+                continue
+            min_volume = float(pipette_data.get("min_volume", 1))
+            max_volume = float(pipette_data.get("max_volume", 300))
+            if min_volume <= 0 or max_volume < min_volume:
+                continue
+            options.append({
+                "mount": mount,
+                "min_volume": min_volume,
+                "max_volume": max_volume,
+                "name": pipette_data.get("name"),
+                "model": pipette_data.get("model"),
+                "channels": pipette_data.get("channels", 1),
+                "pipette_id": pipette_data.get("id"),
+            })
+        return options
+
+    @staticmethod
+    def _typical_pipette_error(pipette, volume_ul):
+        """Estimate a conservative absolute error from typical OT-2 tolerances.
+
+        The coefficients are the Gen1 white-paper random and systematic error
+        fits retained from the legacy OT2 driver.  They are used solely to
+        choose between plans with the same number of transfers; they are not a
+        substitute for a pipette's calibration certificate.
+        """
+        profiles = {
+            10: (0.00491803278688525, 0.0737704918032787,
+                 0.00491803278688525, 0.173770491803279),
+            20: (0.00491803278688525, 0.0737704918032787,
+                 0.00491803278688525, 0.173770491803279),
+            50: (-0.000983606557377049, 0.226229508196721,
+                 0.0055327868852459, 0.227459016393443),
+            300: (0.00168032786885246, 0.381147540983607,
+                  0.00327868852459016, 0.875409836065574),
+            1000: (0.000573770491803279, 0.860655737704918,
+                   0.00549180327868852, 1.73770491803279),
+        }
+        nominal_size = min(profiles, key=lambda size: abs(size - pipette["max_volume"]))
+        random_a, random_b, systematic_a, systematic_b = profiles[nominal_size]
+        return abs(random_a * volume_ul + random_b) + abs(
+            systematic_a * volume_ul + systematic_b
+        )
+
+    def _plan_transfer(self, volume):
+        """Plan the most accurate practical aliquots across loaded pipettes.
+
+        Plans within four steps of the mathematical minimum are considered so
+        that a small remainder can use a more accurate small-volume pipette.
+        Expected error is minimized first; transfer count then breaks ties.
+        """
         volume_ul = float(volume)
         if volume_ul <= 0:
             return []
-        if self.max_transfer is None or volume_ul <= self.max_transfer:
-            return [volume_ul]
 
-        transfers = []
-        remaining = volume_ul
-        while remaining > 0:
-            sub_volume = min(self.max_transfer, remaining)
-            transfers.append(float(sub_volume))
-            remaining -= sub_volume
-        return transfers
+        pipettes = self._available_pipette_options()
+        if not pipettes:
+            raise ValueError("No suitable loaded pipettes found!")
+
+        min_steps = max(1, ceil(volume_ul / max(p["max_volume"] for p in pipettes)))
+        max_steps = ceil(volume_ul / min(p["min_volume"] for p in pipettes))
+        practical_max_steps = min(max_steps, min_steps + 4)
+        best_plan = None
+        for transfer_count in range(min_steps, practical_max_steps + 1):
+            for selected_indices in combinations_with_replacement(
+                range(len(pipettes)), transfer_count
+            ):
+                selected = [pipettes[index] for index in selected_indices]
+                min_total = sum(pipette["min_volume"] for pipette in selected)
+                max_total = sum(pipette["max_volume"] for pipette in selected)
+                if volume_ul < min_total - 1e-9 or volume_ul > max_total + 1e-9:
+                    continue
+
+                volumes = [pipette["min_volume"] for pipette in selected]
+                remaining = volume_ul - min_total
+                # Allocate additional volume to the pipette with the lowest
+                # typical incremental error, using larger pipettes as a stable
+                # tie-breaker to keep the plan compact.
+                ordered = sorted(
+                    range(len(selected)),
+                    key=lambda index: (
+                        self._typical_pipette_error(selected[index], selected[index]["min_volume"] + 1)
+                        - self._typical_pipette_error(selected[index], selected[index]["min_volume"]),
+                        -selected[index]["max_volume"],
+                    ),
+                )
+                for index in ordered:
+                    added_volume = min(
+                        remaining,
+                        selected[index]["max_volume"] - volumes[index],
+                    )
+                    volumes[index] += added_volume
+                    remaining -= added_volume
+                    if remaining <= 1e-9:
+                        break
+                if remaining > 1e-9:
+                    continue
+
+                plan = [
+                    {"pipette": pipette, "volume_ul": float(aliquot)}
+                    for pipette, aliquot in zip(selected, volumes)
+                ]
+                score = sum(
+                    self._typical_pipette_error(step["pipette"], step["volume_ul"])
+                    for step in plan
+                )
+                plan_key = (
+                    score,
+                    transfer_count,
+                    tuple((step["pipette"]["mount"], step["volume_ul"]) for step in plan),
+                )
+                if best_plan is None or plan_key < best_plan[0]:
+                    best_plan = (plan_key, plan)
+        if best_plan is not None:
+            return best_plan[1]
+
+        raise ValueError(
+            f"Cannot plan {volume_ul} uL within the volume limits of the loaded pipettes."
+        )
 
     def _resolve_tip_rack_offset(self, tip_rack_offset=None, mount=None):
         """Resolve the configured tip-rack offset mapping.
@@ -2385,7 +2984,15 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             and self.current_tip.get("labware_id") == labware_id
             and self.current_tip.get("well_name") == well_name
         )
-        if (labware_id, well_name) not in available and not current_tip_matches:
+        # PersistentConfig restores JSON arrays as lists, while newly-created
+        # entries in this process are commonly tuples.  Compare the pair's
+        # contents instead of its container type so persisted tip state is
+        # usable after a driver restart.
+        tip_is_available = any(
+            len(entry) == 2 and entry[0] == labware_id and entry[1] == well_name
+            for entry in available
+        )
+        if not tip_is_available and not current_tip_matches:
             raise ValueError(f"Requested tip location {normalized} is not available")
         return {"labware_id": labware_id, "well_name": well_name}
 
@@ -2640,11 +3247,21 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         """
         available = list(self.config.get("available_tips", {}).get(mount, []))
         requested = (labware_id, well_name)
-        if requested not in available:
+        requested_index = next(
+            (
+                index
+                for index, entry in enumerate(available)
+                if len(entry) == 2
+                and entry[0] == labware_id
+                and entry[1] == well_name
+            ),
+            None,
+        )
+        if requested_index is None:
             raise ValueError(
                 f"Requested tip location {well_name} in {labware_id} is not available for {mount} mount"
             )
-        available.remove(requested)
+        del available[requested_index]
         self.config.setdefault("available_tips", {})[mount] = available
         return requested
 
@@ -2889,9 +3506,6 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             of required transfers.
         """
         self.log_debug(f"Looking for a pipette for volume {volume}")
-        # Make sure we have the latest pipette information
-        self._update_pipettes()
-
         pipettes = []
         for mount, pipette_data in self._get_active_pipettes().items():
             if not pipette_data:
@@ -3176,8 +3790,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         
     def set_tempmodule_temperature(
         self,
-        module_id,
         temperature_c,
+        module_id = None,
         hold_time = 0.0,
         wait = True,
         ):
@@ -3188,34 +3802,36 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         tuple
             Current and target temperatures after stabilization.
         """
-        self.log_info(f"Setting temperature module to {temperature_c}°C")
+        round_temperature_c = round(float(temperature_c))
+        self.log_info(f"Setting temperature module to {round_temperature_c}°C")
         if module_id is None:
             module_id = self._find_module_by_type("tempdeck")
         self._execute_atomic_command(
             "temperatureModule/setTargetTemperature",
-            params={"moduleId": module_id, "celsius": float(temperature_c)},
+            params={"moduleId": module_id, "celsius": round_temperature_c},
             wait_until_complete=wait,
         )
+
+        # Some OT-2 API versions report no target temperature immediately
+        # after setting it.  
         time.sleep(60) # wait for a minute before querying status
         data = self.get_tempmodule_status(log=False)
-        # Some OT-2 API versions report no target temperature immediately
-        # after setting it.  Return in that case so callers can perform their
-        # own equilibration hold instead of crashing on float - None.
+
         current_temp = data.get("currentTemp")
         target_temp = data.get("targetTemp")
         if current_temp is None or target_temp is None:
-            self.log_warning(
+            self.log_debug(
                 "Temperature module did not report both currentTemp and targetTemp; "
                 "skipping driver-side stabilization wait."
             )
         else:
             while abs(current_temp - target_temp) > 1.0:
-                time.sleep(5)
+                time.sleep(30)
                 data = self.get_tempmodule_status(log=False)
                 current_temp = data.get("currentTemp")
                 target_temp = data.get("targetTemp")
                 if current_temp is None or target_temp is None:
-                    self.log_warning(
+                    self.log_debug(
                         "Temperature module stopped reporting currentTemp or targetTemp; "
                         "skipping driver-side stabilization wait."
                     )
@@ -3228,7 +3844,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
         return current_temp, target_temp
 
-    def deactivate_tempmodule(self, module_id, timeout_s=120, wait=True):
+    def deactivate_tempmodule(self, module_id=None, timeout_s=120, wait=True):
         """Deactivate a temperature module.
 
         Returns

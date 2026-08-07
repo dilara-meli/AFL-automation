@@ -78,6 +78,20 @@ class StubOT2Prepare(OT2Prepare):
         }
 
 
+def test_loaded_pipette_minimums_use_cached_metadata_without_refreshing():
+    driver = StubOT2Prepare()
+    refresh_calls = []
+
+    def unexpected_refresh():
+        refresh_calls.append(True)
+        raise AssertionError("preparation must not refresh robot pipette metadata")
+
+    driver._update_pipettes = unexpected_refresh
+
+    assert driver._loaded_pipette_minimum_volumes() == [1.0, 20.0]
+    assert refresh_calls == []
+
+
 def test_transfer_stage_records_prepare_execution_metadata():
     driver = StubOT2Prepare()
 
@@ -196,6 +210,28 @@ def test_execute_preparation_marks_destination_occupied():
     assert driver.config["occupied_sample_locations"] == ["5A1"]
 
 
+@pytest.mark.parametrize(
+    "tip_error",
+    [
+        "Requested tip location 6A1 is not available",
+        "Configured tip location 5A1 does not match right mount",
+    ],
+)
+def test_execute_preparation_raises_for_unusable_stock_tip(tip_error):
+    driver = StubOT2Prepare()
+
+    def raise_tip_error(*args, **kwargs):
+        raise ValueError(tip_error)
+
+    driver.transfer = raise_tip_error
+    balanced_target = SimpleNamespace(protocol=[SimpleNamespace(source="1A1", volume=50.0)])
+
+    with pytest.raises(ValueError, match="tip location"):
+        driver.execute_preparation({}, balanced_target, "5A1")
+
+    assert driver.config["occupied_sample_locations"] == []
+
+
 def test_execute_preparation_orders_stock_sources_by_stock_name_and_logs_actions(capsys):
     driver = StubOT2Prepare()
     driver.config["deck"] = {
@@ -220,6 +256,27 @@ def test_execute_preparation_orders_stock_sources_by_stock_name_and_logs_actions
     assert debug_output.count("[DEBUG] Pipette action:") == 3
     assert "source='1A1'" in debug_output
     assert "source='1A3'" in debug_output
+    assert "tip_location=None" in debug_output
+    assert debug_output.index("[INFO] Transfer requested:") < debug_output.index(
+        "[DEBUG] Pipette action:"
+    )
+
+
+def test_execute_preparation_logs_selected_stock_tip_location(capsys):
+    driver = StubOT2Prepare()
+    driver.config["deck"] = {"1A1": "Water"}
+    driver.config["stock_tip_locations"] = {"Water": ["1A1"]}
+    balanced_target = SimpleNamespace(
+        protocol=[SimpleNamespace(source="1A1", volume=50.0)]
+    )
+
+    assert driver.execute_preparation({}, balanced_target, "5A1") is True
+
+    output = capsys.readouterr().out
+    assert "tip_location='1A1'" in output
+    assert "[INFO] Transfer requested: source='1A1', dest='5A1', volume_ul=50.0" in output
+    assert driver.transfer_calls[0]["kwargs"]["drop_tip"] is False
+    assert driver.transfer_calls[0]["kwargs"]["return_tip"] is True
 
 
 def test_resolve_destination_rejects_occupied_sample_location():

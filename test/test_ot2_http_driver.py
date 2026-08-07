@@ -1,6 +1,12 @@
 import pytest
 from pathlib import Path
 import json
+import logging
+import threading
+from types import SimpleNamespace
+
+import numpy as np
+import requests
 
 from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
 
@@ -50,17 +56,6 @@ class StubOT2HTTPDriver(OT2HTTPDriver):
         self.pipette_info = {
             mount: info.copy() for mount, info in self.hardware_pipettes.items()
         }
-        self.min_transfer = None
-        self.max_transfer = None
-
-        for info in self._get_active_pipettes().values():
-            min_volume = info.get("min_volume")
-            max_volume = info.get("max_volume")
-
-            if self.min_transfer is None or self.min_transfer > min_volume:
-                self.min_transfer = min_volume
-            if self.max_transfer is None or self.max_transfer < max_volume:
-                self.max_transfer = max_volume
 
     def get_wells(self, location):
         return [{"labwareId": "labware_1", "wellName": location[-2:]}]
@@ -300,6 +295,21 @@ def test_get_pipette_ignores_attached_but_unloaded_mount():
     assert pipette["pipette_id"] == "left-id"
 
 
+def test_pipette_selection_uses_cached_loaded_metadata_without_refreshing():
+    driver = _configured_driver()
+    refresh_calls = []
+
+    def unexpected_refresh():
+        refresh_calls.append(True)
+        raise AssertionError("pipette selection must not refresh robot metadata")
+
+    driver._update_pipettes = unexpected_refresh
+
+    assert driver.get_pipette(50)["mount"] == "left"
+    assert driver._available_pipette_options()[0]["mount"] == "left"
+    assert refresh_calls == []
+
+
 def test_transfer_with_single_loaded_pipette_allows_rate_overrides():
     driver = _configured_driver()
 
@@ -319,6 +329,35 @@ def test_transfer_with_single_loaded_pipette_allows_rate_overrides():
     assert transfer_result["dest"] == "1A2"
 
 
+def test_transfer_below_configured_pipette_minimum_is_a_no_op():
+    driver = _configured_driver()
+
+    result = driver.transfer("1A1", "1A2", 1e-14)
+
+    assert result == {
+        "source": "1A1",
+        "dest": "1A2",
+        "requested_volume_ul": 1e-14,
+        "minimum_configured_pipette_volume_ul": 20.0,
+        "subtransfers_ul": [],
+        "status": "skipped_below_minimum_pipette_volume",
+    }
+    assert driver.executed_commands == []
+    assert driver.has_tip is False
+
+
+def test_transfer_rounds_fractional_volume_to_an_integer_ul():
+    driver = _configured_driver()
+
+    result = driver.transfer("1A1", "1A2", 50.6)
+
+    assert result["requested_volume_ul"] == 51
+    aspirate = next(params for command, params in driver.executed_commands if command == "aspirate")
+    dispense = next(params for command, params in driver.executed_commands if command == "dispense")
+    assert aspirate["volume"] == 51
+    assert dispense["volume"] == 51
+
+
 def test_transfer_rejects_drop_tip_and_return_tip_together():
     driver = _configured_driver()
 
@@ -328,6 +367,12 @@ def test_transfer_rejects_drop_tip_and_return_tip_together():
 
 def test_transfer_with_tip_location_uses_requested_tip():
     driver = _configured_driver()
+    # PersistentConfig JSON serialization restores tuple-like tip entries as
+    # lists.  A requested tip must work with that persisted representation.
+    driver.config["available_tips"]["left"] = [
+        ["tiprack-left", "A1"],
+        ["tiprack-left", "A2"],
+    ]
 
     transfer_result = driver.transfer(
         "1A1",
@@ -341,7 +386,7 @@ def test_transfer_with_tip_location_uses_requested_tip():
     assert pick_up["labwareId"] == "tiprack-left"
     assert pick_up["wellName"] == "A2"
     assert driver.current_tip["well_name"] == "A2"
-    assert driver.config["available_tips"]["left"] == [("tiprack-left", "A1")]
+    assert driver.config["available_tips"]["left"] == [["tiprack-left", "A1"]]
     assert transfer_result["requested_tip"]["location"] == "1A2"
 
 
@@ -588,6 +633,109 @@ def test_split_transfer_drops_tip_without_force_new_tip():
     assert transfer_result["subtransfers_ul"] == [300.0, 50.0]
     assert driver.has_tip is False
     assert driver.current_tip is None
+
+
+def test_split_transfer_logs_numbered_pipetting_plan(caplog):
+    driver = _configured_driver()
+    driver.app = SimpleNamespace(logger=logging.getLogger("test_ot2_transfer_plan"))
+
+    with caplog.at_level(logging.INFO, logger="test_ot2_transfer_plan"):
+        driver.transfer("1A1", "1A2", 350, drop_tip=True)
+
+    assert [record.message for record in caplog.records] == [
+        "Pipetting transfer plan 1/2: 1A1 -> 1A2 using p300_single (left), 300 uL",
+        "Pipetting transfer plan 2/2: 1A1 -> 1A2 using p300_single (left), 50 uL",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("volume_ul", "expected_volumes"),
+    [
+        (320, [300.0, 20.0]),
+        (330, [300.0, 20.0, 10.0]),
+        (340, [300.0, 20.0, 20.0]),
+        (350, [300.0, 20.0, 20.0, 10.0]),
+    ],
+)
+def test_transfer_plan_uses_small_pipette_for_accurate_remainder(
+    volume_ul, expected_volumes
+):
+    driver = _configured_driver()
+    driver.hardware_pipettes["right"] = _pipette_info(
+        "right", "right-id", min_volume=1, max_volume=20
+    )
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_instruments"]["right"] = {
+        "name": "p20_single",
+        "pipette_id": "right-id",
+        "tip_racks": ["tiprack-right"],
+    }
+    driver.config["available_tips"]["right"] = [("tiprack-right", "A1")]
+    # Mirror the state change performed by load_instrument after loading the
+    # second pipette into the active run.
+    driver._update_pipettes()
+    driver._update_pipette_ranges()
+
+    transfer_result = driver.transfer("1A1", "1A2", volume_ul, drop_tip=True)
+
+    assert transfer_result["subtransfers_ul"] == expected_volumes
+    assert [step["mount"] for step in transfer_result["pipette_plan"]] == (
+        ["left"] + ["right"] * (len(expected_volumes) - 1)
+    )
+    assert [step["volume_ul"] for step in transfer_result["pipette_plan"]] == expected_volumes
+    aspirate_pipettes = [
+        params["pipetteId"]
+        for command, params in driver.executed_commands
+        if command == "aspirate"
+    ]
+    assert aspirate_pipettes == ["left-id"] + ["right-id"] * (len(expected_volumes) - 1)
+
+
+def test_mixed_pipette_transfer_uses_configured_tip_for_each_mount():
+    driver = _configured_driver()
+    driver.hardware_pipettes["right"] = _pipette_info(
+        "right", "right-id", min_volume=1, max_volume=20
+    )
+    driver.config["loaded_labware"]["2"] = (
+        "tiprack-right",
+        "opentrons_96_tiprack_20ul",
+        {"definition": {"wells": {"A1": {}, "A2": {}}}},
+    )
+    driver.config["loaded_instruments"]["right"] = {
+        "name": "p20_single",
+        "pipette_id": "right-id",
+        "tip_racks": ["tiprack-right"],
+    }
+    driver.config["available_tips"]["right"] = [("tiprack-right", "A1")]
+    driver._update_pipettes()
+    driver._update_pipette_ranges()
+
+    result = driver.transfer(
+        "1A1",
+        "1A2",
+        350,
+        drop_tip=False,
+        return_tip=True,
+        tip_locations=["1A1", "2A1"],
+    )
+
+    pickups = [params for command, params in driver.executed_commands if command == "pickUpTip"]
+    assert [(params["pipetteMount"], params["labwareId"], params["wellName"]) for params in pickups] == [
+        ("left", "tiprack-left", "A1"),
+        ("right", "tiprack-right", "A1"),
+    ]
+    assert result["requested_tips"]["left"]["location"] == "1A1"
+    assert result["requested_tips"]["right"]["location"] == "2A1"
+    assert not any(
+        command == "moveToAddressableAreaForDropTip"
+        for command, _ in driver.executed_commands
+    )
+    assert ("tiprack-left", "A1") in driver.config["available_tips"]["left"]
+    assert ("tiprack-right", "A1") in driver.config["available_tips"]["right"]
 
 
 def test_split_transfer_force_new_tip_refreshes_tip_each_subtransfer():
@@ -1134,6 +1282,27 @@ def test_driver_does_not_reseed_existing_user_labware_dir(monkeypatch, tmp_path)
     assert not (expected_dir / "seed_only.json").exists()
 
 
+def test_get_available_wells_returns_sorted_unoccupied_locations():
+    driver = StubOT2HTTPDriver()
+    driver.config["loaded_labware"]["5"] = (
+        "plate-5",
+        "custom_plate",
+        {"definition": {"wells": {"B2": {}, "A10": {}, "A2": {}, "A1": {}, "B1": {}}}},
+    )
+    driver.config["occupied_sample_locations"] = ["5A2", "5b1"]
+
+    result = driver.get_available_wells(5)
+
+    assert result == ["5A1", "5A10", "5B2"]
+
+
+def test_get_available_wells_raises_for_missing_slot():
+    driver = StubOT2HTTPDriver()
+
+    with pytest.raises(ValueError, match="No labware loaded in slot 9"):
+        driver.get_available_wells("9")
+
+
 def test_send_labware_persists_to_user_labware_dir(monkeypatch, tmp_path):
     home_dir = tmp_path / "home"
     seed_dir = tmp_path / "seed_labware"
@@ -1165,3 +1334,249 @@ def test_send_labware_persists_to_user_labware_dir(monkeypatch, tmp_path):
 
     assert expected_file.exists()
     assert persisted["wells"]["A1"]["z"] == 6.5
+
+
+class _DeckPictureResponse:
+    content = b"fake-jpeg"
+
+    def raise_for_status(self):
+        return None
+
+
+class _DeckPictureErrorResponse:
+    status_code = 500
+    text = '{"message":"camera service unavailable"}'
+
+    def raise_for_status(self):
+        raise requests.exceptions.HTTPError("500 Server Error")
+
+
+class _DeckLightResponse:
+    def __init__(self, on):
+        self.on = on
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"on": self.on}
+
+
+class _DeckStreamWriter:
+    def __init__(self, path, *args):
+        self.path = Path(path)
+        self.frames = []
+
+    def isOpened(self):
+        return True
+
+    def write(self, frame):
+        self.frames.append(frame.copy())
+
+    def release(self):
+        self.path.write_bytes(b"video-" + str(len(self.frames)).encode())
+
+
+class _DeckStreamCV2:
+    IMREAD_COLOR = 1
+
+    def __init__(self):
+        self.writers = []
+
+    def imdecode(self, encoded, mode):
+        assert encoded.tobytes() == b"fake-jpeg"
+        return np.zeros((2, 3, 3), dtype=np.uint8)
+
+    def resize(self, frame, dimensions):
+        return np.zeros((dimensions[1], dimensions[0], 3), dtype=np.uint8)
+
+    def VideoWriter_fourcc(self, *codec):
+        assert codec == ("m", "p", "4", "v")
+        return 0
+
+    def VideoWriter(self, *args):
+        writer = _DeckStreamWriter(*args)
+        self.writers.append(writer)
+        return writer
+
+
+def _deck_stream_driver(tmp_path):
+    driver = StubOT2HTTPDriver()
+    driver.path = tmp_path
+    driver.config.update({
+        "deck_stream_video_fps": 1,
+        "enable_deck_stream": False,
+    })
+    driver._deck_stream_thread = None
+    driver._deck_stream_stop_event = None
+    driver._deck_stream_lock = threading.Lock()
+    driver._deck_stream_state = {
+        "running": False,
+        "current_window_started_at": None,
+        "last_completed_at": None,
+        "last_video_path": None,
+        "last_frame_count": 0,
+        "last_error": None,
+        "stopped_for_run_status": None,
+        "task_name": None,
+    }
+    return driver
+
+
+def test_task_video_settings_use_fps(tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+
+    settings = driver._task_video_settings()
+
+    assert settings["directory"] == tmp_path / "ot2_deck_stream"
+    assert settings["capture_period_seconds"] == 1
+    driver.config["deck_stream_video_fps"] = 0
+    with pytest.raises(ValueError, match="FPS must be positive"):
+        driver._task_video_settings()
+
+
+def test_standalone_deck_stream_tasks_are_not_exposed(tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+
+    assert not hasattr(driver, "get_deck_stream")
+    assert not hasattr(driver, "stop_deck_stream")
+
+
+def test_task_video_can_use_a_fixed_overwrite_path(monkeypatch, tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+    driver.config["enable_deck_stream"] = True
+    logged = []
+    monkeypatch.setattr(driver, "log_info", logged.append)
+    monkeypatch.setattr(driver, "_ensure_deck_lights_on", lambda: False)
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.threading.Thread", FakeThread
+    )
+
+    assert driver._start_task_video("prepare", output_filename="prepare.mp4") is True
+    assert driver._deck_stream_state["task_name"] == "prepare"
+    expected_directory = tmp_path / "ot2_deck_stream"
+    assert expected_directory.is_dir()
+    assert len(logged) == 1
+    assert logged == [f"Deck stream task video: {expected_directory}/prepare.mp4"]
+
+
+def test_deck_stream_turns_lights_on_only_when_needed(monkeypatch, tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+    requests_sent = []
+
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.requests.get",
+        lambda **kwargs: _DeckLightResponse(on=False),
+    )
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.requests.post",
+        lambda **kwargs: requests_sent.append(kwargs) or _DeckLightResponse(on=True),
+    )
+
+    assert driver._ensure_deck_lights_on() is True
+    assert requests_sent == [{
+        "url": "http://ot2.test/robot/lights",
+        "headers": {"Opentrons-Version": "2"},
+        "json": {"on": True},
+        "timeout": 15,
+    }]
+
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.requests.get",
+        lambda **kwargs: _DeckLightResponse(on=True),
+    )
+    assert driver._ensure_deck_lights_on() is False
+    assert len(requests_sent) == 1
+
+
+def test_enabled_deck_stream_does_not_start_worker_during_initialization(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(OT2HTTPDriver, "_initialize_robot", lambda self: None)
+    monkeypatch.setattr(OT2HTTPDriver, "_get_seed_custom_labware_dir", lambda self: None)
+    driver = OT2HTTPDriver({"enable_deck_stream": True})
+
+    assert driver._deck_stream_thread is None
+
+
+def test_deck_stream_window_fetches_camera_picture_and_replaces_video(monkeypatch, tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+    cv2_module = _DeckStreamCV2()
+    captured_request = {}
+
+    def fake_post(**kwargs):
+        captured_request.update(kwargs)
+        return _DeckPictureResponse()
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", fake_post)
+    monkeypatch.setattr(driver, "_deck_stream_cv2", lambda: cv2_module)
+    output_dir = tmp_path / "ot2_deck_stream"
+    output_dir.mkdir()
+    output_path = output_dir / "deck_stream.mp4"
+    output_path.write_bytes(b"old-video")
+
+    result = driver._record_deck_stream_window({
+        "directory": output_dir,
+        "capture_period_seconds": 0.001,
+        "duration_seconds": 0.002,
+        "video_fps": 1,
+        "request_timeout": 15,
+    })
+
+    assert captured_request == {
+        "url": "http://ot2.test/camera/picture",
+        "headers": {"Opentrons-Version": "2"},
+        "timeout": 15,
+    }
+    assert result["path"] == str(output_path)
+    assert output_path.read_bytes().startswith(b"video-")
+    assert driver._deck_stream_state["last_video_path"] == str(output_path)
+    assert driver._deck_stream_state["last_frame_count"] >= 1
+
+
+def test_deck_stream_includes_ot2_camera_error_details(monkeypatch, tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+    monkeypatch.setattr(
+        "AFL.automation.prepare.OT2HTTPDriver.requests.post",
+        lambda **kwargs: _DeckPictureErrorResponse(),
+    )
+
+    with pytest.raises(RuntimeError, match="camera service unavailable"):
+        driver._capture_deck_picture(_DeckStreamCV2(), timeout=15)
+
+
+
+
+def test_deck_stream_empty_window_preserves_previous_video(monkeypatch, tmp_path):
+    driver = _deck_stream_driver(tmp_path)
+    output_dir = tmp_path / "ot2_deck_stream"
+    output_dir.mkdir()
+    output_path = output_dir / "deck_stream.mp4"
+    output_path.write_bytes(b"old-video")
+    monkeypatch.setattr(driver, "_deck_stream_cv2", lambda: _DeckStreamCV2())
+
+    def failing_post(**kwargs):
+        raise requests.exceptions.ConnectionError("camera unavailable")
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", failing_post)
+    with pytest.raises(RuntimeError, match="camera unavailable"):
+        driver._record_deck_stream_window({
+            "directory": output_dir,
+            "capture_period_seconds": 0.001,
+            "duration_seconds": 0.002,
+            "video_fps": 1,
+            "request_timeout": 15,
+        })
+
+    assert output_path.read_bytes() == b"old-video"
+    assert "camera unavailable" in driver._deck_stream_state["last_error"]
