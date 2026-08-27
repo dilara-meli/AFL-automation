@@ -5,7 +5,7 @@ from jinja2 import Template
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-GAMRY_DRIVER_PATH = REPO_ROOT / "AFL" / "automation" / "instrument" / "GamryDriver.py"
+GAMRY_DRIVER_PATH = REPO_ROOT / "AFL" / "automation" / "instrument" / "Gamry" / "GamryDriver.py"
 GAMRY_PANEL_DIR = REPO_ROOT / "AFL" / "automation" / "apps" / "gamry_panel"
 
 
@@ -26,7 +26,7 @@ def test_launcher_metadata_matches_driver_module():
 
     assert assignments["_DEFAULT_PORT"] == 5051
     assert assignments["_DEFAULT_CUSTOM_CONFIG"] == {
-        "_classname": "AFL.automation.instrument.GamryDriver.GamryDriver",
+        "_classname": "AFL.automation.instrument.Gamry.GamryDriver.GamryDriver",
     }
 
 
@@ -41,7 +41,7 @@ def test_gamry_driver_source_registers_panel_route_and_assets():
     source = GAMRY_DRIVER_PATH.read_text(encoding="utf-8")
 
     assert "self.useful_links['Gamry Panel'] = '/gamry_panel'" in source
-    assert "'gamry_panel_assets': pathlib.Path(__file__).parent.parent / 'apps' / 'gamry_panel'" in source
+    assert "'gamry_panel_assets': pathlib.Path(__file__).parent.parent.parent / 'apps' / 'gamry_panel'" in source
     assert "def gamry_panel(self, **kwargs):" in source
 
 
