@@ -117,6 +117,9 @@ class APIServer:
         self.task_queue = MutableQueue()
         self.driver     = driver
         self.driver.app = self.app
+        # ``init_logging`` runs before a driver is available.  Apply the
+        # driver's persistent setting once the server and driver are paired.
+        self.driver._set_log_level(self.driver.config.get('log_level', 'DEBUG'))
         self.driver.data = self.data
         if self.driver.dropbox is None:
             self.driver.dropbox = {}
@@ -290,7 +293,6 @@ class APIServer:
         '''
         Return the functions, params, and defaults to be shown in this server's quickbar
         '''
-        self.driver.refresh_quickbar()
         return jsonify(self.driver.quickbar.function_info),200
 
     def is_server_live(self):
@@ -340,99 +342,23 @@ class APIServer:
             self.app.logger.debug(f'Adding route {route} for function named {name} with baked-in kwargs {kwarg_add}')
             self.app.add_url_rule(route,name,response_function,methods=['GET'])
 
-    def _make_json_safe(self, value):
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            return value
-
-        if isinstance(value, pathlib.Path):
-            return str(value)
-
-        if isinstance(value, dict):
-            return {
-                self._make_json_safe(key): self._make_json_safe(item)
-                for key, item in value.items()
-            }
-
-        if isinstance(value, (list, tuple, set)):
-            return [self._make_json_safe(item) for item in value]
-
-        if hasattr(value, 'item'):
-            try:
-                return self._make_json_safe(value.item())
-            except Exception:
-                pass
-
-        if hasattr(value, 'tolist'):
-            try:
-                return self._make_json_safe(value.tolist())
-            except Exception:
-                pass
-
-        if hasattr(value, 'items'):
-            try:
-                return {
-                    self._make_json_safe(key): self._make_json_safe(item)
-                    for key, item in value.items()
-                }
-            except Exception:
-                pass
-
-        if hasattr(value, '__iter__') and not isinstance(value, (bytes, bytearray)):
-            try:
-                return [self._make_json_safe(item) for item in list(value)]
-            except Exception:
-                pass
-
-        try:
-            return str(value)
-        except Exception:
-            return repr(value)
-
-    def _normalize_driver_task(self, task):
-        if task is None:
-            return {}
-
-        normalized = {}
-        for key, value in dict(task).items():
-            if isinstance(value, (list, tuple)) and len(value) == 1:
-                value = value[0]
-            if isinstance(value, str):
-                value = value.strip()
-            normalized[key] = value
-        return normalized
-
     def query_driver(self):
         task = request.get_json(silent=True)
         if task is None:
             task = request.args
-        task = self._normalize_driver_task(task)
 
         self.app.logger.info(f'Request for {request.args}')
         if 'r' in task:
-            fn_name = task['r']
-            if fn_name in self.driver.unqueued.functions:
+            if task['r'] in self.driver.unqueued.functions:
+                fn_name = task['r']
                 call_kwargs = dict(task)
+                # Remove router control key before forwarding kwargs.
                 call_kwargs.pop('r', None)
-                try:
-                    result = getattr(self.driver, fn_name)(**call_kwargs)
-                    result = self._make_json_safe(result)
-                    return result,200
-                except Exception as exc:
-                    self.app.logger.exception('Driver query failed for %s', fn_name)
-                    return {
-                        'status': 'error',
-                        'route': fn_name,
-                        'message': str(exc),
-                    },500
+                return getattr(self.driver, fn_name)(**call_kwargs),200
             else:
-                return {
-                    'status': 'error',
-                    'route': fn_name,
-                    'message': 'No such task found as an unqueued function in driver',
-                    'available_routes': sorted(self.driver.unqueued.functions),
-                },404
+                return "No such task found as an unqueued function in driver"
         else:
-            return {'status': 'error', 'message': 'No task specified, add argument r=task to get result'},404
+            return "No task specified, add argument r=task to get result",404
 
 
 
@@ -447,12 +373,29 @@ class APIServer:
         path = pathlib.Path(resolved_afl_home).expanduser()
         path.mkdir(exist_ok=True,parents=True)
         filepath = path / f'{self.name}.log'
-        file_handler = FileHandler(filepath)
-        file_handler.setFormatter(logging.Formatter(
-                '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
-                ))
-        self.app.logger.addHandler(file_handler)
-        logging.getLogger('werkzeug').addHandler(file_handler)
+        filepath = filepath.resolve()
+
+        # ``init_logging`` is called during construction and is also called by
+        # legacy launchers.  Reuse the handler for this log file rather than
+        # attaching a second one, which would write every record twice.
+        file_handler = next(
+            (
+                handler for handler in self.app.logger.handlers
+                if isinstance(handler, FileHandler)
+                and pathlib.Path(handler.baseFilename).resolve() == filepath
+            ),
+            None,
+        )
+        if file_handler is None:
+            file_handler = FileHandler(filepath)
+            file_handler.setFormatter(logging.Formatter(
+                    '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
+                    ))
+            self.app.logger.addHandler(file_handler)
+
+        werkzeug_logger = logging.getLogger('werkzeug')
+        if file_handler not in werkzeug_logger.handlers:
+            werkzeug_logger.addHandler(file_handler)
 
 
     def index(self):

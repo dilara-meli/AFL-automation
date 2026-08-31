@@ -1,6 +1,6 @@
 import pytest
 
-from AFL.automation.prepare.PrepareDriver import PrepareDriver
+from AFL.automation.prepare.PrepareDriver import PrepareDriver, capture_task_video
 
 
 class DummyPrepare(PrepareDriver):
@@ -70,6 +70,36 @@ class DummyPrepare(PrepareDriver):
         ]
         if self.raise_on_protocol_validation:
             raise ValueError('protocol contains infeasible transfer volume')
+
+
+def test_capture_task_video_decorator_is_opt_in_and_finalizes_on_failure():
+    class VideoDriver:
+        def __init__(self):
+            self.events = []
+
+        def _start_task_video(self, task_name, output_filename):
+            self.events.append(("start", task_name, output_filename))
+
+        def _finish_task_video(self):
+            self.events.append(("finish",))
+
+        @capture_task_video("example.mp4")
+        def operation(self, capture_task_video=False, fail=False):
+            if fail:
+                raise RuntimeError("planned failure")
+            return "complete"
+
+    driver = VideoDriver()
+
+    assert driver.operation() == "complete"
+    assert driver.events == []
+
+    assert driver.operation(capture_task_video=True) == "complete"
+    assert driver.events == [("start", "operation", "example.mp4"), ("finish",)]
+
+    with pytest.raises(RuntimeError, match="planned failure"):
+        driver.operation(capture_task_video=True, fail=True)
+    assert driver.events[-2:] == [("start", "operation", "example.mp4"), ("finish",)]
 
 
 
@@ -275,6 +305,25 @@ def test_is_feasible_rejects_stock_volume_fraction_targets_with_invalid_protocol
         {'source': '1A1', 'dest': '1A4', 'volume': 300.0},
         {'source': '1A2', 'dest': '1A4', 'volume': 700.0},
     ]
+
+
+@pytest.mark.usefixtures('mixdb')
+def test_is_feasible_reports_missing_direct_recipe_stocks():
+    driver = DummyPrepare()
+    driver.config.write = False
+
+    target = {
+        'name': 'MissingStockRecipe',
+        'location': '1A4',
+        'stock_volume_fractions': {'stock_Red': 1.0},
+        'total_volume': '1000 ul',
+    }
+
+    with pytest.warns(UserWarning, match='configured stock.*stock_Red'):
+        assert driver.is_feasible(target, enable_multistep_dilution=False) == [None]
+
+    assert 'stock_Red' in driver.last_feasibility_errors[0]
+    assert 'Currently configured stocks: none' in driver.last_feasibility_errors[0]
 
 
 @pytest.mark.usefixtures('mixdb')

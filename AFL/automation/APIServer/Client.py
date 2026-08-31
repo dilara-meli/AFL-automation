@@ -94,7 +94,6 @@ class Client:
 
     def wait(self,target_uuid=None,interval=0.1,for_history=True,first_check_delay=5.0):
         time.sleep(first_check_delay)
-        matched_task = None
         while True:
             try:
                 response = requests.get(self.url+'/get_queue',headers=self.headers,timeout=15)
@@ -103,8 +102,7 @@ class Client:
             history,running,queued = response.json()
             if target_uuid is not None:
                 if for_history:
-                    matched_task = next((task for task in history if str(task['uuid']) == str(target_uuid)), None)
-                    if matched_task is not None:
+                    if any([str(task['uuid'])==str(target_uuid) for task in history]):
                         break
                 else:
                     if not any([str(task['uuid'])==str(target_uuid) for task in running+queued]):
@@ -115,9 +113,14 @@ class Client:
                     break
             time.sleep(interval)
 
-        #check the return info of the command we waited on
-        if target_uuid is not None and matched_task is not None:
-            return matched_task['meta']
+        # Return the completed task that was requested, including verified
+        # Tiled write metadata when the server has a DataTiled backend.
+        if target_uuid is not None:
+            completed_task = next(
+                task for task in reversed(history)
+                if str(task['uuid']) == str(target_uuid)
+            )
+            return completed_task['meta']
         return history[-1]['meta']
 
     def get_quickbar(self):

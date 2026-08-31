@@ -55,7 +55,6 @@ class Driver(DriverWebAppsMixin):
         self.data = None
         self.dropbox = None
         self.logger = logging.getLogger(name if name is not None else 'Driver')
-        self.logger.setLevel(logging.INFO)
         self._tiled_client = None  # Cached Tiled client
         self._combined_dataset_cache = {}
         self._combined_dataset_cache_order = []
@@ -79,14 +78,41 @@ class Driver(DriverWebAppsMixin):
         self.path.mkdir(exist_ok=True,parents=True)
         self.filepath = self.path / (name + '.config.json')
 
+        # The shared launcher sets this for a clean launch, allowing a driver
+        # to be constructed from its declared defaults without consuming a
+        # prior PersistentConfig history.
+        load_existing_config = os.environ.get('AFL_FRESH_DRIVER_CONFIG') != '1'
+
+        # Every driver can control the verbosity of the APIServer it is
+        # attached to.  Keep the framework default out of PersistentConfig:
+        # launcher snapshots must contain only the driver's declared defaults
+        # (and any explicit overrides), rather than an implicit extra key.
+        config_defaults = dict(defaults) if defaults is not None else {}
+        log_level = config_defaults.get('log_level', 'DEBUG')
+
         self.config = PersistentConfig(
             path=self.filepath,
-            defaults= defaults,
+            defaults=config_defaults,
             overrides= overrides,
+            load_existing=load_existing_config,
             )
+        self._set_log_level(self.config.get('log_level', log_level))
         
         # collect inherited static directories
         self.static_dirs = self.gather_static_dirs()
+
+    def _set_log_level(self, log_level):
+        """Set this driver's logger and its attached APIServer logger level."""
+        try:
+            self.logger.setLevel(log_level)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid log_level {log_level!r}; use a standard logging level "
+                "such as DEBUG, INFO, WARNING, ERROR, or CRITICAL."
+            ) from exc
+
+        if self.app is not None and hasattr(self.app, 'logger'):
+            self.app.logger.setLevel(log_level)
 
     def _log(self, level, message):
         if self.app is not None and hasattr(self.app, 'logger'):
@@ -143,6 +169,10 @@ class Driver(DriverWebAppsMixin):
         return dirs
     
     def set_config(self,**kwargs):
+        if 'log_level' in kwargs:
+            # Validate before persisting, then update the active server without
+            # requiring a restart.
+            self._set_log_level(kwargs['log_level'])
         self.config.update(kwargs)
         # if ('driver' in kwargs) and (kwargs['driver'] is not None):
         #     driver_name = kwargs['driver']
@@ -192,10 +222,6 @@ class Driver(DriverWebAppsMixin):
             for name,value in config:
                 self.log_info(f'{name:30s} = {value}')
         return config.config
-
-    def refresh_quickbar(self):
-        """Refresh any dynamic quickbar metadata before it is served."""
-        return None
 
     def clean_config(self):
         """Remove any config keys that are not present in defaults.

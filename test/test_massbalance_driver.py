@@ -85,16 +85,24 @@ def test_massbalance_driver_mixed_solvents_mass():
         if not result['success']:
             none_count += 1
             continue
-        assert balanced.mass.to('mg').magnitude == pytest.approx(500)
-        assert balanced.concentration['NaCl'].to('mg/ml').magnitude == pytest.approx(25)
+        # Integer-ul aliquots can differ slightly from the continuous ideal
+        # mass balance; the reported solution is built from those executable
+        # aliquots and must remain within one microlitre-scale increment.
+        assert balanced.mass.to('mg').magnitude == pytest.approx(500, abs=1.0)
+        assert balanced.concentration['NaCl'].to('mg/ml').magnitude == pytest.approx(25, abs=0.2)
+        assert all(float(action.volume).is_integer() for action in balanced.protocol)
 
         sub_balanced = balanced.copy()
         sub_target = Solution(**mb.config['targets'][i])
         del sub_balanced.components['NaCl']
         del sub_target.components['NaCl']
 
-        assert sub_balanced.mass_fraction['H2O'] == pytest.approx(sub_target.mass_fraction['H2O'])
-        assert sub_balanced.mass_fraction['Hexanes'] == pytest.approx(sub_target.mass_fraction['Hexanes'])
+        assert sub_balanced.mass_fraction['H2O'] == pytest.approx(
+            sub_target.mass_fraction['H2O'], abs=0.002
+        )
+        assert sub_balanced.mass_fraction['Hexanes'] == pytest.approx(
+            sub_target.mass_fraction['Hexanes'], abs=0.002
+        )
 
     assert none_count == 1
 
@@ -323,6 +331,37 @@ def test_upload_stocks_preserves_multi_source_schema_and_list_stocks_reports_rem
             'remaining_volume': '1700.0 ul',
         }
     ]
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_multi_source_stock_preserves_recipe_volume_and_uses_source_inventory():
+    mb = MassBalanceDriver()
+    mb.config.write = False
+    mb.reset_stocks()
+
+    mb.add_stock(
+        {
+            "name": "stock_NaCl",
+            "total_volume": "20 ml",
+            "volumes": {"H2O": "20 ml"},
+            "concentrations": {"NaCl": "1 mg/ml"},
+            "solutes": ["NaCl"],
+            "sources": [
+                {"location": "2A1", "initial_volume": "350 ul"},
+                {"location": "2A2", "initial_volume": "100 ul"},
+                {"location": "2B1", "initial_volume": "100 ul"},
+            ],
+        }
+    )
+
+    assert mb.config["stocks"][0]["total_volume"] == "20 ml"
+    assert [float(stock.volume.to("ul").magnitude) for stock in mb.stocks] == pytest.approx(
+        [350.0, 100.0, 100.0]
+    )
+    assert all(
+        float(stock.concentration["NaCl"].to("mg/ml").magnitude) == pytest.approx(1.0)
+        for stock in mb.stocks
+    )
 
 
 @pytest.mark.usefixtures("mixdb")

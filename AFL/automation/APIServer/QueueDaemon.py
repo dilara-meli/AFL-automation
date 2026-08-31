@@ -84,6 +84,19 @@ class QueueDaemon(threading.Thread):
             else:
                 masked_package['task'][k] = v
         return masked_package
+
+    def _attach_tiled_result_metadata(self, package):
+        """Record the verified Tiled write outcome for a completed task."""
+        tiled_entry_id = getattr(self.data, "last_tiled_entry_id", None)
+        if tiled_entry_id is not None:
+            package["meta"]["tiled_entry_id"] = str(tiled_entry_id)
+            package["meta"]["tiled_status"] = "written"
+        elif hasattr(self.data, "last_tiled_error"):
+            package["meta"]["tiled_entry_id"] = None
+            package["meta"]["tiled_status"] = "fallback"
+        else:
+            package["meta"]["tiled_entry_id"] = None
+            package["meta"]["tiled_status"] = "not_configured"
         
 
     def run(self):
@@ -157,10 +170,7 @@ class QueueDaemon(threading.Thread):
             # so that DataTiled can store it as the main data element
 
             if isinstance(return_val, xr.Dataset):
-                return_val = return_val.copy()
-                return_val.attrs['uuid'] = str(masked_package['uuid'])
                 self.data['main_dataset'] = return_val
-                self.driver.deposit_obj(return_val, uid=str(masked_package['uuid']))
             elif type(return_val) is np.ndarray:
                 self.data['main_array'] = return_val
             elif type(return_val) is pd.DataFrame:
@@ -169,6 +179,7 @@ class QueueDaemon(threading.Thread):
                 self.data['main_dataframe'] = return_val.to_frame()
 
             self.data.finalize()
+            self._attach_tiled_result_metadata(masked_package)
             self.history.append(masked_package)#history for this server restart
 
             self.task_queue.iteration_id = time.time()
