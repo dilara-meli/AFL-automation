@@ -28,7 +28,8 @@ class PersistentConfig(MutableMapping):
         max_history_size_mb=100,  # New: limit history by file size
         write_debounce_seconds=0.1,  # New: batch writes within this time window
         compact_json=True,  # New: use compact JSON for large files
-        datetime_key_format='%y/%d/%m %H:%M:%S.%f'
+        datetime_key_format='%y/%d/%m %H:%M:%S.%f',
+        load_existing=True,
                 ):
         '''Constructor
         
@@ -71,6 +72,11 @@ class PersistentConfig(MutableMapping):
             If True, use compact JSON (no indentation) for files larger than 1MB.
             This significantly reduces file size and write time for large configs.
             (default: True)
+
+        load_existing: bool
+            If False, ignore any existing configuration history at ``path`` and
+            initialize from ``defaults`` and ``overrides`` instead.  The new
+            configuration replaces the file on its first write.
         
         datetime_key_format: str
             String defining the root level keys of the json-serialized file. 
@@ -91,7 +97,7 @@ class PersistentConfig(MutableMapping):
         self._write_lock = threading.Lock()
         
         need_update=False
-        if self.path.exists():
+        if load_existing and self.path.exists():
             with open(self.path,'r') as f:
                 self.history = json.load(f)
             key = self._get_sorted_history_keys()[-1] #use latest key
@@ -239,6 +245,20 @@ class PersistentConfig(MutableMapping):
                 self._write_timer = None
             self._pending_write = False
             self._do_write()
+
+    def write_current_config(self, path):
+        '''Write a plain, non-historical snapshot of the current configuration.'''
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + '.tmp')
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump(self.config, f, indent=4)
+            temp_path.replace(path)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
     
     def _estimate_history_size_mb(self):
         '''Estimate the size of history in MB by serializing to JSON'''
@@ -266,6 +286,10 @@ class PersistentConfig(MutableMapping):
         '''Perform the actual write to disk'''
         if not self.write:
             return
+
+        # Config paths such as ``~/.afl/config.json`` may not exist yet on a
+        # new host. Create the parent before the atomic temporary-file write.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
             
         # Trim history by count
         if len(self.history) > self.max_history:

@@ -6,7 +6,7 @@ from typing import List, Optional, Dict, Set, Callable, Any, Iterator
 import numpy as np
 from scipy.optimize import lsq_linear, Bounds
 
-from AFL.automation.mixcalc.PipetteAction import PipetteAction
+from AFL.automation.prepare.PipetteAction import PipetteAction
 from AFL.automation.mixcalc.Solution import Solution
 from AFL.automation.mixcalc.BalanceDiagnosis import BalanceDiagnosis, FailureCode, FailureDetail
 
@@ -14,6 +14,14 @@ ZERO_MASS_TOL_G = 1e-12
 
 
 # --- Shared utility functions ---
+def _integer_volume_ul(volume_ul: float) -> int:
+    """Round a positive microlitre volume to the nearest executable integer."""
+    value = float(volume_ul)
+    if not math.isfinite(value):
+        raise ValueError(f"Pipette volume must be finite, got {volume_ul!r}")
+    return int(math.floor(value + 0.5))
+
+
 def _extract_masses(solution: Solution, components: List[str], array: np.ndarray, unit: str = 'g') -> None:
     if array is None:
         array = np.zeros(len(components))
@@ -73,13 +81,21 @@ def _make_balanced_target(mass_transfers, target):
     balanced_target = Solution(name="")
     balanced_target.protocol = []
     for stock, mass in mass_transfers.items():
-        measured = stock.measure_out(mass)
+        requested = stock.measure_out(mass)
+        volume_ul = _integer_volume_ul(requested.volume.to('ul').magnitude)
+        if volume_ul <= 0:
+            continue
+        # The reported composition and protocol must describe the same,
+        # executable integer-volume aliquot.
+        measured = stock.measure_out(f"{volume_ul} ul")
+        mass_transfers[stock] = f"{measured.mass.to('g').magnitude} g"
         balanced_target = balanced_target + measured
         balanced_target.protocol.append(
             PipetteAction(
                 source=stock.location,
                 dest=target.location,
-                volume=measured.volume.to('ul').magnitude,
+                volume=volume_ul,
+                tip_location=getattr(stock, 'tip_location', None),
             )
         )
     balanced_target.name = target.name + "-balanced"
@@ -87,6 +103,70 @@ def _make_balanced_target(mass_transfers, target):
         if not balanced_target.contains(name):
             balanced_target.components[name] = component.copy()
             balanced_target[name].mass = '0.0 g'
+    return balanced_target
+
+
+def _make_stock_volume_fraction_target(stocks, target):
+    """Compile a direct stock-volume recipe into a normal balanced target."""
+    requested_total_volume = target.requested_total_volume
+    if requested_total_volume is None:
+        raise ValueError("stock_volume_fractions targets require total_volume")
+
+    balanced_target = Solution(name=target.name + "-balanced")
+    balanced_target.protocol = []
+    balanced_target.stock_volume_fractions = dict(target.stock_volume_fractions)
+    balanced_target.stock_transfer_volumes = {}
+    balanced_target.requested_total_volume = requested_total_volume
+
+    for stock_name, fraction in target.stock_volume_fractions.items():
+        required_volume_ul = _integer_volume_ul(
+            float(requested_total_volume.to("ul").magnitude) * fraction
+        )
+        balanced_target.stock_transfer_volumes[stock_name] = required_volume_ul
+        remaining_volume_ul = required_volume_ul
+        sources = [
+            stock
+            for stock in stocks
+            if getattr(stock, "stock_group", stock.name) == stock_name
+        ]
+        if not sources:
+            raise ValueError(f"Unknown stock '{stock_name}' in stock_volume_fractions")
+
+        for stock in sources:
+            if stock.location is None:
+                continue
+            available_volume_ul = math.floor(float(stock.volume.to("ul").magnitude))
+            transfer_volume_ul = min(remaining_volume_ul, available_volume_ul)
+            if transfer_volume_ul <= 0:
+                continue
+            measured = stock.measure_out(f"{transfer_volume_ul} ul")
+            balanced_target = balanced_target + measured
+            balanced_target.protocol.append(
+                PipetteAction(
+                    source=stock.location,
+                    dest=target.location,
+                    volume=transfer_volume_ul,
+                    tip_location=getattr(stock, "tip_location", None),
+                )
+            )
+            remaining_volume_ul -= transfer_volume_ul
+            if remaining_volume_ul <= 0:
+                break
+
+        if remaining_volume_ul > 0:
+            raise ValueError(
+                f"Not enough volume remaining across stock sources for '{stock_name}'. "
+                f"Requested {required_volume_ul} uL, {remaining_volume_ul} uL could not be allocated."
+            )
+
+    balanced_target.name = target.name
+    balanced_target.location = target.location
+    balanced_target.stock_volume_fractions = dict(target.stock_volume_fractions)
+    balanced_target.stock_transfer_volumes = {
+        stock_name: int(volume_ul)
+        for stock_name, volume_ul in balanced_target.stock_transfer_volumes.items()
+    }
+    balanced_target.requested_total_volume = requested_total_volume
     return balanced_target
 
 
@@ -822,7 +902,8 @@ class MassBalanceBase:
     ):
         if any([stock.location is None for stock in self.stocks]):
             raise ValueError("Some stocks don't have a location specified. This should be specified when the stocks are instantiated")
-        self._set_bounds()
+        if not all(target.stock_volume_fractions for target in self.targets):
+            self._set_bounds()
         components = list(self.components)
 
         target_mass_matrix = np.zeros((len(self.targets), len(components)))
@@ -852,6 +933,30 @@ class MassBalanceBase:
                     target_idx=target_idx,
                     target_name=target.name,
                 )
+            if target.stock_volume_fractions:
+                balanced_target = _make_stock_volume_fraction_target(self.stocks, target)
+                self.balanced.append({
+                    'target': target,
+                    'balanced_target': balanced_target,
+                    'transfers': None,
+                    'difference': None,
+                    'success': True,
+                    'diagnosis': None,
+                    'procedure_plan': {
+                        'mode': 'stock_volume_fractions',
+                        'required_intermediate_targets': 0,
+                        'stages': [],
+                    },
+                })
+                if progress_callback is not None:
+                    progress_callback(
+                        stage='target_end',
+                        completed=target_idx + 1,
+                        total=len(self.targets),
+                        target_idx=target_idx,
+                        target_name=target.name,
+                    )
+                continue
             target_masses = target_mass_matrix[target_idx]
             solved = self._solve_single_target(
                 target=target,

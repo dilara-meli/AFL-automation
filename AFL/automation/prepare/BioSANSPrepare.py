@@ -99,6 +99,9 @@ class BioSANSPrepare(PrepareDriver):
         for pipette_action in balanced_target.protocol:
             source_stock_name = pipette_action.source
             if source_stock_name not in self.stock_pv_map:
+                source_stock = self.stocks_by_location(source_stock_name)
+                source_stock_name = source_stock.name
+            if source_stock_name not in self.stock_pv_map:
                 raise ValueError(
                     f"Stock PV for '{source_stock_name}' not found in stock_pv_map. "
                     f"Available stocks in map: {list(self.stock_pv_map.keys())}"
@@ -243,8 +246,7 @@ class BioSANSPrepare(PrepareDriver):
     def reset(self):
         self.reset_targets()
         self.reset_stocks()
-        self.stocks = []
-        self.targets = []
+        self._reset_prepare_state()
 
     @property
     def client(self):

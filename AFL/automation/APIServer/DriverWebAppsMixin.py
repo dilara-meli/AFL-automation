@@ -1,12 +1,13 @@
 import datetime
 import io
 import json
-import pathlib
 from collections import defaultdict
 
 from flask import render_template
 from tiled.client import from_uri
 from tiled.queries import Contains, In
+
+from AFL.automation.shared.tiled import TiledConfigurationError, resolve_tiled_config
 
 
 class DriverWebAppsMixin:
@@ -30,59 +31,12 @@ class DriverWebAppsMixin:
         Returns:
             dict with status and config values or error message
         """
-        config_path = pathlib.Path.home() / '.afl' / 'config.json'
-
-        if not config_path.exists():
-            return {
-                'status': 'error',
-                'message': 'Config file not found at ~/.afl/config.json. Please create this file with tiled_server and tiled_api_key settings.'
-            }
-
         try:
-            with open(config_path, 'r') as f:
-                config_data = json.load(f)
-        except (json.JSONDecodeError, ValueError) as e:
+            tiled_server, tiled_api_key = resolve_tiled_config()
+        except TiledConfigurationError as exc:
             return {
                 'status': 'error',
-                'message': f'Invalid JSON in config file: {str(e)}'
-            }
-
-        # Search through config entries (newest first) to find tiled settings
-        if not config_data:
-            return {
-                'status': 'error',
-                'message': 'Config file is empty.'
-            }
-
-        # Try entries in reverse sorted order to find one with tiled config
-        # Use datetime parsing to properly sort date keys (format: YY/DD/MM HH:MM:SS.ffffff)
-        datetime_key_format = '%y/%d/%m %H:%M:%S.%f'
-        try:
-            keys = sorted(
-                config_data.keys(),
-                key=lambda k: datetime.datetime.strptime(k, datetime_key_format),
-                reverse=True
-            )
-        except ValueError:
-            # Fallback to lexicographic sort if datetime parsing fails
-            keys = sorted(config_data.keys(), reverse=True)
-        tiled_server = ''
-        tiled_api_key = ''
-
-        for key in keys:
-            entry = config_data[key]
-            if isinstance(entry, dict):
-                server = entry.get('tiled_server', '')
-                api_key = entry.get('tiled_api_key', '')
-                if server and api_key:
-                    tiled_server = server
-                    tiled_api_key = api_key
-                    break
-
-        if not tiled_server:
-            return {
-                'status': 'error',
-                'message': 'tiled_server not configured in ~/.afl/config.json. Please add a tiled_server URL to your config.'
+                'message': str(exc),
             }
 
         if not tiled_api_key:
@@ -931,41 +885,29 @@ class DriverWebAppsMixin:
         }
 
     def _get_plot_sample_dim_state(self, dataset):
-        """Resolve sample-dimension state for plot-oriented serialization."""
+        """Resolve the sample-dimension state used by plot serialization."""
         sample_dim = dataset.attrs.get('_detected_sample_dim')
         if sample_dim not in dataset.dims:
             sample_dim = self._detect_sample_dimension(dataset, allow_size_fallback=True)
-
-        sample_count = int(
-            dataset.attrs.get(
-                '_sample_count',
-                dataset.sizes.get(sample_dim, 1) if sample_dim else 1,
-            )
-        )
+        sample_count = int(dataset.attrs.get(
+            '_sample_count', dataset.sizes.get(sample_dim, 1) if sample_dim else 1,
+        ))
         singleton_synthetic_sample_dim = bool(
-            sample_dim
-            and sample_count <= 1
-            and dataset.attrs.get('_synthetic_singleton_sample_dim')
+            sample_dim and sample_count <= 1 and dataset.attrs.get('_synthetic_singleton_sample_dim')
         )
         return sample_dim, sample_count, singleton_synthetic_sample_dim
 
     def _normalize_plot_dataarray(self, name, data_array, dataset, sample_dim=None, is_coord=False):
-        """Drop synthetic singleton sample dimensions for plot serialization."""
+        """Drop only the synthetic singleton sample axis before plotting."""
         if sample_dim not in getattr(data_array, 'dims', ()):
             return data_array
-
-        sample_count = int(
-            dataset.attrs.get(
-                '_sample_count',
-                dataset.sizes.get(sample_dim, 1) if sample_dim else 1,
-            )
-        )
+        sample_count = int(dataset.attrs.get(
+            '_sample_count', dataset.sizes.get(sample_dim, 1) if sample_dim else 1,
+        ))
         if sample_count > 1 or not dataset.attrs.get('_synthetic_singleton_sample_dim'):
             return data_array
-
         if is_coord and name in {sample_dim, 'sample_name', 'sample_uuid', 'entry_id'}:
             return data_array
-
         return data_array.isel({sample_dim: 0}, drop=True)
 
     def _build_tiled_plot_manifest(self, dataset):
@@ -974,23 +916,18 @@ class DriverWebAppsMixin:
         import xarray as xr
 
         sample_dim, sample_count, singleton_synthetic_sample_dim = self._get_plot_sample_dim_state(dataset)
-
         effective_sample_dim = sample_dim
         if singleton_synthetic_sample_dim:
             effective_sample_dim = None
         elif effective_sample_dim and len(dataset.dims) == 1 and sample_count <= 1:
-            # For single-entry datasets, a lone physical axis like "point" should
-            # remain a plottable line axis, not be reinterpreted as a sample axis.
+            # A lone physical axis (such as time or potential) is plottable data,
+            # not a sample dimension.
             effective_sample_dim = None
 
         catalog = {}
         for coord_name, coord in dataset.coords.items():
             normalized_coord = self._normalize_plot_dataarray(
-                coord_name,
-                coord,
-                dataset,
-                sample_dim=sample_dim,
-                is_coord=True,
+                coord_name, coord, dataset, sample_dim=sample_dim, is_coord=True,
             )
             catalog[coord_name] = self._describe_plot_dataarray(
                 coord_name,
@@ -1002,11 +939,7 @@ class DriverWebAppsMixin:
 
         for var_name, data_array in dataset.data_vars.items():
             normalized_data_array = self._normalize_plot_dataarray(
-                var_name,
-                data_array,
-                dataset,
-                sample_dim=sample_dim,
-                is_coord=False,
+                var_name, data_array, dataset, sample_dim=sample_dim, is_coord=False,
             )
             catalog[var_name] = self._describe_plot_dataarray(
                 var_name,
@@ -1090,11 +1023,7 @@ class DriverWebAppsMixin:
 
             sample_dim, _, _ = self._get_plot_sample_dim_state(ds)
             data_array = self._normalize_plot_dataarray(
-                var_name,
-                data_array,
-                ds,
-                sample_dim=sample_dim,
-                is_coord=is_coord,
+                var_name, data_array, ds, sample_dim=sample_dim, is_coord=is_coord,
             )
 
             return {
@@ -1473,11 +1402,8 @@ class DriverWebAppsMixin:
         if len(datasets) == 1:
             dataset = datasets[0].copy(deep=True)
             metadata = metadata_list[0]
-
-            # Normalize single-entry results to the same outer index dimension
-            # used for multi-entry datasets so metadata is consistently exposed
-            # as coordinates. Plot serialization collapses this synthetic axis
-            # back out when it only contains a single sample.
+            # Use the same outer index as multi-entry data. Serialization removes
+            # this artificial singleton axis before the browser plots it.
             dataset = dataset.expand_dims({concat_dim: [0]})
             dataset = dataset.assign_coords({
                 'sample_name': (concat_dim, [metadata['sample_name']]),
@@ -1490,28 +1416,18 @@ class DriverWebAppsMixin:
             dataset.attrs['_detected_sample_dim'] = concat_dim
             dataset.attrs['_sample_count'] = 1
             dataset.attrs['_synthetic_singleton_sample_dim'] = True
-            
-            # If sample_composition exists, add it as a DataArray along the sample dimension
+
             if metadata['sample_composition']:
                 components = metadata['sample_composition']['components']
                 values = metadata['sample_composition']['values']
-
                 if 'composition' not in dataset.data_vars:
-                    dataset = dataset.assign(
-                        composition=xr.DataArray(
-                            data=np.asarray([values], dtype=float),
-                            dims=[concat_dim, 'components'],
-                            coords={
-                                concat_dim: dataset.coords[concat_dim].values,
-                                'components': components,
-                            },
-                            name='composition',
-                        )
-                    )
-                dataset.attrs['sample_composition'] = {
-                    'components': components,
-                    'values': values,
-                }
+                    dataset = dataset.assign(composition=xr.DataArray(
+                        data=np.asarray([values], dtype=float),
+                        dims=[concat_dim, 'components'],
+                        coords={concat_dim: dataset.coords[concat_dim].values, 'components': components},
+                        name='composition',
+                    ))
+                dataset.attrs['sample_composition'] = {'components': components, 'values': values}
             
             # Apply variable prefix if specified
             if variable_prefix:

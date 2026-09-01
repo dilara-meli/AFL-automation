@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import sys
 import time
@@ -8,6 +9,7 @@ import datetime
 import uuid
 import json
 import hashlib
+from itertools import product
 
 import numpy as np
 from scipy.optimize import Bounds
@@ -18,6 +20,7 @@ from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.mixcalc.Solution import Solution
 from AFL.automation.mixcalc.MixDB import MixDB
 from AFL.automation.shared.units import enforce_units
+from AFL.automation.shared.utilities import listify
 
 
 def _is_finite(v):
@@ -80,6 +83,7 @@ def _solution_to_display_dict(solution):
     out = {
         'name': solution.name,
         'location': solution.location,
+        'tip': getattr(solution, 'tip', None),
         'components': list(solution.components.keys()),
     }
 
@@ -220,6 +224,7 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
     defaults = {
         'minimum_volume': '20 ul',
         'stocks': [],
+        'stock_inventory': {},
         'targets': [],
         'tol': 1e-3,
         'enable_multistep_dilution': False,
@@ -291,6 +296,153 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
             raise ValueError('No targets have been added; Must call process_stocks before accessing components')
         return {component for target in self.targets for component in target.components}
 
+    @staticmethod
+    def _normalize_stock_location(location):
+        if location is None:
+            raise ValueError('Stock source location is required')
+        if not isinstance(location, str):
+            raise TypeError(
+                f"Stock source location must be a string, got {type(location).__name__}"
+            )
+        normalized = location.strip().upper()
+        if not normalized:
+            raise ValueError('Stock source location cannot be empty')
+        return normalized
+
+    @classmethod
+    def _make_stock_source_id(cls, stock_name: str, location: str) -> str:
+        return f"{str(stock_name).strip()}@{cls._normalize_stock_location(location)}"
+
+    @classmethod
+    def _normalize_stock_source(cls, source: Dict) -> Dict:
+        if not isinstance(source, dict):
+            raise TypeError(
+                f"Stock source must be a mapping, got {type(source).__name__}"
+            )
+        if source.get('tip') is not None or source.get('tip_location') is not None:
+            raise ValueError('tip_location must be defined once at the stock level, not per source')
+        normalized = {
+            'location': cls._normalize_stock_location(source.get('location')),
+        }
+        if source.get('initial_volume') is not None:
+            normalized['initial_volume'] = source.get('initial_volume')
+        return normalized
+
+    @classmethod
+    def _normalize_stock_definition(cls, stock: Dict) -> Dict:
+        if not isinstance(stock, dict):
+            raise TypeError(f"Stock definition must be a mapping, got {type(stock).__name__}")
+        normalized = copy.deepcopy(stock)
+        stock_name = str(normalized.get('name', '')).strip()
+        if not stock_name:
+            raise ValueError('Stock definition requires a non-empty name')
+        normalized['name'] = stock_name
+
+        location = normalized.get('location')
+        sources = normalized.get('sources')
+        if location is not None and sources:
+            raise ValueError("Specify either top-level location or sources, not both")
+
+        has_explicit_sources = bool(sources)
+        if sources:
+            normalized_sources = [
+                cls._normalize_stock_source(source)
+                for source in listify(sources)
+            ]
+        elif location is not None:
+            normalized_sources = [
+                cls._normalize_stock_source(
+                    {
+                        'location': location,
+                        'initial_volume': normalized.get('total_volume'),
+                    }
+                )
+            ]
+        else:
+            normalized_sources = []
+
+        seen_locations = set()
+        for source in normalized_sources:
+            location_key = source['location']
+            if location_key in seen_locations:
+                raise ValueError(
+                    f"Stock '{stock_name}' defines duplicate source location {location_key}"
+                )
+            seen_locations.add(location_key)
+
+        normalized.pop('location', None)
+        # A stock-level total volume defines the composition used by every
+        # source.  Preserve it for explicit multi-source stocks; each
+        # source's initial_volume is inventory, not a separate recipe.
+        if not has_explicit_sources:
+            normalized.pop('total_volume', None)
+        normalized['sources'] = normalized_sources
+        return normalized
+
+    def _initialize_stock_inventory_entry(self, stock: Dict) -> None:
+        inventory = dict(self.config.get('stock_inventory', {}))
+        for source in stock.get('sources', []):
+            stock_id = self._make_stock_source_id(stock['name'], source['location'])
+            if stock_id in inventory:
+                continue
+            inventory[stock_id] = {
+                'remaining_volume': source.get('initial_volume'),
+            }
+        self.config['stock_inventory'] = inventory
+
+    def _normalize_and_store_stocks(self, stocks: List[Dict]) -> List[Dict]:
+        normalized_stocks = []
+        seen_locations = {}
+        inventory = dict(self.config.get('stock_inventory', {}))
+        for stock in stocks:
+            normalized = self._normalize_stock_definition(stock)
+            for source in normalized.get('sources', []):
+                location = source['location']
+                existing_stock = seen_locations.get(location)
+                if existing_stock is not None:
+                    raise ValueError(
+                        f"Stock source location {location} is already assigned to stock '{existing_stock}'"
+                    )
+                seen_locations[location] = normalized['name']
+                stock_id = self._make_stock_source_id(normalized['name'], location)
+                if stock_id not in inventory:
+                    inventory[stock_id] = {
+                        'remaining_volume': source.get('initial_volume'),
+                    }
+            normalized_stocks.append(normalized)
+
+        self.config['stocks'] = normalized_stocks
+        self.config['stock_inventory'] = inventory
+        return normalized_stocks
+
+    def _runtime_stock_configs(self, stock_config: Dict) -> List[Dict]:
+        runtime_configs = []
+        base = copy.deepcopy(stock_config)
+        sources = base.pop('sources', [])
+        tip_location = base.get('tip_location', base.get('tip'))
+        if not sources:
+            return [base]
+        for source in sources:
+            runtime_config = copy.deepcopy(base)
+            runtime_config['location'] = source['location']
+            if tip_location is not None:
+                runtime_config['tip_location'] = tip_location
+            stock_id = self._make_stock_source_id(runtime_config['name'], source['location'])
+            inventory_entry = self.config.get('stock_inventory', {}).get(stock_id, {})
+            remaining_volume = inventory_entry.get('remaining_volume')
+            if remaining_volume is None:
+                remaining_volume = source.get('initial_volume')
+            if remaining_volume is not None:
+                remaining_volume_qty = enforce_units(remaining_volume, 'volume')
+                if float(remaining_volume_qty.to('ul').magnitude) <= 0:
+                    continue
+                if runtime_config.get('total_volume') is None:
+                    runtime_config['total_volume'] = remaining_volume
+                else:
+                    runtime_config['_source_remaining_volume'] = remaining_volume
+            runtime_configs.append(runtime_config)
+        return runtime_configs
+
     def process_stocks(self):
         self._process_stocks_with_diagnostics(False)
 
@@ -299,16 +451,40 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
         diagnostics = []
         if capture_diagnostics:
             self.last_stock_load_diagnostics = diagnostics
-        for idx, stock_config in enumerate(self.config['stocks']):
-            if capture_diagnostics:
-                stock, diag = self._build_solution_with_diagnostics(stock_config, idx)
-                if diag:
-                    diagnostics.append(diag)
-            else:
-                stock = Solution(**stock_config)
-            new_stocks.append(stock)
-            if 'stock_locations' in self.config and stock.location is not None:
-                self.config['stock_locations'][stock.name] = stock.location
+        normalized_stocks = self._normalize_and_store_stocks(self.config['stocks'])
+        stock_locations = {}
+        for idx, stock_config in enumerate(normalized_stocks):
+            source_locations = [source['location'] for source in stock_config.get('sources', [])]
+            if 'stock_locations' in self.config:
+                stock_locations[stock_config['name']] = (
+                    source_locations[0] if len(source_locations) == 1 else source_locations
+                )
+            for runtime_config in self._runtime_stock_configs(stock_config):
+                source_remaining_volume = runtime_config.pop(
+                    '_source_remaining_volume', None
+                )
+                if capture_diagnostics:
+                    stock, diag = self._build_solution_with_diagnostics(runtime_config, idx)
+                    if diag:
+                        diagnostics.append(diag)
+                else:
+                    stock = Solution(**runtime_config)
+                if source_remaining_volume is not None:
+                    stock = stock.measure_out(source_remaining_volume)
+                stock.stock_group = stock_config['name']
+                stock.stock_id = (
+                    self._make_stock_source_id(stock_config['name'], stock.location)
+                    if stock.location is not None
+                    else None
+                )
+                new_stocks.append(stock)
+                inventory_entry = self.config.get('stock_inventory', {}).get(stock.stock_id, {})
+                if stock.stock_id is not None and inventory_entry.get('remaining_volume') is None and stock.volume is not None:
+                    self.config['stock_inventory'][stock.stock_id] = {
+                        'remaining_volume': f"{float(stock.volume.to('ul').magnitude)} ul"
+                    }
+        if 'stock_locations' in self.config:
+            self.config['stock_locations'] = stock_locations
         self.stocks = new_stocks
         return diagnostics
 
@@ -385,13 +561,15 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
             self.reset_stocks()
         else:
             prev = list(self.config['stocks'])
-        self.config['stocks'] = self.config['stocks'] + [solution]
-        if 'stock_locations' in self.config and solution.get('location') is not None:
-            self.config['stock_locations'][solution['name']] = solution['location']
+        prev_inventory = dict(self.config.get('stock_inventory', {}))
+        normalized_solution = self._normalize_stock_definition(solution)
+        self.config['stocks'] = self.config['stocks'] + [normalized_solution]
+        self._initialize_stock_inventory_entry(normalized_solution)
         try:
             self.process_stocks()
         except Exception as e:
             self.config['stocks'] = prev
+            self.config['stock_inventory'] = prev_inventory
             self.process_stocks()
             raise e
         self.config._update_history()
@@ -412,6 +590,7 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
 
     def reset_stocks(self):
         self.config['stocks'] = []
+        self.config['stock_inventory'] = {}
         if 'stock_locations' in self.config:
             self.config['stock_locations'].clear()
         self.config._update_history()
@@ -580,18 +759,20 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
             stocks = []
         prev_stocks = list(self.config['stocks'])
         prev_locs = dict(self.config['stock_locations']) if 'stock_locations' in self.config else {}
+        prev_inventory = dict(self.config.get('stock_inventory', {}))
         try:
             if reset:
                 self.reset_stocks()
-            for stock in stocks:
-                self.config['stocks'] = self.config['stocks'] + [stock]
-                if 'stock_locations' in self.config and stock.get('location') is not None:
-                    self.config['stock_locations'][stock['name']] = stock['location']
+            normalized_stocks = [self._normalize_stock_definition(stock) for stock in stocks]
+            self.config['stocks'] = self.config['stocks'] + normalized_stocks
+            for stock in normalized_stocks:
+                self._initialize_stock_inventory_entry(stock)
             diagnostics = self._process_stocks_with_diagnostics(True)
-            history_source = self._save_stock_snapshot(stocks=stocks, tags=tags)
-            return {'success': True, 'count': len(stocks), 'diagnostics': diagnostics, 'history_source': history_source}
+            history_source = self._save_stock_snapshot(stocks=normalized_stocks, tags=tags)
+            return {'success': True, 'count': len(normalized_stocks), 'diagnostics': diagnostics, 'history_source': history_source}
         except Exception as e:
             self.config['stocks'] = prev_stocks
+            self.config['stock_inventory'] = prev_inventory
             if 'stock_locations' in self.config:
                 self.config['stock_locations'].clear()
                 self.config['stock_locations'].update(prev_locs)
@@ -673,6 +854,138 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
         return {'success': True}
 
     @Driver.unqueued()
+    def generate_sweep_targets(self, sweep_config=None):
+        """Generate MixDoctor targets from a serializable sweep configuration.
+
+        The configuration is the same object saved by MixDoctor's sweep editor:
+        ``prefix``, ``size_type``, ``size_value``, ``rows``, and optional
+        ``name_rules``.  Keeping generation on the driver makes it available to
+        scripts and guarantees that the UI previews the exact target list that it
+        uploads.
+        """
+        if isinstance(sweep_config, str):
+            sweep_config = json.loads(sweep_config)
+        sweep_config = sweep_config or {}
+        if not isinstance(sweep_config, dict):
+            raise ValueError('sweep_config must be a dictionary')
+
+        property_keys = {
+            'mass': 'masses',
+            'volume': 'volumes',
+            'concentration': 'concentrations',
+            'mass_fraction': 'mass_fractions',
+            'volume_fraction': 'volume_fractions',
+            'molarity': 'molarities',
+            'molality': 'molalities',
+        }
+        property_short_names = {
+            'mass': 'm',
+            'volume': 'v',
+            'concentration': 'c',
+            'mass_fraction': 'mf',
+            'volume_fraction': 'vf',
+            'molarity': 'M',
+            'molality': 'm',
+        }
+        unit_properties = {'mass', 'volume', 'concentration', 'molarity', 'molality'}
+
+        active_rows = []
+        remainder_rows = []
+        solutes = []
+        source_rows = {}
+        for row in sweep_config.get('rows', []):
+            if not isinstance(row, dict) or not row.get('use', False):
+                continue
+            component = str(row.get('name', '')).strip()
+            property_type = str(row.get('prop_type', '')).strip()
+            if not component or property_type not in property_keys:
+                continue
+            source_rows.setdefault(component, row)
+            if row.get('is_solute', False) and component not in solutes:
+                solutes.append(component)
+            if row.get('is_remainder', False):
+                remainder_rows.append((component, property_type, str(row.get('units', '')).strip()))
+                continue
+            try:
+                start = float(row.get('start'))
+                stop = float(row.get('stop'))
+                steps = int(row.get('steps'))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'Invalid sweep range for {component!r}') from exc
+            if steps < 1:
+                raise ValueError(f'Sweep steps for {component!r} must be at least 1')
+            values = np.linspace(start, stop, steps).tolist()
+            active_rows.append((component, property_type, str(row.get('units', '')).strip(), values))
+
+        if not active_rows:
+            return []
+
+        target_count = int(np.prod([len(row[3]) for row in active_rows]))
+        if target_count > 10000:
+            raise ValueError(f'Sweep would create {target_count} targets; limit is 10000')
+
+        prefix = str(sweep_config.get('prefix') or 'target').strip() or 'target'
+        size_type = str(sweep_config.get('size_type') or '').strip()
+        size_value = sweep_config.get('size_value')
+        name_rules = sweep_config.get('name_rules') or []
+        targets = []
+
+        for index, values in enumerate(product(*(row[3] for row in active_rows))):
+            target = {}
+            if size_type and size_value not in (None, ''):
+                target[size_type] = size_value
+            for (component, property_type, units, _), value in zip(active_rows, values):
+                property_key = property_keys[property_type]
+                target.setdefault(property_key, {})[component] = (
+                    f'{value:g} {units}' if property_type in unit_properties and units else value
+                )
+            for component, property_type, _ in remainder_rows:
+                target.setdefault(property_keys[property_type], {})[component] = None
+            if solutes:
+                target['solutes'] = list(solutes)
+
+            name_segments = []
+            include_index = False
+            for rule in name_rules:
+                if not isinstance(rule, dict):
+                    continue
+                component = str(rule.get('component', '')).strip()
+                source_row = source_rows.get(component)
+                if source_row is None:
+                    continue
+                property_type = source_row.get('prop_type')
+                property_key = property_keys.get(property_type)
+                raw_value = target.get(property_key, {}).get(component) if property_key else None
+                if raw_value is None:
+                    continue
+                try:
+                    value = float(str(raw_value).split()[0])
+                except (TypeError, ValueError):
+                    continue
+                formatter = str(rule.get('formatter') or '.3f')
+                try:
+                    formatted = format(value, formatter)
+                except ValueError:
+                    formatted = f'{value:.4g}'
+                units = str(source_row.get('units', '')).strip().replace(' ', '')
+                suffix = units if rule.get('include_units', False) and property_type in unit_properties else ''
+                if rule.get('show_component', True):
+                    segment = f'{component}_{property_short_names[property_type]}{formatted}{suffix}'
+                else:
+                    segment = f'{formatted}{suffix}'
+                name_segments.append(segment)
+                include_index = include_index or bool(rule.get('include_index', False))
+
+            target['name'] = (
+                f'{prefix}-' + '-'.join(name_segments)
+                if name_segments else f'{prefix}-{index + 1:04d}'
+            )
+            if include_index and name_segments:
+                target['name'] += f'-{index + 1}'
+            targets.append(target)
+        return targets
+
+    @Driver.unqueued()
     def load_sweep_config(self):
         return self.config['sweep_config'] if 'sweep_config' in self.config else {}
 
@@ -696,7 +1009,29 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
     @Driver.unqueued()
     def list_stocks(self):
         self.process_stocks()
-        return [_solution_to_display_dict(stock) for stock in self.stocks]
+        inventory = self.config.get('stock_inventory', {})
+        listed_stocks = []
+        for stock in self.config.get('stocks', []):
+            entry = copy.deepcopy(stock)
+            aggregate_remaining_ul = 0.0
+            aggregate_known = False
+            for source in entry.get('sources', []):
+                stock_id = self._make_stock_source_id(entry['name'], source['location'])
+                remaining_volume = inventory.get(stock_id, {}).get('remaining_volume')
+                source['stock_id'] = stock_id
+                source['remaining_volume'] = remaining_volume
+                if remaining_volume is None:
+                    continue
+                try:
+                    aggregate_remaining_ul += float(enforce_units(remaining_volume, 'volume').to('ul').magnitude)
+                    aggregate_known = True
+                except Exception:
+                    continue
+            entry['remaining_volume'] = (
+                f"{round(aggregate_remaining_ul, 6)} ul" if aggregate_known else None
+            )
+            listed_stocks.append(entry)
+        return listed_stocks
 
     @Driver.unqueued()
     def list_stock_history(self):
@@ -895,7 +1230,7 @@ class MassBalanceDriver(MassBalanceBase, MassBalanceWebAppMixin, Driver):
 
         try:
             result = super().balance(
-                tol=self.config['tol'],
+                tol=self.config.get('tol', 1e-3),
                 return_report=return_report,
                 enable_multistep_dilution=bool(enable_multistep_dilution),
                 multistep_max_steps=int(self.config.get('multistep_max_steps', 2)),

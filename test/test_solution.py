@@ -97,6 +97,32 @@ def test_set_properties_from_dict():
 
 
 @pytest.mark.usefixtures("mixdb")
+def test_solution_accepts_tip_alias_and_copies_it():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        solution = Solution(name="TipStock", masses={"H2O": "10 g"}, tip="6A4")
+    assert solution.tip == "6A4"
+    assert solution.tip_location == "6A4"
+
+    measured = solution.measure_out("5 g")
+    assert measured.tip == "6A4"
+    assert measured.tip_location == "6A4"
+
+
+@pytest.mark.usefixtures("mixdb")
+def test_solution_accepts_tip_list_and_copies_it():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        solution = Solution(name="TipStockList", masses={"H2O": "10 g"}, tip=["6A4", "9A1"])
+    assert solution.tip == ["6A4", "9A1"]
+    assert solution.tip_location == ["6A4", "9A1"]
+
+    measured = solution.measure_out("5 g")
+    assert measured.tip == ["6A4", "9A1"]
+    assert measured.tip_location == ["6A4", "9A1"]
+
+
+@pytest.mark.usefixtures("mixdb")
 def test_rename_component():
     with warnings.catch_warnings():
         warnings.simplefilter("error")

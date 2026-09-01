@@ -19,6 +19,7 @@ from AFL.automation.shared.units import (
     AVOGADROS_NUMBER,
 )
 from AFL.automation.shared.warnings import MixWarning
+from AFL.automation.shared.utilities import listify
 
 SANITY_MSG = """
 Solution Check:
@@ -34,6 +35,33 @@ class Solution(Context):
     _stack_name = "stocks"
     _component_init_keys = {'name', 'mass', 'volume', 'density', 'formula', 'sld', 'uid', 'solute'}
 
+    @staticmethod
+    def _tip_locations_as_list(tip_value):
+        if tip_value is None:
+            return None
+        normalized = []
+        for location in listify(tip_value):
+            if location is None:
+                continue
+            if not isinstance(location, str):
+                raise TypeError(
+                    f"Tip location must be a string or list of strings, got {type(location).__name__}"
+                )
+            location = location.strip().upper()
+            if location and location not in normalized:
+                normalized.append(location)
+        if not normalized:
+            return None
+        return normalized
+
+    @staticmethod
+    def _collapse_tip_locations(tip_locations):
+        if tip_locations is None:
+            return None
+        if len(tip_locations) == 1:
+            return tip_locations[0]
+        return tip_locations
+
     def __init__(
         self,
         name: str,
@@ -47,7 +75,10 @@ class Solution(Context):
         molarities: Optional[Dict] = None,
         molalities: Optional[Dict] = None,
         location: Optional[str] = None,
+        tip: Optional[str | List[str]] = None,
+        tip_location: Optional[str | List[str]] = None,
         solutes: Optional[List[str]] = None,
+        stock_volume_fractions: Optional[Dict] = None,
         sanity_check: Optional[bool] = True,
     ):
         """
@@ -79,9 +110,18 @@ class Solution(Context):
             A dictionary of component molalities (moles per kilogram of solvent).
         location : str, optional
             The location of the solution on the robot. Usually a deck location e.g., '1A1'.
+        tip : str or list[str], optional
+            Optional tip location or ordered tip-location list associated with this stock,
+            e.g. '6A4' or ['6A4', '9A4'].
+        tip_location : str or list[str], optional
+            Alias for ``tip``.
         solutes : list of str, optional
             A list of solute names. If set, the components will be initialized as solutes and they won't contribute
             to the volume of the solution
+        stock_volume_fractions : dict, optional
+            A direct preparation recipe mapping configured stock names to
+            their requested volume fractions. This is preparation metadata,
+            distinct from ``volume_fractions`` over chemical components.
         sanity_check : bool, optional
             Whether to perform a sanity check on the solution.
 
@@ -98,7 +138,30 @@ class Solution(Context):
         super().__init__(name=name)
         self.context_type = "Solution"
         self.location = location
+        normalized_tip = self._tip_locations_as_list(tip)
+        normalized_tip_location = self._tip_locations_as_list(tip_location)
+        if (
+            normalized_tip is not None
+            and normalized_tip_location is not None
+            and normalized_tip != normalized_tip_location
+        ):
+            raise ValueError(
+                f"Received conflicting tip values: tip={tip!r}, tip_location={tip_location!r}"
+            )
+        resolved_tip = (
+            normalized_tip_location
+            if normalized_tip_location is not None
+            else normalized_tip
+        )
+        resolved_tip = self._collapse_tip_locations(resolved_tip)
+        self.tip = resolved_tip
+        self.tip_location = resolved_tip
         self.protocol = None
+        self.stock_volume_fractions = self._normalize_stock_volume_fractions(
+            stock_volume_fractions
+        )
+        self.stock_transfer_volumes = {}
+        self.requested_total_volume = None
         self.components: Dict = {}
         self.add_self_to_context()
 
@@ -195,9 +258,12 @@ class Solution(Context):
             self.mass = total_mass
 
         if total_volume is not None:
-            self.volume = total_volume
+            if self.stock_volume_fractions and len(self.solvents) == 0:
+                self.requested_total_volume = enforce_units(total_volume, "volume")
+            else:
+                self.volume = total_volume
 
-        if sanity_check:
+        if sanity_check and not self.stock_volume_fractions:
             self._sanity_check(masses, volumes, concentrations, mass_fractions, volume_fractions, molarities, molalities, total_mass, total_volume)
 
     def _process_fractions_with_remainder(self, fractions: Dict, fraction_type: str) -> Dict:
@@ -261,6 +327,37 @@ class Solution(Context):
         result = dict(fractions)
         result[remainder_key] = max(0.0, remainder)  # Clamp to 0 for tiny negative values due to float precision
         return result
+
+    @staticmethod
+    def _normalize_stock_volume_fractions(stock_volume_fractions: Optional[Dict]) -> Dict:
+        """Validate direct stock-dispense recipe fractions."""
+        if stock_volume_fractions is None:
+            return {}
+        if not isinstance(stock_volume_fractions, dict) or not stock_volume_fractions:
+            raise ValueError(
+                "stock_volume_fractions must be a non-empty mapping of stock names to fractions"
+            )
+
+        normalized = {}
+        fraction_sum = 0.0
+        for stock_name, fraction in stock_volume_fractions.items():
+            name = str(stock_name).strip()
+            if not name:
+                raise ValueError("stock_volume_fractions contains an empty stock name")
+            fraction_value = enforce_units(fraction, "dimensionless")
+            fraction_float = float(getattr(fraction_value, "magnitude", fraction_value))
+            if fraction_float < 0.0:
+                raise ValueError(
+                    f"stock_volume_fractions[{name!r}] must be non-negative, got {fraction_float}"
+                )
+            normalized[name] = fraction_float
+            fraction_sum += fraction_float
+
+        if abs(fraction_sum - 1.0) > 1e-2:
+            raise ValueError(
+                f"stock_volume_fractions must sum to 1.0, got {fraction_sum}"
+            )
+        return normalized
 
     def _sanity_check(self, masses, volumes, concentrations, mass_fractions, volume_fractions, molarities, molalities, total_mass, total_volume):
         """
@@ -449,8 +546,20 @@ class Solution(Context):
         return id(self)
 
     def to_dict(self):
+        if self.stock_volume_fractions:
+            total_volume = self.requested_total_volume or self.volume
+            return {
+                "name": self.name,
+                "location": self.location,
+                "total_volume": f"{round(float(total_volume.to('ul').magnitude), 6)} ul",
+                "stock_volume_fractions": copy.deepcopy(self.stock_volume_fractions),
+                "stock_transfer_volumes_ul": copy.deepcopy(self.stock_transfer_volumes),
+            }
+
         out_dict = {
             "name": self.name,
+            "location": self.location,
+            "tip": self.tip,
             "components": list(self.components.keys()),
             "masses": {},
         }
@@ -512,7 +621,12 @@ class Solution(Context):
         solution = Solution(name=name if name is not None else self.name)
         solution.context_type = self.context_type
         solution.location = self.location
+        solution.tip = copy.deepcopy(self.tip)
+        solution.tip_location = copy.deepcopy(self.tip_location)
         solution.protocol = self.protocol
+        solution.stock_volume_fractions = copy.deepcopy(self.stock_volume_fractions)
+        solution.stock_transfer_volumes = copy.deepcopy(self.stock_transfer_volumes)
+        solution.requested_total_volume = self.requested_total_volume
         solution.components = {name: component.copy() for name, component in self.components.items()}
         return solution
 

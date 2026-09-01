@@ -4,7 +4,8 @@
 # Explicitly exclude nbutil files from being exposed
 __all__ = [
     'exceptions',
-    'utilities'
+    'utilities',
+    'tiled',
     # Add other modules you want to expose here
     # But leave out 'nbutil', 'nbutil-APS', etc.
 ]

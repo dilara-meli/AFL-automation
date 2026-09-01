@@ -2,9 +2,7 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import Optional, Dict
 import pathlib
-import json
 import os
-import datetime
 
 import pandas as pd  # type: ignore
 import numpy as np
@@ -12,6 +10,11 @@ import tiled.client
 
 from AFL.automation.shared.PersistentConfig import PersistentConfig
 from AFL.automation.shared.exceptions import NotFoundError
+from AFL.automation.shared.tiled import (
+    TiledConfigurationError,
+    get_afl_home,
+    resolve_tiled_config,
+)
 from AFL.automation.shared.units import units, has_units
 
 # Global variable to store the last instantiated MixDB instance
@@ -613,45 +616,14 @@ class Tiled_DBEngine(DBEngine):
             self.fallback_engine.write(filename, writer=writer)
 
 def _resolve_afl_home() -> pathlib.Path:
-    home = os.environ.get('AFL_HOME', '')
-    if home.strip():
-        return pathlib.Path(home).expanduser()
-    return pathlib.Path.home() / '.afl'
+    return get_afl_home()
 
 
 def _read_global_tiled_config() -> tuple[str, str]:
-    config_path = _resolve_afl_home() / 'config.json'
-    if not config_path.exists():
-        return '', ''
     try:
-        with open(config_path, 'r') as f:
-            config_data = json.load(f)
-    except Exception:
+        return resolve_tiled_config()
+    except TiledConfigurationError:
         return '', ''
-    if not isinstance(config_data, dict) or not config_data:
-        return '', ''
-
-    # PersistentConfig uses YY/DD/MM timestamps, so lexicographic sorting can
-    # pick an older entry. Parse the timestamps to select the true latest entry.
-    datetime_key_format = '%y/%d/%m %H:%M:%S.%f'
-    try:
-        keys = sorted(
-            config_data.keys(),
-            key=lambda key: datetime.datetime.strptime(key, datetime_key_format),
-            reverse=True,
-        )
-    except ValueError:
-        keys = sorted(config_data.keys(), reverse=True)
-
-    for key in keys:
-        entry = config_data.get(key, {})
-        if not isinstance(entry, dict):
-            continue
-        server = str(entry.get('tiled_server', '')).strip()
-        api_key = str(entry.get('tiled_api_key', '')).strip()
-        if server:
-            return server, api_key
-    return '', ''
 
 
 def _get_default_engine_with_tiled_fallback(default_local_spec: pathlib.Path) -> DBEngine:

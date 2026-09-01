@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from AFL.automation.instrument.GamryDriver import GamryDriver
-from AFL.automation.instrument.gamry_worker import (
+from AFL.automation.instrument.Gamry.GamryDriver import GamryDriver
+from AFL.automation.instrument.Gamry.gamry_worker import (
     _build_measurement_result_from_data,
     _calculate_dpv_differential_current,
     _derive_dpv_trace,
@@ -296,10 +296,10 @@ def test_collect_dpv_allocates_curve_with_small_buffer_margin(monkeypatch):
         pstat_is_valid=lambda pstat: True,
     )
 
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker.initialize_pstat', lambda *args, **kwargs: None)
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker._curve_data_to_lists', lambda data: {'time': [], 'vf': [], 'im': []})
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker._derive_dpv_trace', lambda *args, **kwargs: None)
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker.time.sleep', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.gamry_worker.initialize_pstat', lambda *args, **kwargs: None)
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.gamry_worker._curve_data_to_lists', lambda data: {'time': [], 'vf': [], 'im': []})
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.gamry_worker._derive_dpv_trace', lambda *args, **kwargs: None)
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.gamry_worker.time.sleep', lambda *_args, **_kwargs: None)
 
     result = collect_dpv(
         fake_tkp,
@@ -349,7 +349,7 @@ def test_start_service_launches_worker(monkeypatch, driver):
         captured['kwargs'] = kwargs
         return process
 
-    monkeypatch.setattr('AFL.automation.instrument.GamryDriver.subprocess.Popen', fake_popen)
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.GamryDriver.subprocess.Popen', fake_popen)
 
     result = driver.startService()
 
@@ -441,7 +441,7 @@ def test_missing_persisted_worker_path_resets_to_repo_worker(tmp_path, monkeypat
         },
     )
 
-    expected_worker = pathlib.Path(__file__).resolve().parents[1] / 'AFL' / 'automation' / 'instrument' / 'gamry_worker.py'
+    expected_worker = pathlib.Path(__file__).resolve().parents[1] / 'AFL' / 'automation' / 'instrument' / 'Gamry' / 'gamry_worker.py'
     assert pathlib.Path(driver.getWorkerPath()) == expected_worker
 
 
@@ -1180,13 +1180,13 @@ def test_collect_dpv_returns_derived_trace_without_text_exports(monkeypatch):
         pstat_is_valid=lambda pstat: True,
     )
 
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker.initialize_pstat', lambda *args, **kwargs: None)
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.gamry_worker.initialize_pstat', lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        'AFL.automation.instrument.gamry_worker._curve_data_to_lists',
+        'AFL.automation.instrument.Gamry.gamry_worker._curve_data_to_lists',
         lambda data: {'time': [0.0, 0.1], 'vf': [-1.0, -0.975], 'im': [0.1, 0.2]},
     )
     monkeypatch.setattr(
-        'AFL.automation.instrument.gamry_worker._derive_dpv_trace',
+        'AFL.automation.instrument.Gamry.gamry_worker._derive_dpv_trace',
         lambda *args, **kwargs: {
             'time': [0.5, 1.0, 1.5],
             'potential': [-0.975, -0.970, -0.965],
@@ -1194,15 +1194,15 @@ def test_collect_dpv_returns_derived_trace_without_text_exports(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        'AFL.automation.instrument.gamry_worker._curve_data_to_lists',
+        'AFL.automation.instrument.Gamry.gamry_worker._curve_data_to_lists',
         lambda data: {
             'time': [0.00, 0.20, 0.39, 0.41, 0.45, 0.49, 0.50, 0.70, 0.89, 0.91, 0.95, 0.99],
             'vf': [-1.0, -1.0, -1.0, -0.975, -0.975, -0.975, -0.995, -0.995, -0.995, -0.97, -0.97, -0.97],
             'im': [0.10, 0.11, 0.12, 0.16, 0.17, 0.18, 0.14, 0.15, 0.16, 0.21, 0.22, 0.23],
         },
     )
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker._summarize_dpv_timing', lambda *args, **kwargs: {})
-    monkeypatch.setattr('AFL.automation.instrument.gamry_worker.time.sleep', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.gamry_worker._summarize_dpv_timing', lambda *args, **kwargs: {})
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.gamry_worker.time.sleep', lambda *_args, **_kwargs: None)
 
     result = collect_dpv(
         fake_tkp,

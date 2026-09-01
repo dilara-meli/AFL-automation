@@ -1,3 +1,11 @@
+"""APIServer driver that owns a locally connected Gamry potentiostat.
+
+``GamryDriver`` runs on the Windows host with Gamry's ``toolkitpy`` package
+and the physical potentiostat.  It launches :mod:`gamry_worker` in the
+configured Gamry Python environment, communicates with that worker over a
+local RPyC connection, and exposes queued measurement methods to APIServer.
+"""
+
 from AFL.automation.APIServer.Driver import Driver
 import atexit
 import datetime
@@ -17,7 +25,46 @@ from AFL.automation.APIServer.data.DataPacket import DataPacket
 
 
 class GamryDriver(Driver):
+    """Control a Gamry potentiostat through the local worker process.
+
+    Configure ``gamry_env_path`` to the Python environment that can import
+    ``toolkitpy``.  The worker path normally needs no override: it defaults to
+    the packaged ``gamry_worker.py`` file.  Start this driver on the Windows
+    instrument host; clients on other machines should normally use
+    :class:`GamryProxyDriver` instead of connecting to the instrument host
+    directly.
+
+    Example
+    -------
+    Start an APIServer using a configuration equivalent to::
+
+        GamryDriver(overrides={
+            'gamry_env_path': r'C:\\GamryPython\\.venv',
+            'instrument_name': 'PSTAT',
+        })
+
+    Then queue a CV from an AFL client::
+
+        from AFL.automation.APIServer.Client import Client
+
+        client = Client(ip='gamry-windows-host', port='5051', username='operator')
+        task_uuid = client.enqueue(
+            task_name='runCV',
+            initial_voltage=0.0,
+            apex1_voltage=-0.2,
+            apex2_voltage=0.5,
+            final_voltage=0.0,
+            scan_rate=0.1,
+            step_size=0.01,
+        )
+        result = client.wait(target_uuid=task_uuid)
+        dataset = client.retrieve_obj(task_uuid)
+
+    ``runCV``, ``runCA``, ``runSine``, and ``runDPV`` are queued operations;
+    use ``connectInstrument`` and status methods only for short setup checks.
+    """
     defaults = {}
+    # Worker and APIServer settings.
     defaults['gamry_env_path'] = ''
     defaults['worker_path'] = ''
     defaults['instrument_name'] = 'PSTAT'
@@ -27,6 +74,7 @@ class GamryDriver(Driver):
     defaults['service_port'] = 5059
     defaults['service_startup_timeout'] = 15.0
     defaults['measurement_mode'] = 'cv'
+    # Cyclic voltammetry (CV) settings.
     defaults['initial_voltage'] = 0
     defaults['apex1_voltage'] = -0.2
     defaults['apex2_voltage'] = 0.5
@@ -39,6 +87,7 @@ class GamryDriver(Driver):
     defaults['cycles'] = 1
     defaults['scan_delay'] = 0.0
     defaults['current_range_mode'] = 'auto'
+    # Chronoamperometry (CA) settings.
     defaults['ca_initial_voltage'] = 0.0
     defaults['ca_step1_voltage'] = 0.5
     defaults['ca_step2_voltage'] = 0.0
@@ -47,12 +96,14 @@ class GamryDriver(Driver):
     defaults['ca_step2_time'] = 2.0
     defaults['ca_sample_time'] = 0.05
     defaults['ca_expected_max_v'] = 10.0
+    # Sine-wave settings.
     defaults['sine_dc_offset'] = 0.0
     defaults['sine_amplitude'] = 0.05
     defaults['sine_frequency'] = 10.0
     defaults['sine_acq_frequency'] = 1000.0
     defaults['sine_total_time'] = 0.5
     defaults['sine_phase_offset'] = 0.0
+    # Differential pulse voltammetry (DPV) settings.
     defaults['dpv_initial_voltage'] = -1.0
     defaults['dpv_final_voltage'] = 0.0
     defaults['dpv_step_size'] = 0.005
@@ -63,7 +114,7 @@ class GamryDriver(Driver):
     defaults['dpv_irange_mode'] = 'fixed'
     defaults['dpv_max_current'] = 0.0003
     static_dirs = {
-        'gamry_panel_assets': pathlib.Path(__file__).parent.parent / 'apps' / 'gamry_panel',
+        'gamry_panel_assets': pathlib.Path(__file__).parent.parent.parent / 'apps' / 'gamry_panel',
     }
 
     @staticmethod
@@ -322,7 +373,7 @@ class GamryDriver(Driver):
 
     @Driver.unqueued(render_hint='html')
     def gamry_panel(self, **kwargs):
-        base = pathlib.Path(__file__).parent.parent / 'apps' / 'gamry_panel'
+        base = pathlib.Path(__file__).parent.parent.parent / 'apps' / 'gamry_panel'
         html = Template((base / 'gamry_panel.html').read_text(encoding='utf-8'))
         css = (base / 'gamry_panel.css').read_text(encoding='utf-8')
         js = (base / 'gamry_panel.js').read_text(encoding='utf-8')
@@ -1135,7 +1186,7 @@ class GamryDriver(Driver):
 
 # _OVERRIDE_MAIN_MODULE_NAME = 'GamryDriver'
 _DEFAULT_CUSTOM_CONFIG = {
-    '_classname': 'AFL.automation.instrument.GamryDriver.GamryDriver',
+    '_classname': 'AFL.automation.instrument.Gamry.GamryDriver.GamryDriver',
 }
 _DEFAULT_PORT = 5051
 

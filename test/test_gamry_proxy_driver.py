@@ -1,13 +1,16 @@
-from AFL.automation.instrument.GamryHTTPDriver import GamryHTTPDriver
+from AFL.automation.instrument.Gamry.GamryProxyDriver import GamryProxyDriver
+from AFL.automation.APIServer.Driver import ProxyDriver
 
 
 class FakeClient:
-    def __init__(self, ip=None, port='5000', interactive=False):
+    def __init__(self, ip=None, port='5000', username=None, interactive=False):
         self.ip = ip
         self.port = port
         self.interactive = interactive
         self.logged_in_username = None
         self.calls = []
+        if username is not None:
+            self.login(username)
 
     def login(self, username, populate_commands=True):
         self.logged_in_username = username
@@ -53,17 +56,46 @@ class FakeClient:
 
 
 def test_status_reports_remote_endpoint(monkeypatch):
-    monkeypatch.setattr('AFL.automation.instrument.GamryHTTPDriver.Client', FakeClient)
-    driver = GamryHTTPDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.GamryProxyDriver.Client', FakeClient)
+    driver = GamryProxyDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
 
     status = driver.status()
 
     assert 'server_url=http://gamry-win:5051' in status
 
 
+def test_is_proxy_driver():
+    assert isinstance(GamryProxyDriver(), ProxyDriver)
+
+
+def test_quickbar_parameters_are_grouped_and_labeled_with_units():
+    driver = GamryProxyDriver()
+
+    cv_params = driver.quickbar.function_info['runCV']['qb']['params']
+    ca_params = driver.quickbar.function_info['runCA']['qb']['params']
+
+    assert list(cv_params)[:7] == [
+        'initial_voltage',
+        'apex1_voltage',
+        'apex2_voltage',
+        'final_voltage',
+        'apex1_hold',
+        'apex2_hold',
+        'final_hold',
+    ]
+    assert cv_params['apex1_hold']['label'] == 'Apex 1 Hold (s)'
+    assert cv_params['scan_rate']['label'] == 'Scan Rate (V/s)'
+    assert list(ca_params)[:3] == [
+        'ca_initial_voltage',
+        'ca_step1_voltage',
+        'ca_step2_voltage',
+    ]
+    assert ca_params['ca_sample_time']['label'] == 'Sample Time (s)'
+
+
 def test_ping_uses_client_and_login(monkeypatch):
-    monkeypatch.setattr('AFL.automation.instrument.GamryHTTPDriver.Client', FakeClient)
-    driver = GamryHTTPDriver(
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.GamryProxyDriver.Client', FakeClient)
+    driver = GamryProxyDriver(
         overrides={
             'server_ip': 'gamry-win',
             'server_port': '5051',
@@ -81,8 +113,8 @@ def test_ping_uses_client_and_login(monkeypatch):
 
 
 def test_unqueued_methods_forward_to_remote_client(monkeypatch):
-    monkeypatch.setattr('AFL.automation.instrument.GamryHTTPDriver.Client', FakeClient)
-    driver = GamryHTTPDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.GamryProxyDriver.Client', FakeClient)
+    driver = GamryProxyDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
 
     status = driver.ping()
     connection = driver.connectInstrument(instrument_name='PSTAT-1')
@@ -92,16 +124,17 @@ def test_unqueued_methods_forward_to_remote_client(monkeypatch):
 
 
 def test_queued_methods_forward_task_name_and_kwargs(monkeypatch):
-    monkeypatch.setattr('AFL.automation.instrument.GamryHTTPDriver.Client', FakeClient)
-    driver = GamryHTTPDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.GamryProxyDriver.Client', FakeClient)
+    driver = GamryProxyDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
 
     result = driver.runCA(instrument_name='PSTAT-1', ca_step1_time=2.0)
 
     assert result.attrs['measurement_mode'] == 'ca'
-    assert driver._client.calls[0] == (
+    assert driver._proxy_clients['gamry'].calls[0] == (
         'enqueue',
         {
             'task_name': 'runCA',
+            'interactive': False,
             'ca_initial_voltage': 0.0,
             'ca_step1_voltage': 0.5,
             'ca_step2_voltage': 0.0,
@@ -118,10 +151,10 @@ def test_queued_methods_forward_task_name_and_kwargs(monkeypatch):
 
 
 def test_client_login_is_skipped_without_username(monkeypatch):
-    monkeypatch.setattr('AFL.automation.instrument.GamryHTTPDriver.Client', FakeClient)
-    driver = GamryHTTPDriver(overrides={'server_ip': 'gamry-win'})
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.GamryProxyDriver.Client', FakeClient)
+    driver = GamryProxyDriver(overrides={'server_ip': 'gamry-win'})
 
     result = driver.ping()
 
     assert result['driver_status']['driver'] == 'remote-gamry'
-    assert driver._client.logged_in_username == 'GamryHTTPDriver'
+    assert driver._proxy_clients['gamry'].logged_in_username == 'GamryProxyDriver'
