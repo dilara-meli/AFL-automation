@@ -35,6 +35,7 @@ class OT2Gripper(OT2GantryDriver):
     # toward an electrochemistry plate.  It is deliberately independent of
     # electrode-rack pickup calibration.
     WELL_APPROACH_Z = 170.0
+    MIN_LABWARE_TOP_CLEARANCE_MM = 65.0
 
     def __init__(
         self,
@@ -93,9 +94,10 @@ class OT2Gripper(OT2GantryDriver):
     def reset_electrode_racks(self) -> Dict[str, Any]:
         """Restore availability for all wells in the registered electrode racks."""
         self._ensure_no_held_electrode_for_reset()
-        slots = self._normalize_slots(self.config["electrode_rack_slots"])
-        if not slots:
-            raise ValueError("No electrode racks are registered. Call register_electrode_racks first.")
+        registered_slots = self.config["electrode_rack_slots"]
+        if not registered_slots:
+            raise RuntimeError("No electrode racks are registered. Call register_electrode_racks first.")
+        slots = self._normalize_slots(registered_slots)
         self.config["available_electrodes"] = self._electrodes_from_slots(
             self._owner_config(), slots
         )
@@ -337,6 +339,30 @@ class OT2Gripper(OT2GantryDriver):
         if not isinstance(meta, dict) or meta.get("exit_state") != "Success!":
             detail = meta.get("return_val") if isinstance(meta, dict) else meta
             raise RuntimeError(f"OT2 movement task {task_uuid} failed: {detail}")
+
+    def _enqueue_atomic_move(self, target, origin, offset):
+        """Queue only gripper moves that maintain labware-top clearance.
+
+        OT2 well coordinates are only comparable to a labware top when using
+        the ``top`` origin.  Other origins therefore cannot prove the required
+        clearance and are rejected rather than risking a collision.
+        """
+        if str(origin).strip().lower() != "top":
+            raise ValueError(
+                "OT2Gripper safety check requires moves relative to the labware top"
+            )
+        try:
+            z_offset = float(offset["z"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("OT2Gripper move must include a finite Z offset") from exc
+        if not math.isfinite(z_offset):
+            raise ValueError("OT2Gripper move must include a finite Z offset")
+        if z_offset < self.MIN_LABWARE_TOP_CLEARANCE_MM:
+            raise ValueError(
+                "OT2Gripper safety check rejected move: gripper would be closer than "
+                f"{self.MIN_LABWARE_TOP_CLEARANCE_MM:g} mm to the top of labware"
+            )
+        return super()._enqueue_atomic_move(target, origin, offset)
 
 
 _DEFAULT_PORT = 5059

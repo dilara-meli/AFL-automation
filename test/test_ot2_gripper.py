@@ -87,9 +87,9 @@ def driver(monkeypatch, tmp_path):
             "ot2_prepare_ip": "ot2-prepare.test",
             "ot2_prepare_port": "5002",
             "gripper_mount": "right",
-            "approach_z": 10.0,
-            "grip_z": -2.0,
-            "retract_z": 15.0,
+            "approach_z": 170.0,
+            "grip_z": 97.5,
+            "retract_z": 170.0,
         },
         afl_home=tmp_path,
     )
@@ -116,12 +116,12 @@ def test_proxy_workflow_waits_for_ot2_and_remote_gripper(driver):
     assert [call["task_name"] for call in gripper.calls] == ["set_angle", "close", "open"]
     assert gripper.calls[0]["angle"] == 60
     assert [call["params"]["wellLocation"]["offset"]["z"] for call in owner.calls] == [
-        10.0,
-        -2.0,
-        15.0,
-        10.0,
-        -2.0,
-        15.0,
+        170.0,
+        97.5,
+        170.0,
+        170.0,
+        97.5,
+        170.0,
     ]
     assert [call["params"]["wellLocation"]["offset"]["y"] for call in owner.calls] == [
         0.0,
@@ -156,18 +156,18 @@ def test_move_held_electrode_to_loaded_experiment_well(driver):
     owner.calls.clear()
     owner.waited.clear()
 
-    result = coordinator.move_electrode_to_well("2B1", experiment_z=12.5)
+    result = coordinator.move_electrode_to_well("2B1", experiment_z=65.0)
 
     assert result == {
         "status": "at_experiment_well",
         "electrode": coordinator.config["held_electrode"],
         "location": "2B1",
         "approach_z": 170.0,
-        "experiment_z": 12.5,
+        "experiment_z": 65.0,
     }
     assert [call["params"]["wellLocation"]["offset"] for call in owner.calls] == [
         {"x": 0.0, "y": 0.0, "z": 170.0},
-        {"x": 0.0, "y": 0.0, "z": 12.5},
+        {"x": 0.0, "y": 0.0, "z": 65.0},
     ]
     assert all(call["params"]["pipetteId"] == "pipette-right" for call in owner.calls)
     assert len(owner.waited) == 2
@@ -184,6 +184,23 @@ def test_move_to_experiment_well_requires_a_held_electrode_and_valid_z(driver):
         coordinator.move_electrode_to_well("2B1", experiment_z=float("nan"))
     with pytest.raises(ValueError, match="offset_y"):
         coordinator.drop_electrode("2B1", offset_y=float("nan"))
+
+
+def test_gripper_rejects_moves_below_labware_clearance(driver):
+    coordinator, owner, _ = driver
+    coordinator.config["held_electrode"] = {"location": "1A1"}
+
+    with pytest.raises(ValueError, match="closer than 65 mm"):
+        coordinator.move_electrode_to_well("2B1", experiment_z=64.9)
+    with pytest.raises(ValueError, match="closer than 65 mm"):
+        coordinator.move_to_well("2B1", offset_z=64.9)
+    with pytest.raises(ValueError, match="relative to the labware top"):
+        coordinator.move_to_well("2B1", origin="bottom", offset_z=100.0)
+
+    # The initial 170 mm approach is safe; the lower descent is rejected
+    # before it is submitted to OT2Prepare.
+    assert len(owner.calls) == 1
+    assert owner.calls[0]["params"]["wellLocation"]["offset"]["z"] == 170.0
 
 
 def test_registration_and_motion_validation(driver):
