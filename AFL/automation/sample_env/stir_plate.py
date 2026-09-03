@@ -1,4 +1,5 @@
 import re
+import os
 import threading
 import time
 
@@ -9,9 +10,11 @@ from AFL.automation.APIServer.Driver import Driver
 serial = lazy.load("serial", require="AFL-automation[serial]")
 
 
-class Stir_Plate(Driver):
+class stir_plate(Driver):
     defaults = {}
-    defaults["serial_port"] = "COM4"
+    # pyserial accepts Windows COM names directly, while Linux serial devices
+    # are exposed beneath /dev.
+    defaults["serial_port"] = "COM4" if os.name == "nt" else "/dev/ttyUSB0"
     defaults["baudrate"] = 9600
     defaults["timeout"] = 0.5
     defaults["status_query_timeout"] = 0.5
@@ -32,11 +35,11 @@ class Stir_Plate(Driver):
         self.app = None
         Driver.__init__(
             self,
-            name="Stir_Plate",
+            name="stir_plate",
             defaults=self.gather_defaults(),
             overrides=overrides,
         )
-        self.name = "Stir_Plate"
+        self.name = "stir_plate"
         self.connection = None
         self._serial_lock = threading.Lock()
         self.cached_rpm = None
@@ -66,13 +69,29 @@ class Stir_Plate(Driver):
             8: serial.EIGHTBITS,
         }
         return {
-            "port": self.config["serial_port"],
+            "port": self._serial_port(),
             "baudrate": self.config["baudrate"],
             "bytesize": bytesize_map[self.config["bytesize"]],
             "parity": parity_map[str(self.config["parity"]).upper()],
             "stopbits": stopbit_map[self.config["stopbits"]],
             "timeout": self.config["timeout"],
         }
+
+    def _serial_port(self):
+        """Return a pyserial-compatible port path on the current platform.
+
+        Existing configurations commonly use a bare Linux device name (for
+        example ``ttyUSB0``).  Convert those names to their device-node paths,
+        but leave explicit paths and Windows COM-port names untouched.
+        """
+        port = str(self.config["serial_port"]).strip()
+        if not port:
+            raise ValueError("serial_port must not be empty")
+
+        if os.name != "nt" and not port.startswith("/"):
+            if re.fullmatch(r"tty(?:USB|ACM|S)\d+", port):
+                return f"/dev/{port}"
+        return port
 
     def _ensure_connection(self):
         if self.connection is not None and self.connection.is_open:
@@ -120,6 +139,19 @@ class Stir_Plate(Driver):
     def _require_response(self, response, action):
         if response is None:
             raise RuntimeError(f"No response from stir plate during {action}")
+        return response
+
+    def _require_remote_mode(self, action):
+        """Refuse control writes when the plate reports local/manual control.
+
+        The controller acknowledges serial commands in manual mode, but does
+        not apply them.  Checking its status before a control write avoids
+        recording a successful queued task for an action the hardware ignored.
+        """
+        status = self.read_status()
+        if self.cached_mode == "manual":
+            raise RuntimeError("mode is set to manual, cannot execute command")
+        return status
 
     @staticmethod
     def _coerce_duration_part(value, field_name):
@@ -133,6 +165,21 @@ class Stir_Plate(Driver):
             return float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{field_name} must be numeric.") from exc
+
+    @staticmethod
+    def _coerce_rpm(value, default=None):
+        """Normalize an RPM input, using *default* for blank UI fields."""
+        if value is None or (isinstance(value, str) and not value.strip()):
+            if default is None:
+                raise ValueError("rpm must be numeric.")
+            value = default
+        try:
+            rpm = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("rpm must be numeric.") from exc
+        if rpm < 0:
+            raise ValueError("rpm must be non-negative.")
+        return rpm
 
     def _extract_first_int(self, response):
         if response is None:
@@ -154,11 +201,24 @@ class Stir_Plate(Driver):
             self.cached_mode = "unknown"
 
     @Driver.queued()
-    def start_stir(self):
+    def start_stir(self, rpm=None):
+        """Start stirring, optionally setting a requested RPM.
+
+        When no RPM is supplied, reuse the last positive setpoint or fall
+        back to ``default_rpm``.
+        """
+        if rpm is None or (isinstance(rpm, str) and not rpm.strip()):
+            target_rpm = (
+                self.cached_rpm
+                if isinstance(self.cached_rpm, int) and self.cached_rpm > 0
+                else int(self.config["default_rpm"])
+            )
+        else:
+            target_rpm = self._coerce_rpm(rpm)
+
         if self.cached_power_state != "on":
             self.start()
 
-        target_rpm = self.cached_rpm if isinstance(self.cached_rpm, int) and self.cached_rpm > 0 else int(self.config["default_rpm"])
         response = self.set_rpm(target_rpm)
         self.cached_power_state = "on"
         self.cached_stir_state = "running"
@@ -167,6 +227,7 @@ class Stir_Plate(Driver):
 
     @Driver.queued()
     def start(self):
+        self._require_remote_mode("start")
         response = self._require_response(self._send_command("start"), "start")
         self.cached_power_state = "on"
         if self.cached_stir_state == "unknown":
@@ -175,14 +236,8 @@ class Stir_Plate(Driver):
         return response
 
     @Driver.queued()
-    def stop_stir(self):
-        response = self.set_rpm(0)
-        self.cached_stir_state = "stopped"
-        self.cached_status = "stopped"
-        return response
-
-    @Driver.queued()
     def stop(self):
+        self._require_remote_mode("stop")
         response = self._require_response(self._send_command("stop"), "stop")
         self.cached_power_state = "off"
         self.cached_stir_state = "stopped"
@@ -199,8 +254,10 @@ class Stir_Plate(Driver):
 
     @Driver.queued()
     def set_rpm(self, rpm=350):
-        response = self._require_response(self._send_command(f"setrpm_{int(rpm)}"), "set_rpm")
-        self.cached_rpm = int(rpm)
+        rpm = self._coerce_rpm(rpm)
+        self._require_remote_mode(f"set_rpm({rpm})")
+        response = self._require_response(self._send_command(f"setrpm_{rpm}"), "set_rpm")
+        self.cached_rpm = rpm
         if self.cached_power_state == "off":
             self.cached_stir_state = "stopped"
             self.cached_status = "off"
@@ -228,6 +285,7 @@ class Stir_Plate(Driver):
 
     @Driver.queued()
     def set_power(self, power=50):
+        self._require_remote_mode(f"set_power({int(power)})")
         response = self._require_response(self._send_command(f"setpower_{int(power)}"), "set_power")
         self.cached_power = int(power)
         return response
@@ -316,8 +374,9 @@ class Stir_Plate(Driver):
         raise TimeoutError(f"Stir plate did not reach {speed} rpm within {timeout} s")
 
     @Driver.queued()
-    def run_stir(self, rpm, hours=0, minutes=5, seconds=0, power=None, wait_for_speed=True):
+    def run_stir(self, rpm=None, hours=0, minutes=5, seconds=0, power=None, wait_for_speed=True):
         self._cancel_run_program.clear()
+        rpm = self._coerce_rpm(rpm, default=self.config["default_rpm"])
         if power not in (None, ""):
             self.set_power(power)
         self.start_stir()
@@ -364,15 +423,9 @@ class Stir_Plate(Driver):
             status_lines.append(f"errors: {'; '.join(errors)}")
         return status_lines
 
-
+_DEFAULT_PORT = 5053
 if __name__ == "__main__":
     from AFL.automation.shared.launcher import *
-
-
-
-
-
-
 
 
 
