@@ -70,6 +70,13 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
     defaults["robot_port"] = "31950"  # Default Opentrons HTTP API port
     defaults["loaded_labware"] = {}  # Persistent storage for loaded labware
     defaults["loaded_instruments"] = {}  # Persistent storage for loaded instruments
+    defaults["gripper_attachment_profiles"] = {
+        "electrochem_gripper": {
+                "pipette_name": "p1000_single_gen2",
+                "gripper_tip_z_offset_mm": -65,
+                "horizontal_clearance_mm": 20.0
+  }}
+    defaults["loaded_gripper_attachments"] = {}
     defaults["loaded_modules"] = {}  # Persistent storage for loaded modules
     defaults["available_tips"] = {}  # Persistent storage for available tips, Format: {mount: [(tiprack_id, well_name), ...]}
     defaults["stock_tip_locations"] = {}  # Configured stock tip candidates, Format: {stock_name: ["6A4", "9A4"]}
@@ -619,6 +626,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 continue
             if mount not in loaded_instruments:
                 continue
+            if mount in self.config.get("loaded_gripper_attachments", {}):
+                continue
             if info.get("id") is None:
                 continue
             active_pipettes[mount] = info
@@ -1003,6 +1012,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 status.append(
                     f"Pipette on {mount} mount: {pipette.get('model', 'unknown')}"
                 )
+        for mount, attachment in self.config.get("loaded_gripper_attachments", {}).items():
+            status.append(
+                f"Gripper attachment on {mount} mount: {attachment.get('profile_name', 'unknown')}"
+            )
 
         # Get loaded labware information
         try:
@@ -1731,7 +1744,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             "the Opentrons hardware server before retrying."
         )
 
-    def load_instrument(self, name, mount, tip_rack_slots, reload=False, check_run_status=True, update_pipettes=True, **kwargs):
+    def load_instrument(self, name, mount, tip_rack_slots, reload=False, check_run_status=True, update_pipettes=True, allow_empty_tip_racks=False, **kwargs):
         """Load a pipette and initialize tip tracking.
 
         Parameters
@@ -1759,7 +1772,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         if mount not in {"left", "right"}:
             raise ValueError(f"Mount must be 'left' or 'right'. Received: {mount!r}")
         tip_rack_slots = [str(slot) for slot in listify(tip_rack_slots)]
-        if len(tip_rack_slots) == 0:
+        if len(tip_rack_slots) == 0 and not allow_empty_tip_racks:
             raise ValueError("At least one tip rack slot must be provided.")
 
         for slot in tip_rack_slots:
@@ -1867,6 +1880,68 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         except (requests.exceptions.RequestException, KeyError) as e:
             self.log_error(f"Error loading pipette: {str(e)}")
             raise RuntimeError(f"Error loading pipette: {str(e)}")
+
+    @Driver.queued()
+    def load_gripper_attachment(self, mount, profile_name):
+        """Load a calibrated virtual gripper attachment on a pipette mount."""
+        mount = str(mount).strip().lower()
+        if mount not in {"left", "right"}:
+            raise ValueError("mount must be 'left' or 'right'")
+        profiles = self.config.get("gripper_attachment_profiles", {})
+        try:
+            profile = dict(profiles[profile_name])
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"Unknown gripper attachment profile {profile_name!r}") from exc
+        required = {"pipette_name", "gripper_tip_z_offset_mm", "horizontal_clearance_mm"}
+        missing = required.difference(profile)
+        if missing:
+            raise ValueError(
+                f"Gripper attachment profile {profile_name!r} is missing {sorted(missing)!r}"
+            )
+        try:
+            profile["gripper_tip_z_offset_mm"] = float(profile["gripper_tip_z_offset_mm"])
+            profile["horizontal_clearance_mm"] = float(profile["horizontal_clearance_mm"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Gripper profile offset and clearance must be numeric") from exc
+        if profile["horizontal_clearance_mm"] < 0:
+            raise ValueError("Gripper profile clearance must be non-negative")
+        pipette_name = self._normalize_pipette_name(profile["pipette_name"])
+        instrument = self.config["loaded_instruments"].get(mount)
+        if instrument is None:
+            self.load_instrument(pipette_name, mount, [], allow_empty_tip_racks=True)
+            instrument = self.config["loaded_instruments"][mount]
+        elif instrument.get("name") != pipette_name:
+            raise ValueError(
+                f"Gripper profile {profile_name!r} requires {pipette_name!r}, but "
+                f"{instrument.get('name')!r} is loaded on {mount!r}"
+            )
+        attachments = dict(self.config.get("loaded_gripper_attachments", {}))
+        attachments[mount] = {
+            "profile_name": str(profile_name),
+            "pipette_id": instrument["pipette_id"],
+            **profile,
+        }
+        self.config["loaded_gripper_attachments"] = attachments
+        self._update_pipette_ranges()
+        return attachments[mount]
+
+    @Driver.queued()
+    def unload_gripper_attachment(self, mount):
+        """Remove a virtual gripper attachment and re-enable its pipette mount."""
+        mount = str(mount).strip().lower()
+        attachments = dict(self.config.get("loaded_gripper_attachments", {}))
+        if mount not in attachments:
+            raise ValueError(f"No gripper attachment is loaded on {mount!r}")
+        attachment = attachments.pop(mount)
+        self.config["loaded_gripper_attachments"] = attachments
+        self._update_pipette_ranges()
+        return attachment
+
+    def _assert_mount_available_for_liquid_handling(self, mount):
+        if str(mount).strip().lower() in self.config.get("loaded_gripper_attachments", {}):
+            raise RuntimeError(
+                f"Mount {mount!r} has a gripper attachment loaded and cannot perform liquid handling"
+            )
 
     def _normalize_pipette_name(self, name):
         """Normalize a pipette alias to the canonical Opentrons name."""
@@ -3057,6 +3132,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             raise ValueError(
                 f"Could not find pipette ID for mount {matches[0]['mount']}"
             )
+        self._assert_mount_available_for_liquid_handling(matches[0]["mount"])
         return matches[0]
 
     def pickup_tip(self, tip_location, tip_rack_offset=None):
@@ -3948,6 +4024,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         original_modules = self.config["loaded_modules"].copy()
         original_labware = self.config["loaded_labware"].copy()
         original_instruments = self.config["loaded_instruments"].copy()
+        original_gripper_attachments = self.config.get("loaded_gripper_attachments", {}).copy()
         old_uuid_to_slot = {}
         tiprack_slots = {}
         for (mount,instrument) in original_instruments.items():
@@ -4002,6 +4079,14 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 except Exception as e:
                     self.log_error(f"Error reloading instrument {instrument_name} on {mount} mount: {str(e)}")
                     raise
+
+            attachments = {}
+            for mount, attachment in original_gripper_attachments.items():
+                if mount in self.config["loaded_instruments"]:
+                    updated = dict(attachment)
+                    updated["pipette_id"] = self.config["loaded_instruments"][mount]["pipette_id"]
+                    attachments[mount] = updated
+            self.config["loaded_gripper_attachments"] = attachments
                     
             self.log_info("Deck configuration successfully reloaded")
 
@@ -4036,6 +4121,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             self.config["loaded_modules"] = original_modules
             self.config["loaded_labware"] = original_labware
             self.config["loaded_instruments"] = original_instruments
+            self.config["loaded_gripper_attachments"] = original_gripper_attachments
             return False
     
     def _ensure_run_exists(self, check_run_status=True):

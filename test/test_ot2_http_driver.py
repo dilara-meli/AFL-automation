@@ -144,6 +144,33 @@ def _configured_driver():
     return driver
 
 
+def test_load_gripper_attachment_uses_empty_tiprack_list_and_blocks_pipetting(monkeypatch):
+    driver = StubOT2HTTPDriver()
+    driver.config["gripper_attachment_profiles"] = {
+        "electrochem": {
+            "pipette_name": "p300_single",
+            "gripper_tip_z_offset_mm": -42.5,
+            "horizontal_clearance_mm": 20.0,
+        }
+    }
+    driver.hardware_pipettes = {
+        "right": _pipette_info("right", None, min_volume=20, max_volume=300),
+    }
+
+    def fake_post(url, headers=None, params=None, json=None):
+        assert json["data"]["commandType"] == "loadPipette"
+        assert json["data"]["params"]["tip_racks"] == []
+        return _FakeResponse({"data": {"result": {"pipetteId": "gripper-pipette"}}})
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", fake_post)
+    attachment = driver.load_gripper_attachment("right", "electrochem")
+
+    assert attachment["pipette_id"] == "gripper-pipette"
+    assert driver._available_pipette_options() == []
+    assert driver.unload_gripper_attachment("right")["profile_name"] == "electrochem"
+    assert driver._available_pipette_options()[0]["mount"] == "right"
+
+
 def _custom_labware_def(
     z_value=6.1,
     *,

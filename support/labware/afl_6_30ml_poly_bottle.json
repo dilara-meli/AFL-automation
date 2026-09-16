@@ -1,0 +1,117 @@
+{
+    "ordering": [
+        [
+            "A1",
+            "B1"
+        ],
+        [
+            "A2",
+            "B2"
+        ],
+        [
+            "A3",
+            "B3"
+        ]
+    ],
+    "brand": {
+        "brand": "AFL",
+        "brandId": []
+    },
+    "metadata": {
+        "displayName": "AFL_6_30ml_poly_bottle",
+        "displayCategory": "wellPlate",
+        "displayVolumeUnits": "µL",
+        "tags": []
+    },
+    "dimensions": {
+        "xDimension": 127.89,
+        "yDimension": 85.6,
+        "zDimension": 60
+    },
+    "wells": {
+        "A1": {
+            "depth": 52,
+            "totalLiquidVolume": 30000,
+            "shape": "circular",
+            "diameter": 21,
+            "x": 25.5,
+            "y": 61.85,
+            "z": 8
+        },
+        "B1": {
+            "depth": 52,
+            "totalLiquidVolume": 30000,
+            "shape": "circular",
+            "diameter": 21,
+            "x": 25.5,
+            "y": 23.85,
+            "z": 8
+        },
+        "A2": {
+            "depth": 52,
+            "totalLiquidVolume": 30000,
+            "shape": "circular",
+            "diameter": 21,
+            "x": 63.5,
+            "y": 61.85,
+            "z": 8
+        },
+        "B2": {
+            "depth": 52,
+            "totalLiquidVolume": 30000,
+            "shape": "circular",
+            "diameter": 21,
+            "x": 63.5,
+            "y": 23.85,
+            "z": 8
+        },
+        "A3": {
+            "depth": 52,
+            "totalLiquidVolume": 30000,
+            "shape": "circular",
+            "diameter": 21,
+            "x": 101.5,
+            "y": 61.85,
+            "z": 8
+        },
+        "B3": {
+            "depth": 52,
+            "totalLiquidVolume": 30000,
+            "shape": "circular",
+            "diameter": 21,
+            "x": 101.5,
+            "y": 23.85,
+            "z": 8
+        }
+    },
+    "groups": [
+        {
+            "metadata": {
+                "wellBottomShape": "flat"
+            },
+            "wells": [
+                "A1",
+                "B1",
+                "A2",
+                "B2",
+                "A3",
+                "B3"
+            ]
+        }
+    ],
+    "parameters": {
+        "format": "irregular",
+        "quirks": [],
+        "isTiprack": false,
+        "isMagneticModuleCompatible": false,
+        "loadName": "afl_6_30ml_poly_bottle"
+    },
+    "namespace": "custom_beta",
+    "version": 1,
+    "schemaVersion": 2,
+    "cornerOffsetFromSlot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+    }
+}

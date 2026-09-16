@@ -23,19 +23,18 @@ class OT2Gripper(OT2GantryDriver):
         "gripper_ip": "10.42.0.231",
         "gripper_port": "5058",
         "gripper_mount": "left",
-        "approach_z": None,
+        # All workflow moves translate in XY at this absolute gripper height
+        # above the deck before moving vertically to their requested Z
+        # coordinate relative to the target well top.
+        "translate_z": 105.0,
         "grip_z": None,
         "retract_z": None,
         "electrode_rack_slots": [],
         "available_electrodes": [],
+        "occupied_electrode_slots": [],
+        "used_electrode_slots": [],
         "held_electrode": None,
     }
-
-    # The gripper first moves to this well-relative height before descending
-    # toward an electrochemistry plate.  It is deliberately independent of
-    # electrode-rack pickup calibration.
-    WELL_APPROACH_Z = 170.0
-    MIN_LABWARE_TOP_CLEARANCE_MM = 65.0
 
     def __init__(
         self,
@@ -63,6 +62,11 @@ class OT2Gripper(OT2GantryDriver):
             overrides=overrides,
             afl_home=afl_home,
         )
+        # ``approach_z`` was replaced by the gripper workflow's translate
+        # height. Remove it from persistent configurations created by older
+        # versions.
+        if "approach_z" in self.config:
+            del self.config["approach_z"]
         OT2GantryDriver.__init__(
             self,
             overrides=overrides,
@@ -75,6 +79,9 @@ class OT2Gripper(OT2GantryDriver):
         # pipette that physically carries the remote gripper.
         self.config["gantry_reference_mount"] = gripper_mount
         self._gripper_client = None
+        # Last completed physical gripper position. This lets each subsequent
+        # movement explicitly retract before translating in XY.
+        self._gripper_motion_state = None
 
     @Driver.queued()
     def register_electrode_racks(self, slots: Iterable[str]) -> Dict[str, Any]:
@@ -85,9 +92,9 @@ class OT2Gripper(OT2GantryDriver):
         """
         self._ensure_no_held_electrode_for_reset()
         slots = self._normalize_slots(slots)
-        available = self._electrodes_from_slots(self._owner_config(), slots)
+        occupied = self._electrodes_from_slots(self._owner_config(), slots)
         self.config["electrode_rack_slots"] = slots
-        self.config["available_electrodes"] = available
+        self._set_occupied_electrode_slots(occupied)
         return self.status()
 
     @Driver.queued()
@@ -98,35 +105,45 @@ class OT2Gripper(OT2GantryDriver):
         if not registered_slots:
             raise RuntimeError("No electrode racks are registered. Call register_electrode_racks first.")
         slots = self._normalize_slots(registered_slots)
-        self.config["available_electrodes"] = self._electrodes_from_slots(
-            self._owner_config(), slots
+        self._set_occupied_electrode_slots(
+            self._electrodes_from_slots(self._owner_config(), slots)
         )
         return self.status()
 
     @Driver.queued()
-    def pickup_electrode(self, location: Optional[str] = None) -> Dict[str, Any]:
-        """Pick up a specified available electrode or the next available one."""
+    def pickup_electrode(
+        self, location: Optional[str] = None, reuse: bool = False
+    ) -> Dict[str, Any]:
+        """Pick up an occupied unused electrode, or reuse one when requested.
+
+        Set ``reuse=True`` to allow selection of an electrode that was picked
+        up previously and then returned to its origin slot.
+        """
         if self.config["held_electrode"] is not None:
             raise RuntimeError("An electrode is already held. Drop it before picking up another.")
+        reuse = self._normalize_reuse(reuse)
         heights = self._motion_heights()
         owner_config = self._owner_config()
-        electrode = self._reserve_electrode(owner_config, location)
+        electrode = self._reserve_electrode(owner_config, location, reuse=reuse)
 
-        self._run_gripper_command("set_angle", angle=60)
-        self._move_and_wait(owner_config, electrode, heights["approach_z"])
+        self._run_gripper_command("set_angle", angle=50)
         self._move_and_wait(owner_config, electrode, heights["grip_z"])
         self._run_gripper_command("close")
+        self._mark_electrode_used(electrode)
         self._move_and_wait(owner_config, electrode, heights["retract_z"])
         self.config["held_electrode"] = electrode
         return {"status": "picked_up", "electrode": electrode, "gripper": self.status()}
 
     @Driver.queued()
-    def drop_electrode(self, location: str, offset_y: float = 0.0) -> Dict[str, Any]:
-        """Move to ``location`` plus a Y offset, release, and retract.
+    def drop_electrode(
+        self, location: Optional[str] = None, offset_y: float = 0.0, waste: bool = False
+    ) -> Dict[str, Any]:
+        """Return a held electrode to its origin, or discard it in a waste well.
 
-        ``offset_y`` is a well-relative displacement in millimetres. It is
-        applied to the approach, release, and retract positions so the
-        electrode follows a vertical path at the requested offset.
+        A normal drop may only return the electrode to its pickup location,
+        which is the only electrode-rack well made unoccupied by pickup. Set
+        ``waste=True`` and provide a loaded waste-well location to discard the
+        electrode without reoccupying its origin slot.
         """
         held_electrode = self.config["held_electrode"]
         if held_electrode is None:
@@ -134,10 +151,24 @@ class OT2Gripper(OT2GantryDriver):
         offset_y = self._finite_z(offset_y, "offset_y")
         heights = self._motion_heights()
         owner_config = self._owner_config()
-        target = self._resolve_location(owner_config, location)
-        self._move_and_wait(owner_config, target, heights["approach_z"], offset_y=offset_y)
+        if waste:
+            if location is None or not str(location).strip():
+                raise ValueError("A waste location is required when waste=True")
+            target = self._resolve_location(owner_config, location)
+        else:
+            origin = held_electrode["location"]
+            if location is not None and str(location).strip().upper() != origin.upper():
+                raise RuntimeError(
+                    f"Electrode can only be returned to its origin slot {origin}; "
+                    "use waste=True to discard it elsewhere."
+                )
+            target = self._resolve_location(owner_config, origin)
         self._move_and_wait(owner_config, target, heights["grip_z"], offset_y=offset_y)
         self._run_gripper_command("open")
+        # Opening releases the electrode. Restore only a normal return before
+        # retracting so a retract failure cannot leave its origin unoccupied.
+        if not waste:
+            self._mark_electrode_slot_occupied(held_electrode)
         self._move_and_wait(owner_config, target, heights["retract_z"], offset_y=offset_y)
         self.config["held_electrode"] = None
         return {
@@ -149,30 +180,65 @@ class OT2Gripper(OT2GantryDriver):
         }
 
     @Driver.queued()
-    def move_electrode_to_well(self, location: str, experiment_z: float) -> Dict[str, Any]:
+    def move_electrode_to_well(
+        self,
+        location: str,
+        experiment_z: float,
+        offset_x: float = 0.0,
+        offset_y: float = 0.0,
+    ) -> Dict[str, Any]:
         """Move the held electrode safely to a loaded experiment-plate well.
 
         ``location`` uses the standard OT2Prepare ``"<slot><well>"`` form.
         The driver resolves that location against OT2Prepare's currently
-        loaded labware, moves first to :attr:`WELL_APPROACH_Z`, waits for the
-        move to complete, then descends to the requested well-relative
-        ``experiment_z`` offset.
+        loaded labware, translates laterally at ``translate_z``, then descends
+        to the requested well-relative ``experiment_z`` offset. ``offset_x``
+        and ``offset_y`` are well-relative millimetre offsets applied to both
+        the translation and the vertical move.
         """
         held_electrode = self.config["held_electrode"]
         if held_electrode is None:
             raise RuntimeError("No electrode is held. Pick up an electrode before moving to a well.")
         experiment_z = self._finite_z(experiment_z, "experiment_z")
+        offset_x = self._finite_z(offset_x, "offset_x")
+        offset_y = self._finite_z(offset_y, "offset_y")
         owner_config = self._owner_config()
         target = self._resolve_location(owner_config, location)
-        self._move_and_wait(owner_config, target, self.WELL_APPROACH_Z)
-        self._move_and_wait(owner_config, target, experiment_z)
+        self._move_and_wait(
+            owner_config,
+            target,
+            experiment_z,
+            offset_x=offset_x,
+            offset_y=offset_y,
+        )
         return {
             "status": "at_experiment_well",
             "electrode": held_electrode,
             "location": target["location"],
-            "approach_z": self.WELL_APPROACH_Z,
+            "translate_z": self._translate_z(),
             "experiment_z": experiment_z,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
         }
+
+    def move_to_well(
+        self,
+        location,
+        origin="top",
+        offset_x=None,
+        offset_y=None,
+        offset_z=None,
+    ):
+        """Disallow raw gantry moves that bypass gripper approach sequencing."""
+        raise RuntimeError(
+            "OT2Gripper direct gantry moves are disabled; use the electrode workflow methods."
+        )
+
+    def move_pipette(self, mount="", dx=0.0, dy=0.0, dz=0.0):
+        """Disallow raw relative moves that bypass gripper approach sequencing."""
+        raise RuntimeError(
+            "OT2Gripper direct gantry moves are disabled; use the electrode workflow methods."
+        )
 
     @Driver.unqueued()
     def status(self) -> Dict[str, Any]:
@@ -186,6 +252,8 @@ class OT2Gripper(OT2GantryDriver):
             "electrode_rack_slots": list(self.config["electrode_rack_slots"]),
             "available_electrodes": list(self.config["available_electrodes"]),
             "available_electrode_count": len(self.config["available_electrodes"]),
+            "occupied_electrode_slots": list(self.config["occupied_electrode_slots"]),
+            "used_electrode_slots": list(self.config["used_electrode_slots"]),
             "held_electrode": self.config["held_electrode"],
         }
 
@@ -223,7 +291,7 @@ class OT2Gripper(OT2GantryDriver):
 
     def _motion_heights(self) -> Dict[str, float]:
         heights = {}
-        for key in ("approach_z", "grip_z", "retract_z"):
+        for key in ("grip_z", "retract_z"):
             heights[key] = self._finite_z(self.config[key], key)
         return heights
 
@@ -240,6 +308,39 @@ class OT2Gripper(OT2GantryDriver):
     def _ensure_no_held_electrode_for_reset(self) -> None:
         if self.config["held_electrode"] is not None:
             raise RuntimeError("Cannot reset electrode racks while an electrode is held.")
+
+    def _set_occupied_electrode_slots(self, occupied: list[list[str]]) -> None:
+        """Persist occupied source wells and the legacy availability view."""
+        occupied = [list(entry) for entry in occupied]
+        self.config["occupied_electrode_slots"] = occupied
+        self.config["available_electrodes"] = list(occupied)
+
+    def _mark_electrode_slot_occupied(self, electrode: Dict[str, str]) -> None:
+        occupied = list(self.config["occupied_electrode_slots"])
+        key = [electrode["labware_id"], electrode["well_name"]]
+        if key not in occupied:
+            occupied.append(key)
+        self._set_occupied_electrode_slots(occupied)
+
+    def _mark_electrode_used(self, electrode: Dict[str, str]) -> None:
+        used = list(self.config["used_electrode_slots"])
+        key = [electrode["labware_id"], electrode["well_name"]]
+        if key not in used:
+            used.append(key)
+            self.config["used_electrode_slots"] = used
+
+    @staticmethod
+    def _normalize_reuse(reuse: bool) -> bool:
+        if isinstance(reuse, str):
+            normalized = reuse.strip().lower()
+            if normalized in {"true", "1", "yes"}:
+                return True
+            if normalized in {"false", "0", "no", ""}:
+                return False
+            raise ValueError("reuse must be a boolean")
+        if isinstance(reuse, bool):
+            return reuse
+        raise ValueError("reuse must be a boolean")
 
     def _normalize_slots(self, slots: Iterable[str]) -> list[str]:
         if isinstance(slots, str):
@@ -269,33 +370,36 @@ class OT2Gripper(OT2GantryDriver):
             available.extend([[labware_id, str(well).upper()] for well in wells])
         return available
 
-    def _reserve_electrode(self, owner_config, location: Optional[str]) -> Dict[str, str]:
-        available = list(self.config["available_electrodes"])
-        if not available:
+    def _reserve_electrode(
+        self, owner_config, location: Optional[str], reuse: bool = False
+    ) -> Dict[str, str]:
+        occupied = list(self.config["occupied_electrode_slots"])
+        if not occupied:
             raise RuntimeError("No electrodes are available. Register or reset electrode racks.")
+        used = list(self.config["used_electrode_slots"])
+        eligible = occupied if reuse else [entry for entry in occupied if entry not in used]
+        if not eligible:
+            raise RuntimeError(
+                "No unused occupied electrodes are available. Pass reuse=True to reuse an electrode."
+            )
         if location is None:
-            labware_id, well_name = available[0]
+            labware_id, well_name = eligible[0]
             target = self._target_from_inventory_entry(owner_config, labware_id, well_name)
-            index = 0
         else:
             target = self._resolve_location(owner_config, location)
-            index = next(
-                (
-                    index
-                    for index, entry in enumerate(available)
-                    if len(entry) == 2
-                    and entry[0] == target["labware_id"]
-                    and str(entry[1]).upper() == target["well_name"]
-                ),
-                None,
-            )
-            if index is None:
+            key = [target["labware_id"], target["well_name"]]
+            if key not in occupied:
                 raise ValueError(f"Requested electrode location {target['location']} is not available")
-        del available[index]
-        self.config["available_electrodes"] = available
+            if key in used and not reuse:
+                raise RuntimeError(
+                    f"Electrode at {target['location']} has already been used; pass reuse=True to pick it again."
+                )
+        key = [target["labware_id"], target["well_name"]]
+        occupied.remove(key)
+        self._set_occupied_electrode_slots(occupied)
         return target
 
-    def _target_from_inventory_entry(self, owner_config, labware_id: str, well_name: str) -> Dict[str, str]:
+    def _target_from_inventory_entry(self, owner_config, labware_id: str, well_name: str) -> Dict[str, Any]:
         for slot in self.config["electrode_rack_slots"]:
             labware = owner_config.get("loaded_labware", {}).get(str(slot))
             if labware and labware[0] == labware_id:
@@ -304,8 +408,12 @@ class OT2Gripper(OT2GantryDriver):
             f"Registered electrode labware {labware_id!r} is no longer loaded in its configured slot"
         )
 
-    def _resolve_location(self, owner_config, location: str) -> Dict[str, str]:
+    def _resolve_location(self, owner_config, location: str) -> Dict[str, Any]:
         slot, well_name = self._parse_location(location)
+        if str(slot) in owner_config.get("loaded_modules", {}):
+            raise ValueError(
+                f"Cannot determine the deck height of labware loaded on module slot {slot!r}"
+            )
         try:
             labware_id, _, labware_data = owner_config["loaded_labware"][slot]
             wells = labware_data["definition"]["wells"]
@@ -318,27 +426,152 @@ class OT2Gripper(OT2GantryDriver):
             "labware_id": labware_id,
             "well_name": well_name,
             "location": f"{slot}{well_name}",
+            "well_top_z": self._well_top_z(wells[well_name], f"{slot}{well_name}"),
         }
+
+    def _well_top_z(self, well: Dict[str, Any], label: str) -> float:
+        """Return a well-top height above the deck from loaded labware geometry."""
+        try:
+            bottom_z = float(well["z"])
+            depth = float(well["depth"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Labware well {label!r} has no usable z and depth geometry"
+            ) from exc
+        if not math.isfinite(bottom_z) or not math.isfinite(depth) or depth < 0:
+            raise ValueError(f"Labware well {label!r} has invalid z or depth geometry")
+        return bottom_z + depth
+
+    def _validate_translate_clearance(
+        self, owner_config: Dict[str, Any], translate_z: float, attachment: Dict[str, float]
+    ) -> None:
+        """Prove the deck-height translation plane clears every loaded labware well."""
+        try:
+            loaded_labware = owner_config["loaded_labware"]
+        except KeyError as exc:
+            raise ValueError("OT2Prepare configuration has no loaded labware") from exc
+        if not isinstance(loaded_labware, dict):
+            raise ValueError("OT2Prepare loaded labware configuration is invalid")
+
+        highest_well_top = None
+        for slot, labware in loaded_labware.items():
+            if str(slot) in owner_config.get("loaded_modules", {}):
+                raise ValueError(
+                    f"Cannot determine the deck height of labware loaded on module slot {slot!r}"
+                )
+            try:
+                wells = labware[2]["definition"]["wells"]
+            except (IndexError, KeyError, TypeError) as exc:
+                raise ValueError(
+                    f"Loaded labware in slot {slot!r} has no usable well geometry"
+                ) from exc
+            if not isinstance(wells, dict) or not wells:
+                raise ValueError(
+                    f"Loaded labware in slot {slot!r} has no usable well geometry"
+                )
+            for well_name, well in wells.items():
+                well_top = self._well_top_z(well, f"{slot}{well_name}")
+                highest_well_top = (
+                    well_top
+                    if highest_well_top is None
+                    else max(highest_well_top, well_top)
+                )
+
+        required_height = highest_well_top + attachment["horizontal_clearance_mm"]
+        if translate_z < required_height:
+            raise ValueError(
+                "Gripper translate_z does not clear loaded labware: "
+                f"{translate_z:g} mm is below the required {required_height:g} mm"
+            )
 
     def _move_and_wait(
         self,
         owner_config,
-        target: Dict[str, str],
-        z_offset: float,
+        target: Dict[str, Any],
+        offset_z: float,
+        offset_x: float = 0.0,
         offset_y: float = 0.0,
     ) -> None:
-        mount = self._normalize_mount(self.config["gripper_mount"])
-        ot2_target = self._resolve_target(owner_config, target["slot"], target["well_name"], mount)
-        task_uuid = self._enqueue_atomic_move(
-            ot2_target,
-            "top",
-            {"x": 0.0, "y": offset_y, "z": z_offset},
+        offset_z = self._finite_z(offset_z, "offset_z")
+        offset_x = self._finite_z(offset_x, "offset_x")
+        offset_y = self._finite_z(offset_y, "offset_y")
+        attachment = self._gripper_attachment(owner_config)
+        translate_z = self._translate_z()
+        self._validate_translate_clearance(owner_config, translate_z, attachment)
+        desired_offset = {"x": offset_x, "y": offset_y, "z": offset_z}
+        target_translate_offset = translate_z - target["well_top_z"]
+        desired_absolute_z = target["well_top_z"] + offset_z
+
+        # First return vertically to the fixed deck-height translation plane
+        # at the current XY position whenever a previous move ended elsewhere.
+        current = self._gripper_motion_state
+        if current is not None:
+            current_absolute_z = current.get(
+                "absolute_z", current["target"]["well_top_z"] + current["offset"]["z"]
+            )
+        else:
+            current_absolute_z = None
+        if current is not None and current_absolute_z != translate_z:
+            self._enqueue_gripper_move(owner_config, current["target"], {
+                "x": current["offset"]["x"],
+                "y": current["offset"]["y"],
+                "z": translate_z - current["target"]["well_top_z"],
+            })
+
+        # Every workflow movement explicitly translates to its target XY at
+        # translate_z, including when the target matches local motion state.
+        # This keeps the high-level workflow contract independent of callers.
+        self._enqueue_gripper_move(
+            owner_config,
+            target,
+            {"x": offset_x, "y": offset_y, "z": target_translate_offset},
         )
+
+        # Move vertically only after the XY translation has completed.
+        if desired_absolute_z != translate_z:
+            self._enqueue_gripper_move(owner_config, target, desired_offset)
+
+    def _enqueue_gripper_move(self, owner_config, target: Dict[str, Any], offset: Dict[str, float]) -> None:
+        """Submit one completed gripper move and update the physical position."""
+        mount = self._normalize_mount(self.config["gripper_mount"])
+        attachment = self._gripper_attachment(owner_config)
+        ot2_target = self._resolve_target(owner_config, target["slot"], target["well_name"], mount)
+        # The profile offset is expressed as the gripper's lowest-point Z
+        # relative to the pipette tip. Convert the requested physical gripper
+        # coordinate into the pipette coordinate expected by Opentrons.
+        pipette_offset = dict(offset)
+        pipette_offset["z"] = offset["z"] - attachment["gripper_tip_z_offset_mm"]
+        task_uuid = self._enqueue_atomic_move(ot2_target, "top", pipette_offset)
         client = self._get_ot2_prepare_client()
         meta = client.wait(target_uuid=task_uuid, first_check_delay=0.0)
         if not isinstance(meta, dict) or meta.get("exit_state") != "Success!":
             detail = meta.get("return_val") if isinstance(meta, dict) else meta
             raise RuntimeError(f"OT2 movement task {task_uuid} failed: {detail}")
+        self._gripper_motion_state = {
+            "target": dict(target),
+            "offset": dict(offset),
+            "absolute_z": target["well_top_z"] + offset["z"],
+        }
+
+    def _gripper_attachment(self, owner_config) -> Dict[str, float]:
+        mount = self._normalize_mount(self.config["gripper_mount"])
+        try:
+            attachment = dict(owner_config["loaded_gripper_attachments"][mount])
+            attachment["gripper_tip_z_offset_mm"] = float(
+                attachment["gripper_tip_z_offset_mm"]
+            )
+            attachment["horizontal_clearance_mm"] = float(
+                attachment["horizontal_clearance_mm"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"OT2Gripper requires a calibrated gripper attachment on the {mount!r} mount"
+            ) from exc
+        return attachment
+
+    def _translate_z(self) -> float:
+        """Return the fixed, deck-relative gripper height used for XY translation."""
+        return self._finite_z(self.config["translate_z"], "translate_z")
 
     def _enqueue_atomic_move(self, target, origin, offset):
         """Queue only gripper moves that maintain labware-top clearance.
@@ -352,16 +585,11 @@ class OT2Gripper(OT2GantryDriver):
                 "OT2Gripper safety check requires moves relative to the labware top"
             )
         try:
-            z_offset = float(offset["z"])
+            offset_z = float(offset["z"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("OT2Gripper move must include a finite Z offset") from exc
-        if not math.isfinite(z_offset):
+        if not math.isfinite(offset_z):
             raise ValueError("OT2Gripper move must include a finite Z offset")
-        if z_offset < self.MIN_LABWARE_TOP_CLEARANCE_MM:
-            raise ValueError(
-                "OT2Gripper safety check rejected move: gripper would be closer than "
-                f"{self.MIN_LABWARE_TOP_CLEARANCE_MM:g} mm to the top of labware"
-            )
         return super()._enqueue_atomic_move(target, origin, offset)
 
 
@@ -372,11 +600,11 @@ _DEFAULT_CUSTOM_CONFIG = {
         "gripper_ip": "10.42.0.231",
         "gripper_port": "5058",
         "gripper_mount": "right",
+        "translate_z": "105",
         "ot2_prepare_ip": "127.0.0.1",
         "ot2_prepare_port": "5002",
-        "approach_z": "170",
-        "grip_z": "97.5",
-        "retract_z": "170",
+        "grip_z": "10",
+        "retract_z": "105",
         "log_level": logging.INFO,
     },
 }
