@@ -118,6 +118,56 @@ def test_transfer_stage_records_prepare_execution_metadata():
     assert entry["planned_transfer"]["required_volume_ul"] == 50.0
 
 
+def test_transfer_to_waste_tracks_waste_and_advances_to_next_bottle():
+    driver = StubOT2Prepare()
+    driver.last_target_location = "5A1"
+    driver.config["waste_protocol"] = {"volume": 50}
+    driver.config["waste_bottles"] = [
+        {"name": "waste-1", "location": "12A1", "capacity": "100 ul"},
+        {"name": "waste-2", "location": "12A2", "capacity": "100 ul"},
+    ]
+
+    driver.transfer_to_waste()
+    driver.transfer_to_waste()
+
+    assert [call["dest"] for call in driver.transfer_calls] == ["12A1", "12A2"]
+    inventory = driver.get_waste_inventory()
+    assert inventory["waste-1"]["transferred_volume_ul"] == 50.0
+    assert inventory["waste-2"]["transferred_volume_ul"] == 50.0
+    executed = driver.data["prepare"]["executed_transfers"]
+    assert executed[-1]["waste_bottle"] == "waste-2"
+
+
+def test_transfer_to_catch_does_not_select_or_track_waste_bottles():
+    driver = StubOT2Prepare()
+    driver.last_target_location = "5A1"
+    driver.config["catch_protocol"] = {"dest": "12A1", "volume": 50}
+    driver.config["waste_bottles"] = [
+        {"location": "12A1", "capacity": "100 ul"},
+        {"location": "12A2", "capacity": "100 ul"},
+    ]
+
+    driver.transfer_to_catch()
+
+    assert driver.transfer_calls[-1]["dest"] == "12A1"
+    assert driver.get_waste_inventory()["12A1"]["transferred_volume_ul"] == 0.0
+
+
+def test_transfer_to_waste_stops_before_all_waste_bottles_are_near_full():
+    driver = StubOT2Prepare()
+    driver.last_target_location = "5A1"
+    driver.config["waste_protocol"] = {"dest": "12A1", "volume": 50}
+    driver.config["waste_bottles"] = [
+        {"location": "12A1", "capacity": "100 ul"},
+    ]
+
+    driver.transfer_to_waste()
+    with pytest.raises(ValueError, match="No configured waste bottle has room"):
+        driver.transfer_to_waste()
+
+    assert len(driver.transfer_calls) == 1
+
+
 @pytest.mark.usefixtures("mixdb")
 def test_process_stocks_tracks_reserved_stock_tips():
     driver = StubOT2Prepare()

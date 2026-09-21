@@ -8,6 +8,7 @@ from AFL.automation.mixcalc.MassBalanceDriver import MassBalanceDriver
 from AFL.automation.prepare.PipetteAction import PipetteAction
 from AFL.automation.mixcalc.Solution import Solution
 from AFL.automation.shared.PersistentConfig import PersistentConfig
+from AFL.automation.shared.units import enforce_units
 from AFL.automation.shared.utilities import listify
 
 
@@ -96,9 +97,63 @@ class PrepareDriver(MassBalanceDriver):
         """Backend hook to adjust a planned preparation target before validation."""
         return balanced_target
 
+    def _sync_minimum_volume_from_backend(self) -> None:
+        """Persist the smallest positive transfer volume exposed by this backend.
+
+        ``MassBalance`` needs a volume with units, while preparation backends
+        conventionally expose their loaded-pipette limit as a numeric value in
+        microlitres (``min_transfer``) or a list of such values.  Keep the
+        persisted mass-balance setting aligned with the currently loaded
+        hardware when that information is available.  Generic prepare drivers
+        without pipette metadata retain their configured value.
+        """
+        raw_minima = []
+        get_minima = getattr(self, "_loaded_pipette_minimum_volumes", None)
+        if callable(get_minima):
+            try:
+                raw_minima.extend(get_minima() or [])
+            except Exception:
+                # A failed hardware metadata query must not prevent a balance
+                # using the previously configured minimum volume.
+                pass
+
+        if not raw_minima:
+            min_transfer = getattr(self, "min_transfer", None)
+            if min_transfer is not None:
+                raw_minima.append(min_transfer)
+
+        minima_ul = []
+        for raw_minimum in raw_minima:
+            try:
+                if isinstance(raw_minimum, (int, float)):
+                    quantity = enforce_units(f"{raw_minimum} ul", "volume")
+                else:
+                    quantity = enforce_units(raw_minimum, "volume")
+                volume_ul = float(quantity.to("ul").magnitude)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if volume_ul > 0:
+                minima_ul.append(volume_ul)
+
+        if not minima_ul:
+            return
+
+        backend_minimum = min(minima_ul)
+        configured_minimum = self.config.get("minimum_volume")
+        try:
+            configured_ul = float(
+                enforce_units(configured_minimum, "volume").to("ul").magnitude
+            )
+        except (AttributeError, TypeError, ValueError):
+            configured_ul = None
+
+        if configured_ul is None or abs(configured_ul - backend_minimum) > 1e-9:
+            self.config["minimum_volume"] = f"{backend_minimum:g} ul"
+
     def _balance_target(self, target: dict, enable_multistep_dilution: bool) -> dict | None:
         """Plan one target through the common MassBalance result contract."""
         self._validate_stock_volume_fraction_sources(target)
+        self._sync_minimum_volume_from_backend()
         mb = MassBalance(minimum_volume=self.config.get("minimum_volume", "100 ul"))
         mb.stocks.extend(self.stocks)
         target_solution = Solution(**self.apply_fixed_comps(target.copy()))

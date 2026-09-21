@@ -4237,7 +4237,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             labware_id=labware_id,
             well_name=well_name,
             tip_rack_offset=offset,
-            approach_z_offset=50.0,
+            approach_z_offset=10.0,
             check_run_status=False,
         )
 

@@ -121,13 +121,19 @@ def test_proxy_workflow_waits_for_ot2_and_remote_gripper(driver):
     assert coordinator.config["gantry_reference_mount"] == "right"
     assert "pickup_electrode" in coordinator.queued.functions
     assert "drop_electrode" in coordinator.queued.functions
+    assert "complete_electrode_measurement" in coordinator.queued.functions
 
     coordinator.register_electrode_racks(["1"])
-    picked = coordinator.pickup_electrode("1A2")
-    dropped = coordinator.drop_electrode("1A2", offset_y=1.25)
+    picked = coordinator.pickup_electrode("1A2", offset_x=-0.5, offset_y=0.75)
+    dropped = coordinator.drop_electrode("1A2", offset_x=2.0, offset_y=1.25)
 
     assert picked["electrode"]["location"] == "1A2"
+    assert picked["measurement_metadata"]["electrode_id"] == "1:A2"
+    assert picked["measurement_metadata"]["electrode_use_index"] == 1
+    assert picked["offset_x"] == -0.5
+    assert picked["offset_y"] == 0.75
     assert dropped["location"] == "1A2"
+    assert dropped["offset_x"] == 2.0
     assert dropped["offset_y"] == 1.25
     assert coordinator.config["held_electrode"] is None
     assert coordinator.config["available_electrodes"] == [
@@ -150,17 +156,30 @@ def test_proxy_workflow_waits_for_ot2_and_remote_gripper(driver):
         170.0,
     ]
     assert [call["params"]["wellLocation"]["offset"]["y"] for call in owner.calls] == [
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        0.75,
+        0.75,
+        0.75,
+        0.75,
+        0.75,
+        0.75,
         1.25,
         1.25,
         1.25,
         1.25,
         1.25,
+    ]
+    assert [call["params"]["wellLocation"]["offset"]["x"] for call in owner.calls] == [
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        -0.5,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
     ]
     assert all(call["params"]["pipetteId"] == "pipette-right" for call in owner.calls)
     assert len(owner.waited) == 11
@@ -215,6 +234,29 @@ def test_pickup_requires_reuse_for_a_returned_used_electrode(driver):
     assert picked["electrode"]["location"] == "1A1"
 
 
+def test_electrode_measurement_count_commits_only_after_completion(driver):
+    coordinator, _, _ = driver
+    coordinator.register_electrode_racks(["1"])
+
+    picked = coordinator.pickup_electrode("1A1")
+    assert picked["measurement_metadata"] == {
+        "electrode_id": "1:A1",
+        "electrode_origin_location": "1A1",
+        "electrode_use_index": 1,
+        "electrode_completed_measurement_count": 0,
+    }
+    assert coordinator.config["electrode_measurement_counts"] == {}
+
+    completed = coordinator.complete_electrode_measurement()
+    assert completed["status"] == "completed"
+    assert coordinator.config["electrode_measurement_counts"] == {"1:A1": 1}
+    assert coordinator.complete_electrode_measurement()["status"] == "already_completed"
+
+    coordinator.drop_electrode()
+    reused = coordinator.pickup_electrode("1A1", reuse=True)
+    assert reused["measurement_metadata"]["electrode_use_index"] == 2
+
+
 def test_move_held_electrode_to_loaded_experiment_well(driver):
     coordinator, owner, _ = driver
     coordinator.register_electrode_racks(["1"])
@@ -257,6 +299,10 @@ def test_move_to_experiment_well_requires_a_held_electrode_and_valid_z(driver):
         coordinator.move_electrode_to_well("2B1", experiment_z=10, offset_x=float("nan"))
     with pytest.raises(ValueError, match="offset_y"):
         coordinator.move_electrode_to_well("2B1", experiment_z=10, offset_y=float("nan"))
+    coordinator.config["held_electrode"] = None
+    with pytest.raises(ValueError, match="offset_x"):
+        coordinator.pickup_electrode("1A1", offset_x=float("nan"))
+    coordinator.config["held_electrode"] = {"location": "1A1"}
     with pytest.raises(ValueError, match="offset_y"):
         coordinator.drop_electrode("2B1", offset_y=float("nan"))
 

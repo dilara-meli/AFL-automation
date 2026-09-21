@@ -38,6 +38,16 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
         "stock_locations": {},  # Maps stock names to deck positions: {'stockH2O': '3A2'}
         "stock_transfer_params": {},  # Per-stock transfer parameters: {'stockH2O': {'mix_after': True}}
         "catch_protocol": {},  # PipetteAction-formatted dict for catch transfer parameters
+        "waste_protocol": {},  # PipetteAction-formatted dict for waste transfers
+        # Ordered waste destinations.  Each entry requires ``location`` and a
+        # capacity (``capacity``, ``volume``, or ``total_volume``), for example
+        # ``{"location": "12A1", "capacity": "1 l"}``.
+        "waste_bottles": [],
+        # A bottle is retired before a transfer would take it beyond this
+        # fraction of its capacity.  This leaves deliberate headroom.
+        "waste_bottle_fill_fraction": 0.9,
+        # Persisted transferred volumes, keyed by bottle name or location.
+        "waste_inventory": {},
     }
 
     def __init__(self, overrides=None):
@@ -104,6 +114,13 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
                     f"{remaining_volume_ul} uL" if remaining_volume_ul is not None else "unknown"
                 )
             status.append(f"Stock inventory remaining: {remaining_by_stock}")
+        waste_inventory = self._waste_inventory_snapshot()
+        if waste_inventory:
+            remaining_by_bottle = {
+                bottle_name: f"{entry['remaining_volume_ul']} uL"
+                for bottle_name, entry in waste_inventory.items()
+            }
+            status.append(f"Waste bottle remaining: {remaining_by_bottle}")
         status.append(
             f"Stock-reserved tips: {len(self.config.get('reserved_stock_tips', []))}"
         )
@@ -157,6 +174,7 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             "p300_single": 20.0,
             "p1000": 100.0,
             "p1000_single": 100.0,
+            "p1000_single_gen2": 100.0
         }
         return known_minima.get(normalized)
 
@@ -455,6 +473,123 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             "remaining_after_ul": after_ul,
             "consumed_volume_ul": round(float(consumed_volume_ul), 6),
         }
+
+    def _configured_waste_bottles(self):
+        """Return normalized, ordered waste-bottle definitions.
+
+        ``waste_bottles`` is normally a list of dictionaries.  A single
+        dictionary is accepted as a convenience, as is the legacy singular
+        ``waste_bottle`` setting.  Bottles are selected in list order.
+        """
+        bottles = self.config.get("waste_bottles", [])
+        if not bottles:
+            bottles = self.config.get("waste_bottle", [])
+        if isinstance(bottles, dict):
+            bottles = [bottles] if "location" in bottles else [
+                dict(value, name=name) for name, value in bottles.items()
+            ]
+
+        normalized = []
+        for bottle in bottles or []:
+            if not isinstance(bottle, dict):
+                raise ValueError("Each waste_bottles entry must be a dictionary")
+            location = bottle.get("location", bottle.get("dest"))
+            capacity = bottle.get("capacity", bottle.get("volume", bottle.get("total_volume")))
+            if location is None or capacity is None:
+                raise ValueError(
+                    "Each waste bottle requires 'location' and a capacity "
+                    "('capacity', 'volume', or 'total_volume')."
+                )
+            capacity_ul = float(enforce_units(capacity, "volume").to("ul").magnitude)
+            if capacity_ul <= 0:
+                raise ValueError(f"Waste bottle {location!r} must have a positive capacity")
+            initial_volume = bottle.get("initial_volume", bottle.get("starting_volume", "0 ul"))
+            initial_ul = float(enforce_units(initial_volume, "volume").to("ul").magnitude)
+            if initial_ul < 0 or initial_ul > capacity_ul:
+                raise ValueError(
+                    f"Initial volume for waste bottle {location!r} must be between zero and its capacity"
+                )
+            fill_fraction = float(bottle.get(
+                "fill_fraction", self.config.get("waste_bottle_fill_fraction", 0.9)
+            ))
+            if not 0 < fill_fraction <= 1:
+                raise ValueError(
+                    f"Waste bottle {location!r} fill_fraction must be greater than zero and no more than one"
+                )
+            normalized.append({
+                "name": str(bottle.get("name", location)),
+                "location": str(location),
+                "capacity_ul": capacity_ul,
+                "initial_volume_ul": initial_ul,
+                "fill_fraction": fill_fraction,
+            })
+        return normalized
+
+    def _waste_inventory_snapshot(self):
+        """Return capacity and accumulated-transfer information for waste bottles."""
+        inventory = self.config.get("waste_inventory", {})
+        snapshot = {}
+        for bottle in self._configured_waste_bottles():
+            transferred_ul = float(inventory.get(bottle["name"], {}).get("transferred_volume_ul", 0.0))
+            filled_ul = bottle["initial_volume_ul"] + transferred_ul
+            snapshot[bottle["name"]] = {
+                "location": bottle["location"],
+                "capacity_volume_ul": round(bottle["capacity_ul"], 6),
+                "initial_volume_ul": round(bottle["initial_volume_ul"], 6),
+                "transferred_volume_ul": round(transferred_ul, 6),
+                "filled_volume_ul": round(filled_ul, 6),
+                "remaining_volume_ul": round(max(0.0, bottle["capacity_ul"] - filled_ul), 6),
+                "fill_fraction": bottle["fill_fraction"],
+            }
+        return snapshot
+
+    def _select_waste_bottle(self, requested_dest, volume_ul):
+        """Choose the first bottle with headroom for a waste transfer.
+
+        A configured catch destination is treated as the first preferred
+        bottle, but later bottles are automatically used once it reaches its
+        configured fill fraction.
+        """
+        bottles = self._configured_waste_bottles()
+        if not bottles:
+            return requested_dest, None
+        requested_dest = None if requested_dest is None else str(requested_dest)
+        configured_locations = {bottle["location"] for bottle in bottles}
+        if requested_dest is not None and requested_dest not in configured_locations:
+            return requested_dest, None
+
+        # A catch protocol can nominate any bottle as its starting point;
+        # only later bottles are fallbacks for that explicit ordering.
+        if requested_dest is not None:
+            start_index = next(
+                index for index, bottle in enumerate(bottles)
+                if bottle["location"] == requested_dest
+            )
+            bottles = bottles[start_index:]
+
+        requested_ul = float(volume_ul)
+        inventory = self._waste_inventory_snapshot()
+        for bottle in bottles:
+            filled_ul = inventory[bottle["name"]]["filled_volume_ul"]
+            safe_limit_ul = bottle["capacity_ul"] * bottle["fill_fraction"]
+            if filled_ul + requested_ul <= safe_limit_ul + 1e-9:
+                return bottle["location"], bottle
+        raise ValueError(
+            f"No configured waste bottle has room for {requested_ul} uL below its fill threshold"
+        )
+
+    def _record_waste_transfer(self, bottle, transferred_volume_ul):
+        """Persist a successful transfer into a configured waste bottle."""
+        if bottle is None:
+            return None
+        inventory = dict(self.config.get("waste_inventory", {}))
+        entry = dict(inventory.get(bottle["name"], {}))
+        previous_ul = float(entry.get("transferred_volume_ul", 0.0))
+        transferred_ul = float(transferred_volume_ul)
+        entry["transferred_volume_ul"] = round(previous_ul + transferred_ul, 6)
+        inventory[bottle["name"]] = entry
+        self.config["waste_inventory"] = inventory
+        return self._waste_inventory_snapshot()[bottle["name"]]
 
     def _ordered_stock_tip_candidates(self, stock_name, step_tip_location=None):
         """Return prioritized tip candidates for a stock transfer.
@@ -1311,6 +1446,11 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             include_sources=bool(include_sources),
         )
 
+    @Driver.unqueued()
+    def get_waste_inventory(self):
+        """Return configured waste-bottle capacities and transferred volumes."""
+        return self._waste_inventory_snapshot()
+
     def get_transfer_params(self, stock_name):
         """Return merged transfer parameters for a stock.
 
@@ -1453,6 +1593,74 @@ class OT2Prepare(OT2HTTPDriver, PrepareDriver):
             dest_val = catch_params.get("dest", "unknown")
             warnings.warn(
                 f"Transfer to catch failed from {source} to {dest_val} using {catch_params}: {str(e)}",
+                stacklevel=2,
+            )
+            raise
+
+    @capture_task_video("transfer_to_waste.mp4")
+    def transfer_to_waste(
+        self,
+        source=None,
+        dest=None,
+        capture_task_video=False,
+        **kwargs,
+    ):
+        """Transfer liquid to the next waste bottle with sufficient headroom.
+
+        ``waste_protocol`` supplies normal transfer parameters, including the
+        required ``volume``.  With no ``dest`` supplied, the first configured
+        bottle that remains below its fill threshold is selected.  If a
+        configured destination is supplied, it and later bottles are tried in
+        configuration order.
+        """
+        waste_params = self.config.get("waste_protocol", {}).copy()
+        if source is None:
+            if self.last_target_location is None:
+                raise ValueError(
+                    "No source specified and no last target location available. "
+                    "Call prepare() first or specify source."
+                )
+            source = self.last_target_location
+        kwargs["source"] = source
+        if dest is not None:
+            kwargs["dest"] = dest
+        waste_params.update(kwargs)
+        if "volume" not in waste_params:
+            raise ValueError("Transfer volume must be specified in waste_protocol or as an argument.")
+
+        requested_volume_ul = float(waste_params["volume"])
+        waste_dest, waste_bottle = self._select_waste_bottle(
+            waste_params.get("dest"), requested_volume_ul
+        )
+        if waste_dest is None:
+            raise ValueError("No waste destination is configured or specified.")
+        waste_params["dest"] = waste_dest
+
+        try:
+            transfer_result = self.transfer(**waste_params)
+            transferred_volume_ul = (
+                sum(transfer_result.get("subtransfers_ul", [])) or requested_volume_ul
+            )
+            waste_inventory = self._record_waste_transfer(
+                waste_bottle, transferred_volume_ul
+            )
+            self._record_prepare_transfer(
+                stage_type="waste",
+                source=waste_params["source"],
+                dest=waste_params["dest"],
+                requested_volume_ul=requested_volume_ul,
+                source_stock_name=self.config.get("deck", {}).get(waste_params["source"]),
+                transfer_params={k: v for k, v in waste_params.items() if k not in ("source", "dest", "volume")},
+                transfer_result=transfer_result,
+                extra={
+                    "waste_bottle": None if waste_bottle is None else waste_bottle["name"],
+                    "waste_inventory": waste_inventory,
+                },
+            )
+        except Exception as e:
+            warnings.warn(
+                f"Transfer to waste failed from {source} to {waste_params.get('dest', 'unknown')} "
+                f"using {waste_params}: {str(e)}",
                 stacklevel=2,
             )
             raise

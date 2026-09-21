@@ -106,6 +106,77 @@ def _make_balanced_target(mass_transfers, target):
     return balanced_target
 
 
+def _allocate_stock_group_volumes(stocks, requested_volumes_ul):
+    """Allocate each logical stock's requested volume across ordered sources.
+
+    Both direct recipes and concentration balances use this allocation step.
+    A ``stock_group`` represents one logical stock; its runtime ``Solution``
+    instances are ordered physical sources.  The first source is exhausted
+    before a later source is used, matching the inventory behavior of direct
+    stock-volume-fraction recipes.
+    """
+    allocations = {}
+    for stock_group, requested_volume_ul in requested_volumes_ul.items():
+        required_volume_ul = _integer_volume_ul(requested_volume_ul)
+        remaining_volume_ul = required_volume_ul
+        sources = [
+            stock
+            for stock in stocks
+            if getattr(stock, "stock_group", stock.name) == stock_group
+        ]
+        if not sources:
+            raise ValueError(f"Unknown stock '{stock_group}' in transfer plan")
+
+        for stock in sources:
+            if stock.location is None:
+                continue
+            available_volume_ul = math.floor(float(stock.volume.to("ul").magnitude))
+            transfer_volume_ul = min(remaining_volume_ul, available_volume_ul)
+            if transfer_volume_ul <= 0:
+                continue
+            allocations[stock] = transfer_volume_ul
+            remaining_volume_ul -= transfer_volume_ul
+            if remaining_volume_ul <= 0:
+                break
+
+        if remaining_volume_ul > 0:
+            raise ValueError(
+                f"Not enough volume remaining across stock sources for '{stock_group}'. "
+                f"Requested {required_volume_ul} uL, {remaining_volume_ul} uL could not be allocated."
+            )
+    return allocations
+
+
+def _redistribute_transfers_by_stock_group(stocks, transfers):
+    """Collapse solved source transfers into logical stocks, then allocate sources.
+
+    The concentration solver operates on source-level solutions for chemistry.
+    This common final-planning step removes arbitrary least-squares splitting
+    between compositionally identical sources.
+    """
+    requested_volumes_ul = {}
+    for stock, mass_g in zip(stocks, transfers):
+        if float(mass_g) <= 0:
+            continue
+        stock_group = getattr(stock, "stock_group", stock.name)
+        requested_volume_ul = float(
+            stock.measure_out(f"{float(mass_g)} g").volume.to("ul").magnitude
+        )
+        requested_volumes_ul[stock_group] = (
+            requested_volumes_ul.get(stock_group, 0.0) + requested_volume_ul
+        )
+
+    allocations = _allocate_stock_group_volumes(stocks, requested_volumes_ul)
+    redistributed = np.zeros(len(stocks), dtype=float)
+    for idx, stock in enumerate(stocks):
+        volume_ul = allocations.get(stock)
+        if volume_ul is not None:
+            redistributed[idx] = float(
+                stock.measure_out(f"{volume_ul} ul").mass.to("g").magnitude
+            )
+    return redistributed
+
+
 def _make_stock_volume_fraction_target(stocks, target):
     """Compile a direct stock-volume recipe into a normal balanced target."""
     requested_total_volume = target.requested_total_volume
@@ -118,46 +189,26 @@ def _make_stock_volume_fraction_target(stocks, target):
     balanced_target.stock_transfer_volumes = {}
     balanced_target.requested_total_volume = requested_total_volume
 
-    for stock_name, fraction in target.stock_volume_fractions.items():
-        required_volume_ul = _integer_volume_ul(
-            float(requested_total_volume.to("ul").magnitude) * fraction
+    requested_volumes_ul = {
+        stock_name: float(requested_total_volume.to("ul").magnitude) * fraction
+        for stock_name, fraction in target.stock_volume_fractions.items()
+    }
+    allocations = _allocate_stock_group_volumes(stocks, requested_volumes_ul)
+    balanced_target.stock_transfer_volumes = {
+        stock_name: _integer_volume_ul(volume_ul)
+        for stock_name, volume_ul in requested_volumes_ul.items()
+    }
+    for stock, transfer_volume_ul in allocations.items():
+        measured = stock.measure_out(f"{transfer_volume_ul} ul")
+        balanced_target = balanced_target + measured
+        balanced_target.protocol.append(
+            PipetteAction(
+                source=stock.location,
+                dest=target.location,
+                volume=transfer_volume_ul,
+                tip_location=getattr(stock, "tip_location", None),
+            )
         )
-        balanced_target.stock_transfer_volumes[stock_name] = required_volume_ul
-        remaining_volume_ul = required_volume_ul
-        sources = [
-            stock
-            for stock in stocks
-            if getattr(stock, "stock_group", stock.name) == stock_name
-        ]
-        if not sources:
-            raise ValueError(f"Unknown stock '{stock_name}' in stock_volume_fractions")
-
-        for stock in sources:
-            if stock.location is None:
-                continue
-            available_volume_ul = math.floor(float(stock.volume.to("ul").magnitude))
-            transfer_volume_ul = min(remaining_volume_ul, available_volume_ul)
-            if transfer_volume_ul <= 0:
-                continue
-            measured = stock.measure_out(f"{transfer_volume_ul} ul")
-            balanced_target = balanced_target + measured
-            balanced_target.protocol.append(
-                PipetteAction(
-                    source=stock.location,
-                    dest=target.location,
-                    volume=transfer_volume_ul,
-                    tip_location=getattr(stock, "tip_location", None),
-                )
-            )
-            remaining_volume_ul -= transfer_volume_ul
-            if remaining_volume_ul <= 0:
-                break
-
-        if remaining_volume_ul > 0:
-            raise ValueError(
-                f"Not enough volume remaining across stock sources for '{stock_name}'. "
-                f"Requested {required_volume_ul} uL, {remaining_volume_ul} uL could not be allocated."
-            )
 
     balanced_target.name = target.name
     balanced_target.location = target.location
@@ -418,18 +469,31 @@ def _iter_balance_candidates(
     base_mass_transfer = np.array(result.x, dtype=float)
     yield base_mass_transfer
 
-    # Identify stocks that the solver pushed to or near their lower bound.
-    # These are candidates for exclusion (zeroing out) since the solver
-    # wanted to use less than or close to the minimum transfer volume.
-    # Using active_mask == -1 alone is insufficient: the solver may place
-    # a stock slightly above its lower bound (e.g., to reduce H2O residual
-    # from a mostly-water stock) even when the target calls for none of
-    # that stock's solute.  A relative tolerance catches these cases.
-    candidate_indices = [
+    # Identify stocks that may be excluded (given a zero transfer).  A real
+    # pipetting constraint is disjunctive: a stock is either not used at all,
+    # or its transfer is at least the minimum pipettable volume.  ``Bounds``
+    # can only express the latter interval, so solve reduced problems with
+    # plausible stocks omitted to represent the zero-transfer branch.
+    #
+    # Stocks near their lower bound are plausible exclusions because the
+    # unconstrained optimum would use little or none of them.  Additionally,
+    # every stock contributing a component requested at zero is a plausible
+    # exclusion even if the constrained solve pushed it well above its lower
+    # bound.  The latter is essential for an unrelated loaded stock: forcing
+    # it into the mix can move it away from the lower bound while still making
+    # an otherwise feasible, zero-concentration target impossible.
+    near_bound_indices = {
         i for i in range(len(stocks))
         if result.active_mask[i] == -1
         or (bounds.lb[i] > 0 and result.x[i] <= bounds.lb[i] * (1 + near_bound_tol))
-    ]
+    }
+    zero_target_components = np.abs(target_masses) <= ZERO_MASS_TOL_G
+    zero_component_indices = {
+        stock_idx
+        for stock_idx in range(len(stocks))
+        if np.any(mass_fraction_matrix[zero_target_components, stock_idx] > 0.0)
+    }
+    candidate_indices = sorted(near_bound_indices | zero_component_indices)
 
     # Try all subsets of candidate stocks and re-solve each
     # reduced problem so the remaining stocks are properly re-optimized.
@@ -608,8 +672,24 @@ class MassBalanceBase:
         return getattr(self, 'minimum_transfer_volume', getattr(self, 'minimum_volume', None))
 
     def _bounds_for_stocks(self, stocks: List[Solution], minimum_transfer_volume) -> Bounds:
+        # A multi-source stock is one logical reagent.  Its final transfer is
+        # later allocated across ordered physical sources, so apply the
+        # minimum-pipette constraint once per logical stock rather than once
+        # per source.  This prevents two available sources from artificially
+        # forcing two minimum-volume aliquots into a target.
+        constrained_groups = set()
+        lower_bounds = []
+        for stock in stocks:
+            stock_group = getattr(stock, "stock_group", stock.name)
+            if stock_group in constrained_groups:
+                lower_bounds.append(0.0)
+                continue
+            constrained_groups.add(stock_group)
+            lower_bounds.append(
+                stock.measure_out(minimum_transfer_volume).mass.to("g").magnitude
+            )
         return Bounds(
-            lb=[stock.measure_out(minimum_transfer_volume).mass.to('g').magnitude for stock in stocks],
+            lb=lower_bounds,
             ub=[np.inf] * len(stocks),
             keep_feasible=False,
         )
@@ -990,7 +1070,11 @@ class MassBalanceBase:
                     ),
                 })
             else:
-                transfers_dict = _make_transfer_dict(planning_stocks, best_candidate['transfers'])
+                planned_transfers = _redistribute_transfers_by_stock_group(
+                    planning_stocks,
+                    best_candidate['transfers'],
+                )
+                transfers_dict = _make_transfer_dict(planning_stocks, planned_transfers)
                 balanced_target = _make_balanced_target(transfers_dict, target)
                 self.balanced.append({
                     'target': target,
@@ -1002,7 +1086,7 @@ class MassBalanceBase:
                     'procedure_plan': self._build_procedure_plan(
                         target=target,
                         stocks=planning_stocks,
-                        transfers=best_candidate['transfers'],
+                        transfers=planned_transfers,
                         enabled=bool(enable_multistep_dilution),
                     ),
                 })

@@ -33,6 +33,8 @@ class OT2Gripper(OT2GantryDriver):
         "available_electrodes": [],
         "occupied_electrode_slots": [],
         "used_electrode_slots": [],
+        # Completed ASV/measurement runs keyed by stable rack-slot/well ID.
+        "electrode_measurement_counts": {},
         "held_electrode": None,
     }
 
@@ -112,42 +114,100 @@ class OT2Gripper(OT2GantryDriver):
 
     @Driver.queued()
     def pickup_electrode(
-        self, location: Optional[str] = None, reuse: bool = False
+        self,
+        location: Optional[str] = None,
+        reuse: bool = False,
+        offset_x: float = 0.0,
+        offset_y: float = 0.0,
     ) -> Dict[str, Any]:
         """Pick up an occupied unused electrode, or reuse one when requested.
 
         Set ``reuse=True`` to allow selection of an electrode that was picked
-        up previously and then returned to its origin slot.
+        up previously and then returned to its origin slot. ``offset_x`` and
+        ``offset_y`` are well-relative millimetre offsets applied to the
+        translation, grip, and retract moves.
         """
         if self.config["held_electrode"] is not None:
             raise RuntimeError("An electrode is already held. Drop it before picking up another.")
         reuse = self._normalize_reuse(reuse)
+        offset_x = self._finite_z(offset_x, "offset_x")
+        offset_y = self._finite_z(offset_y, "offset_y")
         heights = self._motion_heights()
         owner_config = self._owner_config()
         electrode = self._reserve_electrode(owner_config, location, reuse=reuse)
+        measurement_metadata = self._reserve_electrode_measurement(electrode)
 
         self._run_gripper_command("set_angle", angle=50)
-        self._move_and_wait(owner_config, electrode, heights["grip_z"])
+        self._move_and_wait(
+            owner_config,
+            electrode,
+            heights["grip_z"],
+            offset_x=offset_x,
+            offset_y=offset_y,
+        )
         self._run_gripper_command("close")
         self._mark_electrode_used(electrode)
-        self._move_and_wait(owner_config, electrode, heights["retract_z"])
+        self._move_and_wait(
+            owner_config,
+            electrode,
+            heights["retract_z"],
+            offset_x=offset_x,
+            offset_y=offset_y,
+        )
         self.config["held_electrode"] = electrode
-        return {"status": "picked_up", "electrode": electrode, "gripper": self.status()}
+        return {
+            "status": "picked_up",
+            "electrode": electrode,
+            "measurement_metadata": measurement_metadata,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+            "gripper": self.status(),
+        }
+
+    @Driver.queued()
+    def complete_electrode_measurement(self) -> Dict[str, Any]:
+        """Commit the held electrode's reserved measurement-use index.
+
+        Call this only after the final measurement task (for example, DPV)
+        succeeds. Repeating the call for the same held electrode is idempotent.
+        """
+        electrode = self.config["held_electrode"]
+        if electrode is None:
+            raise RuntimeError("No electrode is held. Pick up an electrode before completing a measurement.")
+
+        metadata = self._electrode_measurement_metadata(electrode)
+        if electrode.get("measurement_committed", False):
+            return {"status": "already_completed", **metadata}
+
+        counts = dict(self.config.get("electrode_measurement_counts", {}))
+        electrode_id = metadata["electrode_id"]
+        counts[electrode_id] = metadata["electrode_use_index"]
+        self.config["electrode_measurement_counts"] = counts
+        electrode["measurement_committed"] = True
+        self.config["held_electrode"] = electrode
+        return {"status": "completed", **metadata}
 
     @Driver.queued()
     def drop_electrode(
-        self, location: Optional[str] = None, offset_y: float = 0.0, waste: bool = False
+        self,
+        location: Optional[str] = None,
+        offset_y: float = 0.0,
+        waste: bool = False,
+        offset_x: float = 0.0,
     ) -> Dict[str, Any]:
         """Return a held electrode to its origin, or discard it in a waste well.
 
         A normal drop may only return the electrode to its pickup location,
         which is the only electrode-rack well made unoccupied by pickup. Set
         ``waste=True`` and provide a loaded waste-well location to discard the
-        electrode without reoccupying its origin slot.
+        electrode without reoccupying its origin slot. ``offset_x`` and
+        ``offset_y`` are well-relative millimetre offsets applied to the
+        translation, release, and retract moves.
         """
         held_electrode = self.config["held_electrode"]
         if held_electrode is None:
             raise RuntimeError("No electrode is held. Pick up an electrode before dropping one.")
+        offset_x = self._finite_z(offset_x, "offset_x")
         offset_y = self._finite_z(offset_y, "offset_y")
         heights = self._motion_heights()
         owner_config = self._owner_config()
@@ -163,18 +223,31 @@ class OT2Gripper(OT2GantryDriver):
                     "use waste=True to discard it elsewhere."
                 )
             target = self._resolve_location(owner_config, origin)
-        self._move_and_wait(owner_config, target, heights["grip_z"], offset_y=offset_y)
+        self._move_and_wait(
+            owner_config,
+            target,
+            heights["grip_z"],
+            offset_x=offset_x,
+            offset_y=offset_y,
+        )
         self._run_gripper_command("open")
         # Opening releases the electrode. Restore only a normal return before
         # retracting so a retract failure cannot leave its origin unoccupied.
         if not waste:
             self._mark_electrode_slot_occupied(held_electrode)
-        self._move_and_wait(owner_config, target, heights["retract_z"], offset_y=offset_y)
+        self._move_and_wait(
+            owner_config,
+            target,
+            heights["retract_z"],
+            offset_x=offset_x,
+            offset_y=offset_y,
+        )
         self.config["held_electrode"] = None
         return {
             "status": "dropped",
             "electrode": held_electrode,
             "location": target["location"],
+            "offset_x": offset_x,
             "offset_y": offset_y,
             "gripper": self.status(),
         }
@@ -254,6 +327,9 @@ class OT2Gripper(OT2GantryDriver):
             "available_electrode_count": len(self.config["available_electrodes"]),
             "occupied_electrode_slots": list(self.config["occupied_electrode_slots"]),
             "used_electrode_slots": list(self.config["used_electrode_slots"]),
+            "electrode_measurement_counts": dict(
+                self.config["electrode_measurement_counts"]
+            ),
             "held_electrode": self.config["held_electrode"],
         }
 
@@ -328,6 +404,35 @@ class OT2Gripper(OT2GantryDriver):
         if key not in used:
             used.append(key)
             self.config["used_electrode_slots"] = used
+
+    @staticmethod
+    def _electrode_id(electrode: Dict[str, Any]) -> str:
+        """Build the persistent identity for an electrode stored in a rack well."""
+        try:
+            return f"{electrode['slot']}:{electrode['well_name']}"
+        except KeyError as exc:
+            raise ValueError("Electrode metadata has no rack slot or well name") from exc
+
+    def _electrode_measurement_metadata(self, electrode: Dict[str, Any]) -> Dict[str, Any]:
+        """Return metadata for the held electrode's reserved measurement use."""
+        electrode_id = self._electrode_id(electrode)
+        completed_count = int(
+            self.config.get("electrode_measurement_counts", {}).get(electrode_id, 0)
+        )
+        use_index = electrode.get("electrode_use_index", completed_count + 1)
+        return {
+            "electrode_id": electrode_id,
+            "electrode_origin_location": electrode["location"],
+            "electrode_use_index": int(use_index),
+            "electrode_completed_measurement_count": completed_count,
+        }
+
+    def _reserve_electrode_measurement(self, electrode: Dict[str, Any]) -> Dict[str, Any]:
+        """Reserve, without committing, the next measurement index for an electrode."""
+        metadata = self._electrode_measurement_metadata(electrode)
+        electrode["electrode_use_index"] = metadata["electrode_use_index"]
+        electrode["measurement_committed"] = False
+        return metadata
 
     @staticmethod
     def _normalize_reuse(reuse: bool) -> bool:

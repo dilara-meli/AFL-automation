@@ -284,6 +284,38 @@ def test_diagnosis_unwanted_stock_component():
 
 
 @pytest.mark.usefixtures("mixdb")
+@pytest.mark.parametrize("explicit_zero", [False, True])
+def test_balance_excludes_irrelevant_stock_with_zero_target_component(explicit_zero):
+    """A loaded contaminating stock is optional, whether zero is implicit or explicit."""
+    with MassBalance(minimum_volume='20 ul') as mb:
+        Solution(name="WaterStock", masses={"H2O": "20 g"}, location='1A1')
+        Solution(name="HexanesStock", masses={"Hexanes": "20 g"}, location='1A2')
+        # This stock is available, but the target explicitly requests zero NaCl.
+        Solution(
+            name="SaltStock",
+            masses={"H2O": "20 g"},
+            concentrations={"NaCl": "100 mg/ml"},
+            solutes=["NaCl"],
+            location='1A3',
+        )
+        target_masses = {"H2O": "250 mg", "Hexanes": "250 mg"}
+        if explicit_zero:
+            target_masses["NaCl"] = "0 mg"
+        TargetSolution(
+            name="NoSalt",
+            masses=target_masses,
+            solutes=["NaCl"] if explicit_zero else None,
+        )
+    mb.targets[0].location = None
+    mb.balance()
+
+    result = mb.balanced[0]
+    assert result['success'] is True
+    assert result['balanced_target'] is not None
+    assert {action.source for action in result['balanced_target'].protocol} == {'1A1', '1A2'}
+
+
+@pytest.mark.usefixtures("mixdb")
 def test_diagnosis_rejects_sub_tolerance_zero_target_contamination():
     """Zero-target contamination is a hard failure even below relative tolerance."""
     with MassBalance() as mb:

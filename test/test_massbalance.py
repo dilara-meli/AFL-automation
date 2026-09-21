@@ -92,6 +92,29 @@ def test_balanced_protocol_inherits_stock_tip_location():
 
 
 @pytest.mark.usefixtures("mixdb")
+def test_mass_balance_prefers_first_source_for_a_logical_stock_group():
+    """Concentration balancing allocates multi-source stocks like direct recipes."""
+    with MassBalance(minimum_volume="20 ul") as mb:
+        first_source = Solution(name="Water", masses={"H2O": "20 g"}, location="1A1")
+        second_source = Solution(name="Water", masses={"H2O": "20 g"}, location="1A2")
+        first_source.stock_group = "Water"
+        second_source.stock_group = "Water"
+        TargetSolution(name="SixMillilitres", masses={"H2O": "6 g"}, location="5A1")
+
+    mb.balance()
+
+    result = mb.balanced[0]
+    assert result["success"] is True
+    assert [(action.source, action.volume) for action in result["balanced_target"].protocol] == [
+        ("1A1", 6000),
+    ]
+    transfer_items = result["procedure_plan"]["stages"][0]["transfers"]
+    assert [(item["source_location"], item["required_volume_ul"]) for item in transfer_items] == [
+        ("1A1", 6000.0),
+    ]
+
+
+@pytest.mark.usefixtures("mixdb")
 def test_balanced_protocol_inherits_stock_tip_location_list():
     with MassBalance() as mb:
         Solution(

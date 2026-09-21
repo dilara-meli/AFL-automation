@@ -144,6 +144,19 @@ def _stock_fraction_target():
 
 
 @pytest.mark.usefixtures('mixdb')
+def test_balance_target_syncs_minimum_volume_from_prepare_backend():
+    driver = DummyPrepare()
+    driver.config.write = False
+    _seed_stocks(driver)
+    driver._loaded_pipette_minimum_volumes = lambda: [20.0, 1.0]
+
+    result = driver._balance_target(_stock_fraction_target(), False)
+
+    assert result is not None
+    assert driver.config['minimum_volume'] == '1 ul'
+
+
+@pytest.mark.usefixtures('mixdb')
 def test_prepare_multistep_consumes_multiple_prep_targets():
     driver = DummyPrepare()
     driver.config.write = False
