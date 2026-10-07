@@ -109,9 +109,12 @@ def test_mass_balance_prefers_first_source_for_a_logical_stock_group():
         ("1A1", 6000),
     ]
     transfer_items = result["procedure_plan"]["stages"][0]["transfers"]
-    assert [(item["source_location"], item["required_volume_ul"]) for item in transfer_items] == [
-        ("1A1", 6000.0),
-    ]
+    assert [item["source_location"] for item in transfer_items] == ["1A1"]
+    # Converting the planned mass back to volume can introduce floating-point
+    # roundoff, even though the executable protocol uses integer microlitres.
+    assert [item["required_volume_ul"] for item in transfer_items] == pytest.approx(
+        [6000.0], rel=0, abs=1e-9
+    )
 
 
 @pytest.mark.usefixtures("mixdb")
