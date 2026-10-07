@@ -167,6 +167,9 @@ def test_update_panel_config_persists_dpv_values():
         dpv_sample_period=0.5,
         dpv_pulse_time=0.1,
         dpv_noise_rejection=True,
+        dpv_drop_knock_enabled=True,
+        dpv_drop_knock_duration=0.02,
+        dpv_drop_knock_polarity=True,
         dpv_irange_mode='fixed',
         dpv_max_current=0.3,
     )
@@ -179,6 +182,13 @@ def test_update_panel_config_persists_dpv_values():
     assert driver.config['dpv_pulse_size'] == 0.025
     assert driver.config['dpv_sample_period'] == 0.5
     assert driver.config['dpv_noise_rejection'] is True
+    params = driver._measurement_parameters('dpv', {})
+    assert params['drop_knock_enabled'] is True
+    assert params['drop_knock_duration'] == 0.02
+    assert params['drop_knock_polarity'] is True
+    assert result['config']['dpv_drop_knock_duration'] == 0.02
+    assert 'drop_knock_enabled' in driver.quickbar.function_info['runDPV']['qb']['params']
+    assert 'noise_rejection' not in driver.quickbar.function_info['runDPV']['qb']['params']
     assert driver.config['dpv_irange_mode'] == 'fixed'
     assert driver.config['dpv_max_current'] == 0.3
 

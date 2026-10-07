@@ -912,7 +912,8 @@ def test_derive_dpv_trace_uses_native_cpivcurve_columns():
     assert np.allclose(derived['applied_signal'], [-0.975006, -0.970007])
 
 
-def test_collect_dpv_uses_restored_signal_order_and_voltage_guard():
+@pytest.mark.parametrize('noise_rejection', [True, False])
+def test_collect_dpv_uses_restored_signal_order_and_voltage_guard(noise_rejection):
     class FakeCurve:
         def __init__(self, pstat, point_count):
             self.point_count = point_count
@@ -1040,7 +1041,7 @@ def test_collect_dpv_uses_restored_signal_order_and_voltage_guard():
             'pulse_size': 0.025,
             'sample_period': 0.5,
             'pulse_time': 0.1,
-            'noise_rejection': True,
+            'noise_rejection': noise_rejection,
             'irange_mode': 'fixed',
             'max_current': 0.3,
             'current_range_mode': 'auto',
@@ -1088,7 +1089,8 @@ def test_collect_dpv_uses_restored_signal_order_and_voltage_guard():
     assert fixed_result['parameters']['noise_rejection'] is False
     assert fixed_result['parameters']['irange_mode'] == 'auto'
     assert fixed_result['parameters']['max_current'] == pytest.approx(0.45)
-    assert fixed_result['parameters']['drop_knock_enabled'] is True
+    assert fixed_result['parameters']['drop_knock_enabled'] is False
+    assert fixed_pstat.signal_args[12:15] == (False, 0.0, False)
 
     manual_pstat = FakePstat('PSTAT')
     manual_result = collect_dpv(
@@ -1102,16 +1104,21 @@ def test_collect_dpv_uses_restored_signal_order_and_voltage_guard():
             'pulse_size': 0.025,
             'sample_period': 0.5,
             'pulse_time': 0.1,
-            'noise_rejection': True,
+            'noise_rejection': noise_rejection,
             'irange_mode': 'fixed',
             'max_current': 0.45,
+            'drop_knock_enabled': True,
+            'drop_knock_duration': 0.02,
+            'drop_knock_polarity': True,
             'current_range_mode': 'auto',
         },
     )
 
     assert manual_pstat.ierange_mode is False
     assert manual_pstat.ie_range == pytest.approx(0.45)
-    assert manual_result['parameters']['drop_knock_enabled'] is False
+    assert manual_result['parameters']['drop_knock_enabled'] is True
+    assert manual_pstat.signal_args[12:15] == (True, 0.02, True)
+    assert manual_pstat.signal_args[11] == auto_pstat.signal_args[11]
 
     with pytest.raises(ValueError, match='hard limit'):
         collect_dpv(
@@ -1125,7 +1132,7 @@ def test_collect_dpv_uses_restored_signal_order_and_voltage_guard():
                 'pulse_size': 0.025,
                 'sample_period': 0.5,
                 'pulse_time': 0.1,
-                'noise_rejection': True,
+                'noise_rejection': noise_rejection,
                 'irange_mode': 'fixed',
                 'max_current': 0.3,
                 'current_range_mode': 'auto',
@@ -1225,7 +1232,7 @@ def test_collect_dpv_returns_derived_trace_without_text_exports(monkeypatch):
     assert result['measurement_type'] == 'differential_pulse_voltammetry'
     assert result['data'] == {
         'potential': [-1.0, -0.995],
-        'current': pytest.approx([0.05333333333333333, 0.07]),
+        'current': pytest.approx([0.06, 0.07]),
     }
     assert result['parameters']['dpv_diff_point_count'] == 2
     assert 'text_export_path' not in result['parameters']
@@ -1246,7 +1253,7 @@ def test_calculate_dpv_differential_current_uses_in_memory_raw_data():
     assert differential['skipped_cycles'] == 0
     assert differential['cycle_index'] == [0, 1]
     assert differential['voltage_v'] == [-1.0, -0.995]
-    assert differential['diff_current_a'] == pytest.approx([0.05333333333333333, 0.07])
+    assert differential['diff_current_a'] == pytest.approx([0.06, 0.07])
 
 
 def test_summarize_dpv_timing_reports_observed_cycle_rate():
@@ -1262,3 +1269,63 @@ def test_summarize_dpv_timing_reports_observed_cycle_rate():
     assert summary['observed_cycle_time'] == pytest.approx(1.4)
     assert summary['observed_cycles_per_second'] == pytest.approx(1.0 / 1.4)
     assert summary['cycle_completion_ratio'] == pytest.approx(3.0 / 200.0)
+
+
+@pytest.mark.parametrize('duration, enabled', [(-0.01, False), (float('nan'), False), (float('inf'), True), (0.0, True)])
+def test_collect_dpv_rejects_invalid_drop_knock_duration(duration, enabled):
+    with pytest.raises(ValueError, match='drop-knock duration'):
+        collect_dpv(SimpleNamespace(), 'PSTAT', 'test', {
+            'initial_voltage': -1.0, 'final_voltage': 0.0,
+            'step_size': 0.005, 'pulse_size': 0.025,
+            'sample_period': 0.5, 'pulse_time': 0.1,
+            'drop_knock_enabled': enabled, 'drop_knock_duration': duration,
+        })
+
+
+def test_dpv_worker_dispatch_preserves_drop_knock_controls(monkeypatch):
+    from AFL.automation.instrument.Gamry import gamry_worker
+    parameters = {'drop_knock_enabled': True, 'drop_knock_duration': 0.02,
+                  'drop_knock_polarity': True}
+    monkeypatch.setattr(gamry_worker, 'collect_dpv', lambda tkp, name, process, params: params)
+    assert gamry_worker.run_measurement(None, 'PSTAT', 'test', 'dpv', parameters) == parameters
+
+
+@pytest.mark.parametrize('pulse_time', [0.1, 0.2])
+def test_dpv_output_averages_final_twenty_percent_of_each_interval(pulse_time):
+    # Two cycles at the configured 1 kHz acquisition rate. Linear currents
+    # make the expected means depend on every sample in each window.
+    times = np.arange(1000) / 1000.0
+    current = np.arange(1000, dtype=float)
+    differential = _calculate_dpv_differential_current(
+        {'time': times, 'vf': np.full(1000, -1.0), 'im': current},
+        cycle_time=0.5, pulse_time=pulse_time,
+    )
+    baseline_end = round((0.5 - pulse_time) * 1000)
+    baseline_start = round(baseline_end * 0.8)
+    pulse_start = round((0.5 - 0.2 * pulse_time) * 1000)
+    expected = current[pulse_start:500].mean() - current[baseline_start:baseline_end].mean()
+    assert differential['point_count'] == 2
+    assert differential['skipped_cycles'] == 0
+    assert differential['diff_current_a'] == pytest.approx([expected, expected])
+
+
+def test_dpv_output_excludes_transition_samples_and_uses_time_windows():
+    differential = _calculate_dpv_differential_current(
+        {'time': [0.319, 0.32, 0.39, 0.4, 0.479, 0.48, 0.499, 0.5],
+         'vf': [-1.0] * 8,
+         'im': [999.0, 2.0, 4.0, 999.0, 999.0, 8.0, 12.0, 999.0]},
+        cycle_time=0.5, pulse_time=0.1,
+    )
+    assert differential['diff_current_a'] == pytest.approx([7.0])
+    assert differential['cycle_index'] == [0]
+    assert differential['skipped_cycles'] == 1
+
+
+@pytest.mark.parametrize('times', [[0.0, 0.2, 0.48], [0.32, 0.4, 0.45]])
+def test_dpv_output_skips_cycles_with_empty_averaging_windows(times):
+    differential = _calculate_dpv_differential_current(
+        {'time': times, 'vf': [-1.0] * 3, 'im': [1.0] * 3},
+        cycle_time=0.5, pulse_time=0.1,
+    )
+    assert differential['point_count'] == 0
+    assert differential['skipped_cycles'] == 1

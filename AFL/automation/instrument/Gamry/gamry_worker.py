@@ -139,15 +139,18 @@ def _build_measurement_result_from_data(
     }
 
 
-def _calculate_dpv_differential_current(data, cycle_time, pulse_time, points_to_average=3):
+def _calculate_dpv_differential_current(data, cycle_time, pulse_time):
+    """Subtract baseline from pulse current using the final 20% of each interval.
+
+    Windows include their start and exclude their end so transition samples
+    cannot contribute to the preceding interval. Skip cycles with empty windows.
+    """
     if cycle_time <= 0:
         raise ValueError('DPV cycle time must be positive')
     if pulse_time <= 0:
         raise ValueError('DPV pulse time must be positive')
     if pulse_time >= cycle_time:
         raise ValueError('DPV pulse time must be shorter than the cycle time')
-    if points_to_average <= 0:
-        raise ValueError('DPV averaging point count must be positive')
 
     time_values = list(data.get('time', []))
     voltage_values = list(data.get('vf', data.get('potential', [])))
@@ -170,20 +173,28 @@ def _calculate_dpv_differential_current(data, cycle_time, pulse_time, points_to_
     cycle_indices = []
     skipped_cycles = 0
 
+    def in_window(timestamp, start, end):
+        # Account for floating-point arithmetic at exact window boundaries.
+        at_start = math.isclose(timestamp, start, rel_tol=0.0, abs_tol=1e-12)
+        at_end = math.isclose(timestamp, end, rel_tol=0.0, abs_tol=1e-12)
+        return (timestamp >= start or at_start) and timestamp < end and not at_end
+
     for cycle_index in range(cycle_count):
         cycle_start = cycle_index * cycle_time
         pulse_start = cycle_start + base_time
         cycle_end = (cycle_index + 1) * cycle_time
-        base_points = [index for index in range(point_total) if cycle_start <= time_values[index] < pulse_start]
-        pulse_points = [index for index in range(point_total) if pulse_start <= time_values[index] <= cycle_end]
-        if len(base_points) < points_to_average or len(pulse_points) < points_to_average:
+        base_window_start = pulse_start - 0.2 * base_time
+        pulse_window_start = cycle_end - 0.2 * pulse_time
+        base_points = [index for index in range(point_total)
+                       if in_window(time_values[index], base_window_start, pulse_start)]
+        pulse_points = [index for index in range(point_total)
+                        if in_window(time_values[index], pulse_window_start, cycle_end)]
+        if not base_points or not pulse_points:
             skipped_cycles += 1
             continue
 
-        base_slice = base_points[-points_to_average:]
-        pulse_slice = pulse_points[-points_to_average:]
-        base_average = sum(current_values[index] for index in base_slice) / float(points_to_average)
-        pulse_average = sum(current_values[index] for index in pulse_slice) / float(points_to_average)
+        base_average = sum(current_values[index] for index in base_points) / len(base_points)
+        pulse_average = sum(current_values[index] for index in pulse_points) / len(pulse_points)
         differential_voltage.append(float(voltage_values[base_points[-1]]))
         differential_current.append(float(pulse_average - base_average))
         cycle_indices.append(cycle_index)
@@ -777,7 +788,11 @@ def collect_dpv(tkp, instrument_name, process_name, parameters):
         'pulse_size': float(parameters['pulse_size']),
         'sample_period': float(parameters['sample_period']),
         'pulse_time': float(parameters['pulse_time']),
+        # Retained for compatibility; noise rejection is not implemented here.
         'noise_rejection': bool(parameters.get('noise_rejection', True)),
+        'drop_knock_enabled': bool(parameters.get('drop_knock_enabled', False)),
+        'drop_knock_duration': float(parameters.get('drop_knock_duration', 0.0)),
+        'drop_knock_polarity': bool(parameters.get('drop_knock_polarity', False)),
         'irange_mode': str(parameters.get('irange_mode', 'fixed')).lower(),
         'max_current': float(parameters.get('max_current', 0.0003)),
         'current_range_mode': str(parameters.get('current_range_mode', 'auto')),
@@ -815,9 +830,14 @@ def collect_dpv(tkp, instrument_name, process_name, parameters):
     override_a = 0.0
     enable_override_b = False
     override_b = 0.0
-    drop_knock_enabled = not normalized['noise_rejection']
-    drop_knock_duration = normalized['pulse_time'] if drop_knock_enabled else 0.0
-    drop_knock_polarity = False
+    # ToolkitPy documents these as digital-output controls, independent of averaging.
+    drop_knock_enabled = normalized['drop_knock_enabled']
+    drop_knock_duration = normalized['drop_knock_duration']
+    drop_knock_polarity = normalized['drop_knock_polarity']
+    if not math.isfinite(drop_knock_duration) or drop_knock_duration < 0:
+        raise ValueError('DPV drop-knock duration must be finite and non-negative')
+    if drop_knock_enabled and drop_knock_duration == 0:
+        raise ValueError('DPV drop-knock duration must be positive when enabled')
     dpv_current_range_limit = normalized['max_current'] if normalized['irange_mode'] == 'fixed' else None
     dpv_current_range_mode = 'auto' if normalized['irange_mode'] == 'auto' else 'fixed'
 
@@ -913,6 +933,7 @@ def collect_dpv(tkp, instrument_name, process_name, parameters):
             _log_worker_event('dpv_derived_trace_empty')
 
         differential_trace = _calculate_dpv_differential_current(raw_data, normalized['sample_period'], normalized['pulse_time'])
+        normalized['dpv_output_averaging_fraction'] = 0.2
         normalized['dpv_diff_point_count'] = int(differential_trace['point_count'])
         normalized['dpv_diff_skipped_cycles'] = int(differential_trace['skipped_cycles'])
         dpv_data = {
@@ -967,6 +988,7 @@ def run_measurement(tkp, instrument_name, process_name, measurement_mode, parame
             'initial_voltage', 'final_voltage', 'step_size', 'pulse_size',
             'sample_period', 'pulse_time', 'noise_rejection', 'irange_mode',
             'max_current', 'current_range_mode',
+            'drop_knock_enabled', 'drop_knock_duration', 'drop_knock_polarity',
         ],
     }
     if mode not in expected_keys_by_mode:

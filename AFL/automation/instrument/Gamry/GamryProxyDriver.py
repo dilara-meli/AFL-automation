@@ -85,6 +85,9 @@ class GamryProxyDriver(ProxyDriver):
     defaults['dpv_sample_period'] = 0.5
     defaults['dpv_pulse_time'] = 0.1
     defaults['dpv_noise_rejection'] = True
+    defaults['dpv_drop_knock_enabled'] = False
+    defaults['dpv_drop_knock_duration'] = 0.0
+    defaults['dpv_drop_knock_polarity'] = False
     defaults['dpv_irange_mode'] = 'fixed'
     defaults['dpv_max_current'] = 0.0003
 
@@ -140,7 +143,9 @@ class GamryProxyDriver(ProxyDriver):
                 'dpv_pulse_size': cls._quickbar_param('Pulse Size (V)', 'float', config['dpv_pulse_size']),
                 'dpv_sample_period': cls._quickbar_param('Sample Period (s)', 'float', config['dpv_sample_period']),
                 'dpv_pulse_time': cls._quickbar_param('Pulse Time (s)', 'float', config['dpv_pulse_time']),
-                'dpv_noise_rejection': cls._quickbar_param('Noise Rejection', 'bool', config['dpv_noise_rejection']),
+                'dpv_drop_knock_enabled': cls._quickbar_param('Drop-knock Enabled', 'bool', config['dpv_drop_knock_enabled']),
+                'dpv_drop_knock_duration': cls._quickbar_param('Drop-knock Duration (s)', 'float', config['dpv_drop_knock_duration']),
+                'dpv_drop_knock_polarity': cls._quickbar_param('Drop-knock Polarity', 'bool', config['dpv_drop_knock_polarity']),
                 'dpv_irange_mode': cls._quickbar_param('Current Range Mode', 'text', config['dpv_irange_mode']),
                 'dpv_max_current': cls._quickbar_param('Maximum Current (A)', 'float', config['dpv_max_current']),
                 'current_range_mode': cls._quickbar_param('Current Range Mode', 'text', config['current_range_mode']),
@@ -256,6 +261,9 @@ class GamryProxyDriver(ProxyDriver):
                 'dpv_sample_period': float(self.config['dpv_sample_period'] if overrides.get('dpv_sample_period') is None else overrides['dpv_sample_period']),
                 'dpv_pulse_time': float(self.config['dpv_pulse_time'] if overrides.get('dpv_pulse_time') is None else overrides['dpv_pulse_time']),
                 'dpv_noise_rejection': self._coerce_bool(self.config['dpv_noise_rejection'] if overrides.get('dpv_noise_rejection') is None else overrides['dpv_noise_rejection']),
+                'dpv_drop_knock_enabled': self._coerce_bool(self.config['dpv_drop_knock_enabled'] if overrides.get('dpv_drop_knock_enabled') is None else overrides['dpv_drop_knock_enabled']),
+                'dpv_drop_knock_duration': float(self.config['dpv_drop_knock_duration'] if overrides.get('dpv_drop_knock_duration') is None else overrides['dpv_drop_knock_duration']),
+                'dpv_drop_knock_polarity': self._coerce_bool(self.config['dpv_drop_knock_polarity'] if overrides.get('dpv_drop_knock_polarity') is None else overrides['dpv_drop_knock_polarity']),
                 'dpv_irange_mode': str(self.config['dpv_irange_mode'] if overrides.get('dpv_irange_mode') is None else overrides['dpv_irange_mode']),
                 'dpv_max_current': float(self.config['dpv_max_current'] if overrides.get('dpv_max_current') is None else overrides['dpv_max_current']),
                 'current_range_mode': str(self.config['current_range_mode'] if overrides.get('current_range_mode') is None else overrides['current_range_mode']),

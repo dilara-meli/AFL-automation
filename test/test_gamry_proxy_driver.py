@@ -158,3 +158,15 @@ def test_client_login_is_skipped_without_username(monkeypatch):
 
     assert result['driver_status']['driver'] == 'remote-gamry'
     assert driver._proxy_clients['gamry'].logged_in_username == 'GamryProxyDriver'
+
+
+def test_run_dpv_forwards_explicit_drop_knock_controls(monkeypatch):
+    monkeypatch.setattr('AFL.automation.instrument.Gamry.GamryProxyDriver.Client', FakeClient)
+    driver = GamryProxyDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
+    driver.runDPV(dpv_drop_knock_enabled=True, dpv_drop_knock_duration=0.02,
+                  dpv_drop_knock_polarity=True)
+    calls = driver._get_gamry_client().calls
+    payload = next(kwargs for name, kwargs, _ in calls if name == 'enqueue')
+    assert payload['dpv_drop_knock_enabled'] is True
+    assert payload['dpv_drop_knock_duration'] == 0.02
+    assert payload['dpv_drop_knock_polarity'] is True

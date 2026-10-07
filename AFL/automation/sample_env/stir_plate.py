@@ -29,7 +29,7 @@ class stir_plate(Driver):
     defaults["speed_tolerance"] = 25.0
     defaults["speed_settle_timeout"] = 30.0
     defaults["default_rpm"] = 350
-    defaults["default_power"] = 50
+    defaults["default_power"] = 25
 
     def __init__(self, overrides=None):
         self.app = None

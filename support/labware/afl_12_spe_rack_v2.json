@@ -1,0 +1,201 @@
+{
+    "ordering": [
+        [
+            "A1",
+            "B1"
+        ],
+        [
+            "A2",
+            "B2"
+        ],
+        [
+            "A3",
+            "B3"
+        ],
+        [
+            "A4",
+            "B4"
+        ],
+        [
+            "A5",
+            "B5"
+        ],
+        [
+            "A6",
+            "B6"
+        ]
+    ],
+    "brand": {
+        "brand": "AFL",
+        "brandId": []
+    },
+    "metadata": {
+        "displayName": "AFL_12_SPE_rack_v2",
+        "displayCategory": "wellPlate",
+        "displayVolumeUnits": "µL",
+        "tags": []
+    },
+    "dimensions": {
+        "xDimension": 127.89,
+        "yDimension": 85.6,
+        "zDimension": 22.86
+    },
+    "wells": {
+        "A1": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 9,
+            "y": 53.44,
+            "z": 12.7
+        },
+        "B1": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 9,
+            "y": 6.45,
+            "z": 12.7
+        },
+        "A2": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 31,
+            "y": 53.44,
+            "z": 12.7
+        },
+        "B2": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 31,
+            "y": 6.45,
+            "z": 12.7
+        },
+        "A3": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 53,
+            "y": 53.44,
+            "z": 12.7
+        },
+        "B3": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 53,
+            "y": 6.45,
+            "z": 12.7
+        },
+        "A4": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 75,
+            "y": 53.44,
+            "z": 12.7
+        },
+        "B4": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 75,
+            "y": 6.45,
+            "z": 12.7
+        },
+        "A5": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 97,
+            "y": 53.44,
+            "z": 12.7
+        },
+        "B5": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 97,
+            "y": 6.45,
+            "z": 12.7
+        },
+        "A6": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 119,
+            "y": 53.44,
+            "z": 12.7
+        },
+        "B6": {
+            "depth": 10.16,
+            "totalLiquidVolume": 10,
+            "shape": "rectangular",
+            "xDimension": 13.97,
+            "yDimension": 2.54,
+            "x": 119,
+            "y": 6.45,
+            "z": 12.7
+        }
+    },
+    "groups": [
+        {
+            "metadata": {
+                "wellBottomShape": "flat"
+            },
+            "wells": [
+                "A1",
+                "B1",
+                "A2",
+                "B2",
+                "A3",
+                "B3",
+                "A4",
+                "B4",
+                "A5",
+                "B5",
+                "A6",
+                "B6"
+            ]
+        }
+    ],
+    "parameters": {
+        "format": "irregular",
+        "quirks": [],
+        "isTiprack": false,
+        "isMagneticModuleCompatible": false,
+        "loadName": "afl_12_spe_rack_v2"
+    },
+    "namespace": "custom_beta",
+    "version": 1,
+    "schemaVersion": 2,
+    "cornerOffsetFromSlot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+    }
+}

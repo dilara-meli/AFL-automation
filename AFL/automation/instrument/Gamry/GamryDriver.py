@@ -111,6 +111,9 @@ class GamryDriver(Driver):
     defaults['dpv_sample_period'] = 0.5
     defaults['dpv_pulse_time'] = 0.1
     defaults['dpv_noise_rejection'] = True
+    defaults['dpv_drop_knock_enabled'] = False
+    defaults['dpv_drop_knock_duration'] = 0.0
+    defaults['dpv_drop_knock_polarity'] = False
     defaults['dpv_irange_mode'] = 'fixed'
     defaults['dpv_max_current'] = 0.0003
     static_dirs = {
@@ -175,7 +178,9 @@ class GamryDriver(Driver):
                 'pulse_size': cls._quickbar_param('Pulse Size E (V)', 'float', config['dpv_pulse_size']),
                 'sample_period': cls._quickbar_param('Sample Period (s)', 'float', config['dpv_sample_period']),
                 'pulse_time': cls._quickbar_param('Pulse Time (s)', 'float', config['dpv_pulse_time']),
-                'noise_rejection': cls._quickbar_param('Noise Rejection', 'bool', config['dpv_noise_rejection']),
+                'drop_knock_enabled': cls._quickbar_param('Drop-knock Enabled', 'bool', config['dpv_drop_knock_enabled']),
+                'drop_knock_duration': cls._quickbar_param('Drop-knock Duration (s)', 'float', config['dpv_drop_knock_duration']),
+                'drop_knock_polarity': cls._quickbar_param('Drop-knock Polarity', 'bool', config['dpv_drop_knock_polarity']),
                 'irange_mode': cls._quickbar_param('I/E Range Mode', 'text', config['dpv_irange_mode']),
                 'max_current': cls._quickbar_param('Max Current (A)', 'float', config['dpv_max_current']),
                 'current_range_mode': cls._quickbar_param('Current Range Mode', 'text', config['current_range_mode']),
@@ -500,6 +505,13 @@ class GamryDriver(Driver):
         instrument_name: Optional[str] = None,
         **kwargs,
     ):
+        """Run stripping DPV with optional digital drop-knock output.
+
+        Set ``dpv_drop_knock_enabled=True`` and a positive
+        ``dpv_drop_knock_duration`` in seconds to enable the output.
+        ``dpv_drop_knock_polarity`` maps directly to ToolkitPy's polarity flag.
+        The legacy ``dpv_noise_rejection`` parameter has no acquisition effect.
+        """
         return self.runMeasurement(
             measurement_mode='dpv',
             instrument_name=instrument_name,
@@ -577,6 +589,9 @@ class GamryDriver(Driver):
         dpv_sample_period: Optional[float] = None,
         dpv_pulse_time: Optional[float] = None,
         dpv_noise_rejection: Optional[bool] = None,
+        dpv_drop_knock_enabled: Optional[bool] = None,
+        dpv_drop_knock_duration: Optional[float] = None,
+        dpv_drop_knock_polarity: Optional[bool] = None,
         dpv_irange_mode: Optional[str] = None,
         dpv_max_current: Optional[float] = None,
         **kwargs,
@@ -618,6 +633,7 @@ class GamryDriver(Driver):
             'dpv_sample_period': dpv_sample_period,
             'dpv_pulse_time': dpv_pulse_time,
             'dpv_max_current': dpv_max_current,
+            'dpv_drop_knock_duration': dpv_drop_knock_duration,
         }
         for key, value in numeric_fields.items():
             if value is not None:
@@ -630,6 +646,10 @@ class GamryDriver(Driver):
                 updates[key] = int(value)
         if dpv_noise_rejection is not None:
             updates['dpv_noise_rejection'] = bool(dpv_noise_rejection)
+        if dpv_drop_knock_enabled is not None:
+            updates['dpv_drop_knock_enabled'] = bool(dpv_drop_knock_enabled)
+        if dpv_drop_knock_polarity is not None:
+            updates['dpv_drop_knock_polarity'] = bool(dpv_drop_knock_polarity)
         if current_range_mode is not None:
             updates['current_range_mode'] = str(current_range_mode)
         if dpv_irange_mode is not None:
@@ -1013,6 +1033,9 @@ class GamryDriver(Driver):
                 'sample_period': float(self.config['dpv_sample_period'] if overrides.get('dpv_sample_period') is None else overrides['dpv_sample_period']),
                 'pulse_time': float(self.config['dpv_pulse_time'] if overrides.get('dpv_pulse_time') is None else overrides['dpv_pulse_time']),
                 'noise_rejection': bool(self.config['dpv_noise_rejection'] if overrides.get('dpv_noise_rejection') is None else overrides['dpv_noise_rejection']),
+                'drop_knock_enabled': bool(self.config['dpv_drop_knock_enabled'] if overrides.get('dpv_drop_knock_enabled') is None else overrides['dpv_drop_knock_enabled']),
+                'drop_knock_duration': float(self.config['dpv_drop_knock_duration'] if overrides.get('dpv_drop_knock_duration') is None else overrides['dpv_drop_knock_duration']),
+                'drop_knock_polarity': bool(self.config['dpv_drop_knock_polarity'] if overrides.get('dpv_drop_knock_polarity') is None else overrides['dpv_drop_knock_polarity']),
                 'irange_mode': irange_mode,
                 'max_current': float(self.config['dpv_max_current'] if overrides.get('dpv_max_current') is None else overrides['dpv_max_current']),
                 'current_range_mode': str(self.config['current_range_mode'] if overrides.get('current_range_mode') is None else overrides['current_range_mode']),
@@ -1128,6 +1151,9 @@ class GamryDriver(Driver):
             'dpv_sample_period': float(self.config['dpv_sample_period']),
             'dpv_pulse_time': float(self.config['dpv_pulse_time']),
             'dpv_noise_rejection': bool(self.config['dpv_noise_rejection']),
+            'dpv_drop_knock_enabled': bool(self.config['dpv_drop_knock_enabled']),
+            'dpv_drop_knock_duration': float(self.config['dpv_drop_knock_duration']),
+            'dpv_drop_knock_polarity': bool(self.config['dpv_drop_knock_polarity']),
             'dpv_irange_mode': self.config['dpv_irange_mode'],
             'dpv_max_current': float(self.config['dpv_max_current']),
         }
