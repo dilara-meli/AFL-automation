@@ -23,6 +23,7 @@
 
     function updateModeVisibility() {
         const mode = measurementMode.value || 'cv';
+        form.querySelector('[name="current_range_mode"]').closest('label').hidden = mode === 'swv';
         document.querySelectorAll('.mode-section').forEach((section) => {
             section.hidden = section.getAttribute('data-mode') !== mode;
         });
@@ -300,9 +301,9 @@
             const time = Array.isArray(plotData.time_s) ? plotData.time_s : [];
             const differentialCurrent = Array.isArray(plotData.diff_current_a) ? plotData.diff_current_a : [];
             const measurementType = attrs.measurement_type || '';
-            if (measurementType === 'differential_pulse_voltammetry') {
+            if (['differential_pulse_voltammetry', 'square_wave_voltammetry'].includes(measurementType)) {
                 drawSeriesPlot(primaryCanvas, primaryContext, voltage, differentialCurrent, 'Voltage (V)', 'Differential Current (A)', 'No differential-current data to plot yet.', '#0f766e');
-                drawSeriesPlot(voltageTimeCanvas, voltageTimeContext, [], [], 'Time (s)', 'Voltage (V)', 'DPV voltage-vs-time plot disabled.', '#b45309');
+                drawSeriesPlot(voltageTimeCanvas, voltageTimeContext, [], [], 'Time (s)', 'Voltage (V)', 'Pulse voltammetry voltage-vs-time plot disabled.', '#b45309');
                 return;
             }
             const primaryX = measurementType === 'chronoamperometry' ? time : voltage;

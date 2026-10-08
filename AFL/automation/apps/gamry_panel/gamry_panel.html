@@ -12,7 +12,7 @@
             <div>
                 <p class="eyebrow">AFL Gamry</p>
                 <h1>Remote Front Panel</h1>
-                <p class="lede">Browser-native control for the existing Gamry AFL driver. This panel covers service control, diagnostics, CV, chronoamperometry, sine, and differential pulse voltammetry with completed-run plotting.</p>
+                <p class="lede">Browser-native control for the existing Gamry AFL driver. This panel covers service control, diagnostics, CV, chronoamperometry, sine, differential pulse, and square-wave voltammetry with completed-run plotting.</p>
             </div>
             <div class="status-cluster">
                 <div class="status-pill" id="bridge-status">Unknown</div>
@@ -51,6 +51,7 @@
                             <option value="ca">Chronoamperometry</option>
                             <option value="sine">Sine + DC Offset</option>
                             <option value="dpv">Differential Pulse Voltammetry</option>
+                            <option value="swv">Square-Wave Stripping Voltammetry</option>
                         </select>
                     </label>
                     <label>Current Range Mode<input name="current_range_mode" type="text"></label>
@@ -87,6 +88,15 @@
                         <label>Acquisition Frequency (Hz)<input name="sine_acq_frequency" type="number" step="any"></label>
                         <label>Total Time (s)<input name="sine_total_time" type="number" step="any"></label>
                         <label>Phase Offset (rad)<input name="sine_phase_offset" type="number" step="any"></label>
+                    </div>
+
+                    <div class="mode-section" data-mode="swv">
+                        <label>Initial E (V)<input name="swv_initial_voltage" type="number" step="any"></label>
+                        <label>Final E (V)<input name="swv_final_voltage" type="number" step="any"></label>
+                        <label>Step Size (V)<input name="swv_step_size" type="number" step="any"></label>
+                        <label>Frequency (Hz)<input name="swv_frequency" type="number" step="any"></label>
+                        <label>Pulse Amplitude (V)<input name="swv_pulse_size" type="number" step="any"></label>
+                        <p>Fixed current range: 0.0003 A. Native differential current.</p>
                     </div>
 
                     <div class="mode-section" data-mode="dpv">

@@ -710,14 +710,15 @@ def test_enqueue_panel_measurement_stamps_mode_specific_metadata(monkeypatch, dr
     assert root.calls[0][3] == 'sine'
 
 
-def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver):
+@pytest.mark.parametrize('mode, measurement_type', [('dpv', 'differential_pulse_voltammetry'), ('swv', 'square_wave_voltammetry')])
+def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver, mode, measurement_type):
     root = FakeBridgeRoot(
         responses={
             'run_measurement': {
                 'status': 'ok',
                 'result': {
                     'mode': 'run_measurement',
-                    'measurement_type': 'differential_pulse_voltammetry',
+                    'measurement_type': measurement_type,
                     'x_key': 'potential',
                     'y_key': 'current',
                     'x_source': 'potential',
@@ -744,7 +745,7 @@ def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver):
     monkeypatch.setattr(driver, '_get_bridge_connection', lambda: connection)
     driver.data = DataPacket()
     driver.set_sample('electrode-sample', sample_uuid='SAM-ECHEM-003')
-    dataset = driver.runDPV()
+    dataset = driver.runSWV() if mode == 'swv' else driver.runDPV()
 
     class MockTiledContainer:
         def __init__(self, key, metadata=None):
@@ -786,11 +787,13 @@ def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver):
 
     assert captured['client'] is mock_client.containers['run_documents']
     assert captured['key'] == 'QD-GAMRY-001'
-    assert captured['dataset'].attrs['measurement_type'] == 'differential_pulse_voltammetry'
+    assert captured['dataset'].attrs['measurement_type'] == measurement_type
     assert captured['dataset'].attrs['sample_uuid'] == 'SAM-ECHEM-003'
     assert captured['dataset'].attrs['parameters']['dpv_diff_point_count'] == 2
     assert captured['dataset'].attrs['meta']['return_val'] == 'xarray.Dataset'
 
+
+    assert set(captured['dataset'].data_vars) == {'potential', 'current'}
 
 def test_run_measurement_now_serializes_non_cv_result(monkeypatch, driver):
     root = FakeBridgeRoot(
@@ -1329,3 +1332,134 @@ def test_dpv_output_skips_cycles_with_empty_averaging_windows(times):
     )
     assert differential['point_count'] == 0
     assert differential['skipped_cycles'] == 1
+
+
+SWV_DEFAULTS = {'initial_voltage': -1.0, 'final_voltage': 0.0,
+                'step_size': 0.002, 'frequency': 25.0, 'pulse_size': 0.025}
+
+
+def test_collect_swv_uses_native_signal_curve_and_processing(monkeypatch):
+    from AFL.automation.instrument.Gamry import gamry_worker as worker
+    events = []
+    class Signal:
+        def acq_ctrl(self):
+            return SimpleNamespace(AcqMode=1, AcqBasePeriod=0.000016666,
+                                   DutyCycle=0.2, SamplePeriod=0.02)
+    class Pstat:
+        def set_ctrl_mode(self, mode): events.append(('mode', mode))
+        def signal_sqwv_new(self, *args):
+            events.append(('signal', args))
+            return Signal()
+        def set_signal_sqwv(self, signal): events.append(('apply', signal))
+        def init_signal(self): pass
+        def set_cell(self, enabled): events.append(('cell', enabled))
+        def close(self): events.append(('close',))
+    class Curve:
+        def __init__(self, pstat, size): events.append(('curve', size))
+        def run(self, auto): events.append(('run', auto))
+        def running(self): return False
+        def acq_data(self):
+            # Native Idif deliberately differs from Ifwd - Irev to verify
+            # it reaches the output unchanged, excluding the final endpoint.
+            data = np.zeros(501, dtype=[('vstep', 'f4'), ('ifwd', 'f4'),
+                                        ('irev', 'f4'), ('idif', 'f4')])
+            data['vstep'] = np.linspace(-1, 0, 501)
+            data['ifwd'], data['irev'], data['idif'] = 3e-5, 1e-5, -4e-5
+            return data
+    toolkit = SimpleNamespace(Pstat=lambda name: Pstat(), SqwvCurve=Curve,
+                              PSTATMODE=1, pstat_is_valid=lambda pstat: True)
+    monkeypatch.setattr(worker, 'initialize_pstat', lambda *args: events.append(('init', args[2:])))
+    monkeypatch.setattr(worker.time, 'sleep', lambda seconds: None)
+    result = worker.run_measurement(toolkit, 'PSTAT', 'test', 'swv',
+                                   dict(SWV_DEFAULTS, current_range_mode='auto', max_current=1))
+    assert ('signal', (-1.0, 0.0, 0.002, 0.025, 0.02, 1)) in events
+    assert ('init', ('fixed', 0.0003)) in events
+    assert ('curve', 1501) in events
+    assert events[-2:] == [('cell', False), ('close',)]
+    assert result['measurement_type'] == 'square_wave_voltammetry'
+    assert set(result['data']) == {'potential', 'current'}
+    assert len(result['data']['current']) == 500
+    assert result['data']['potential'][-1] == pytest.approx(-0.002)
+    assert result['data']['current'] == pytest.approx([-4e-5] * 500)
+    assert result['parameters']['current_source'] == 'idif'
+    assert result['parameters']['native_acquisition_control']['DutyCycle'] == 0.2
+    assert result['parameters']['acquisition_processing'] == 'toolkitpy_native'
+
+
+@pytest.mark.parametrize('overrides', [
+    {'frequency': 0}, {'frequency': float('nan')}, {'pulse_size': -0.01},
+    {'step_size': 0}, {'step_size': -0.002}, {'step_size': 0.003},
+    {'final_voltage': -1.0}, {'initial_voltage': -2.0},
+    {'step_size': 0.000001},
+])
+def test_swv_rejects_invalid_parameters(overrides):
+    from AFL.automation.instrument.Gamry.gamry_worker import _normalize_swv_parameters
+    with pytest.raises(ValueError):
+        _normalize_swv_parameters(dict(SWV_DEFAULTS, **overrides))
+
+
+@pytest.mark.parametrize('data', [
+    {}, {'vstep': [], 'idif': []},
+    {'vstep': [-1], 'idif': [1, 2]},
+    {'vstep': [0], 'idif': [1]},
+    {'vstep': [-1], 'idif': [float('nan')]},
+    {'vstep': [-1], 'ifwd': [1], 'irev': [0]},
+])
+def test_swv_rejects_invalid_native_data(data):
+    from AFL.automation.instrument.Gamry.gamry_worker import _process_swv_data
+    with pytest.raises(ValueError):
+        _process_swv_data(data, SWV_DEFAULTS)
+
+
+def test_swv_descending_scan_accepts_capitalized_columns():
+    from AFL.automation.instrument.Gamry.gamry_worker import _process_swv_data
+    parameters = dict(SWV_DEFAULTS, initial_voltage=0, final_voltage=-1, step_size=-0.002)
+    result = _process_swv_data({'Vstep': [0, -0.002, -1], 'Idif': [-2, 1, 3]}, parameters)
+    assert result == {'potential': [0.0, -0.002], 'current': [-2.0, 1.0]}
+
+
+def test_run_swv_builds_differential_dataset(monkeypatch, driver):
+    root = FakeBridgeRoot(responses={'run_measurement': {'status': 'ok', 'result': {
+        'measurement_type': 'square_wave_voltammetry', 'measurement_mode': 'swv',
+        'data': {'potential': [-1.0, -0.998], 'current': [1e-5, 2e-5]},
+    }}})
+    monkeypatch.setattr(driver, '_ensure_service', lambda: None)
+    monkeypatch.setattr(driver, '_get_bridge_connection', lambda: FakeBridgeConnection(root))
+    dataset = driver.runSWV(swv_frequency=50.0)
+    assert root.calls[0][3] == 'swv'
+    assert root.calls[0][4]['frequency'] == 50.0
+    assert dataset.attrs['task_name'] == 'runSWV'
+    assert dataset['current'].attrs['units'] == 'A'
+    assert dataset['potential'].attrs['units'] == 'V'
+    panel = driver._build_panel_result(dataset)
+    assert panel['attrs']['plot_variant'] == 'swv_differential'
+    assert panel['plot_data']['diff_current_a'] == [1e-5, 2e-5]
+
+
+@pytest.mark.parametrize('failure', ['data', 'timeout', 'invalid_instrument'])
+def test_swv_acquisition_failures_disable_cell(monkeypatch, failure):
+    from AFL.automation.instrument.Gamry import gamry_worker as worker
+    events = []
+    class Signal:
+        def acq_ctrl(self): raise NotImplementedError('Metadata unavailable')
+    pstat = SimpleNamespace(
+        set_ctrl_mode=lambda mode: None,
+        signal_sqwv_new=lambda *args: Signal(),
+        set_signal_sqwv=lambda signal: None,
+        init_signal=lambda: None,
+        set_cell=lambda enabled: events.append(('cell', enabled)),
+        close=lambda: events.append(('close',)),
+    )
+    curve = SimpleNamespace(run=lambda auto: None, running=lambda: failure == 'timeout',
+                            acq_data=lambda: np.zeros(1, dtype=[('unexpected', 'f4')]))
+    toolkit = SimpleNamespace(Pstat=lambda name: pstat, SqwvCurve=lambda *args: curve,
+                              PSTATMODE=1,
+                              pstat_is_valid=lambda obj: failure != 'invalid_instrument')
+    monkeypatch.setattr(worker, 'initialize_pstat', lambda *args: None)
+    monkeypatch.setattr(worker.time, 'sleep', lambda seconds: None)
+    ticks = iter([0.0, 1000.0])
+    monkeypatch.setattr(worker.time, 'monotonic', lambda: next(ticks))
+    result = worker.run_measurement(toolkit, 'PSTAT', 'test', 'swv', SWV_DEFAULTS)
+    assert result['error']['type'] == {'data': 'ValueError', 'timeout': 'TimeoutError',
+                                      'invalid_instrument': 'RuntimeError'}[failure]
+    assert events[-2:] == [('cell', False), ('close',)]

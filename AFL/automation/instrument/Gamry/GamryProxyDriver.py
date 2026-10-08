@@ -90,6 +90,12 @@ class GamryProxyDriver(ProxyDriver):
     defaults['dpv_drop_knock_polarity'] = False
     defaults['dpv_irange_mode'] = 'fixed'
     defaults['dpv_max_current'] = 0.0003
+    # Native square-wave stripping voltammetry settings.
+    defaults['swv_initial_voltage'] = -1.0
+    defaults['swv_final_voltage'] = 0.0
+    defaults['swv_step_size'] = 0.002
+    defaults['swv_frequency'] = 25.0
+    defaults['swv_pulse_size'] = 0.025
 
     @staticmethod
     def _quickbar_param(label: str, param_type: str, default: Any) -> Dict[str, Any]:
@@ -150,6 +156,14 @@ class GamryProxyDriver(ProxyDriver):
                 'dpv_max_current': cls._quickbar_param('Maximum Current (A)', 'float', config['dpv_max_current']),
                 'current_range_mode': cls._quickbar_param('Current Range Mode', 'text', config['current_range_mode']),
             }
+        if mode == 'swv':
+            return {
+                'swv_initial_voltage': cls._quickbar_param('Initial E (V)', 'float', config['swv_initial_voltage']),
+                'swv_final_voltage': cls._quickbar_param('Final E (V)', 'float', config['swv_final_voltage']),
+                'swv_step_size': cls._quickbar_param('Step Size (V)', 'float', config['swv_step_size']),
+                'swv_frequency': cls._quickbar_param('Frequency (Hz)', 'float', config['swv_frequency']),
+                'swv_pulse_size': cls._quickbar_param('Pulse Amplitude (V)', 'float', config['swv_pulse_size']),
+            }
         raise ValueError(f'Unsupported quickbar mode: {mode}')
 
     def __init__(
@@ -207,6 +221,7 @@ class GamryProxyDriver(ProxyDriver):
             ('runCA', 'ca'),
             ('runSine', 'sine'),
             ('runDPV', 'dpv'),
+            ('runSWV', 'swv'),
         ):
             function_info = self.quickbar.function_info.get(function_name)
             if function_info is not None:
@@ -267,6 +282,14 @@ class GamryProxyDriver(ProxyDriver):
                 'dpv_irange_mode': str(self.config['dpv_irange_mode'] if overrides.get('dpv_irange_mode') is None else overrides['dpv_irange_mode']),
                 'dpv_max_current': float(self.config['dpv_max_current'] if overrides.get('dpv_max_current') is None else overrides['dpv_max_current']),
                 'current_range_mode': str(self.config['current_range_mode'] if overrides.get('current_range_mode') is None else overrides['current_range_mode']),
+            }
+        if mode == 'swv':
+            return {
+                'swv_initial_voltage': float(self.config['swv_initial_voltage'] if overrides.get('swv_initial_voltage') is None else overrides['swv_initial_voltage']),
+                'swv_final_voltage': float(self.config['swv_final_voltage'] if overrides.get('swv_final_voltage') is None else overrides['swv_final_voltage']),
+                'swv_step_size': float(self.config['swv_step_size'] if overrides.get('swv_step_size') is None else overrides['swv_step_size']),
+                'swv_frequency': float(self.config['swv_frequency'] if overrides.get('swv_frequency') is None else overrides['swv_frequency']),
+                'swv_pulse_size': float(self.config['swv_pulse_size'] if overrides.get('swv_pulse_size') is None else overrides['swv_pulse_size']),
             }
         raise ValueError(f'Unsupported measurement mode: {mode}')
 
@@ -364,6 +387,12 @@ class GamryProxyDriver(ProxyDriver):
     @Driver.queued()
     def runDPV(self, instrument_name: Optional[str] = None, **kwargs):
         return self._remote_dataset('runDPV', 'dpv', instrument_name=instrument_name, **kwargs)
+
+    @Driver.quickbar(qb={'button_text': 'Run square-wave stripping voltammetry', 'params': {}})
+    @Driver.queued()
+    def runSWV(self, instrument_name: Optional[str] = None, **kwargs):
+        """Run native SWV on the instrument host with a fixed 0.0003 A range."""
+        return self._remote_dataset('runSWV', 'swv', instrument_name=instrument_name, **kwargs)
 
 
 _DEFAULT_CUSTOM_CONFIG = {

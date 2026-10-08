@@ -60,7 +60,7 @@ class GamryDriver(Driver):
         result = client.wait(target_uuid=task_uuid)
         dataset = client.retrieve_obj(task_uuid)
 
-    ``runCV``, ``runCA``, ``runSine``, and ``runDPV`` are queued operations;
+    ``runCV``, ``runCA``, ``runSine``, ``runDPV``, and ``runSWV`` are queued operations;
     use ``connectInstrument`` and status methods only for short setup checks.
     """
     defaults = {}
@@ -116,6 +116,12 @@ class GamryDriver(Driver):
     defaults['dpv_drop_knock_polarity'] = False
     defaults['dpv_irange_mode'] = 'fixed'
     defaults['dpv_max_current'] = 0.0003
+    # Native square-wave stripping voltammetry settings.
+    defaults['swv_initial_voltage'] = -1.0
+    defaults['swv_final_voltage'] = 0.0
+    defaults['swv_step_size'] = 0.002
+    defaults['swv_frequency'] = 25.0
+    defaults['swv_pulse_size'] = 0.025
     static_dirs = {
         'gamry_panel_assets': pathlib.Path(__file__).parent.parent.parent / 'apps' / 'gamry_panel',
     }
@@ -184,6 +190,14 @@ class GamryDriver(Driver):
                 'irange_mode': cls._quickbar_param('I/E Range Mode', 'text', config['dpv_irange_mode']),
                 'max_current': cls._quickbar_param('Max Current (A)', 'float', config['dpv_max_current']),
                 'current_range_mode': cls._quickbar_param('Current Range Mode', 'text', config['current_range_mode']),
+            }
+        if mode == 'swv':
+            return {
+                'initial_voltage': cls._quickbar_param('Initial E (V)', 'float', config['swv_initial_voltage']),
+                'final_voltage': cls._quickbar_param('Final E (V)', 'float', config['swv_final_voltage']),
+                'step_size': cls._quickbar_param('Step Size (V)', 'float', config['swv_step_size']),
+                'frequency': cls._quickbar_param('Frequency (Hz)', 'float', config['swv_frequency']),
+                'pulse_size': cls._quickbar_param('Pulse Amplitude (V)', 'float', config['swv_pulse_size']),
             }
         raise ValueError(f'Unsupported quickbar mode: {mode}')
 
@@ -521,6 +535,20 @@ class GamryDriver(Driver):
             **kwargs,
         )
 
+    @Driver.quickbar(qb={'button_text': 'Run square-wave stripping voltammetry', 'params': {}})
+    @Driver.queued()
+    def runSWV(self, instrument_name: Optional[str] = None, **kwargs):
+        """Run native SWV; pulse size is amplitude about the staircase voltage.
+
+        The returned current is ToolkitPy's native idif, with the final
+        staircase boundary excluded.
+        The current range is always fixed using 0.0003 A.
+        """
+        return self.runMeasurement(
+            measurement_mode='swv', instrument_name=instrument_name,
+            return_data=True, task_name='runSWV', step_name='swv', **kwargs,
+        )
+
     @Driver.unqueued()
     def enqueuePanelMeasurement(
         self,
@@ -534,12 +562,14 @@ class GamryDriver(Driver):
             'ca': 'enqueuePanelMeasurement',
             'sine': 'enqueuePanelMeasurement',
             'dpv': 'enqueuePanelMeasurement',
+            'swv': 'enqueuePanelMeasurement',
         }
         step_name_by_mode = {
             'cv': 'panel_cv',
             'ca': 'panel_ca',
             'sine': 'panel_sine',
             'dpv': 'panel_dpv',
+            'swv': 'panel_swv',
         }
         return self.runMeasurement(
             measurement_mode=mode,
@@ -594,6 +624,11 @@ class GamryDriver(Driver):
         dpv_drop_knock_polarity: Optional[bool] = None,
         dpv_irange_mode: Optional[str] = None,
         dpv_max_current: Optional[float] = None,
+        swv_initial_voltage: Optional[float] = None,
+        swv_final_voltage: Optional[float] = None,
+        swv_step_size: Optional[float] = None,
+        swv_frequency: Optional[float] = None,
+        swv_pulse_size: Optional[float] = None,
         **kwargs,
     ):
         updates = {}
@@ -633,6 +668,11 @@ class GamryDriver(Driver):
             'dpv_sample_period': dpv_sample_period,
             'dpv_pulse_time': dpv_pulse_time,
             'dpv_max_current': dpv_max_current,
+            'swv_initial_voltage': swv_initial_voltage,
+            'swv_final_voltage': swv_final_voltage,
+            'swv_step_size': swv_step_size,
+            'swv_frequency': swv_frequency,
+            'swv_pulse_size': swv_pulse_size,
             'dpv_drop_knock_duration': dpv_drop_knock_duration,
         }
         for key, value in numeric_fields.items():
@@ -965,6 +1005,9 @@ class GamryDriver(Driver):
             if array.size == point_count:
                 ds[source_name] = ('point', array[:point_count])
 
+        if measurement_type == 'square_wave_voltammetry':
+            ds['potential'].attrs['units'] = 'V'
+            ds['current'].attrs.update(units='A', long_name='Native SWV differential current', source='idif')
         return ds
 
     def _quickbar_snapshot(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
@@ -973,6 +1016,7 @@ class GamryDriver(Driver):
             'runCA': self._quickbar_params_from_config(self.config, 'ca'),
             'runSine': self._quickbar_params_from_config(self.config, 'sine'),
             'runDPV': self._quickbar_params_from_config(self.config, 'dpv'),
+            'runSWV': self._quickbar_params_from_config(self.config, 'swv'),
         }
 
     def refresh_quickbar(self) -> None:
@@ -1039,6 +1083,14 @@ class GamryDriver(Driver):
                 'irange_mode': irange_mode,
                 'max_current': float(self.config['dpv_max_current'] if overrides.get('dpv_max_current') is None else overrides['dpv_max_current']),
                 'current_range_mode': str(self.config['current_range_mode'] if overrides.get('current_range_mode') is None else overrides['current_range_mode']),
+            }
+        if mode == 'swv':
+            return {
+                'initial_voltage': float(self.config['swv_initial_voltage'] if overrides.get('swv_initial_voltage') is None else overrides['swv_initial_voltage']),
+                'final_voltage': float(self.config['swv_final_voltage'] if overrides.get('swv_final_voltage') is None else overrides['swv_final_voltage']),
+                'step_size': float(self.config['swv_step_size'] if overrides.get('swv_step_size') is None else overrides['swv_step_size']),
+                'frequency': float(self.config['swv_frequency'] if overrides.get('swv_frequency') is None else overrides['swv_frequency']),
+                'pulse_size': float(self.config['swv_pulse_size'] if overrides.get('swv_pulse_size') is None else overrides['swv_pulse_size']),
             }
         raise ValueError(f'Unsupported measurement mode: {mode}')
 
@@ -1156,6 +1208,11 @@ class GamryDriver(Driver):
             'dpv_drop_knock_polarity': bool(self.config['dpv_drop_knock_polarity']),
             'dpv_irange_mode': self.config['dpv_irange_mode'],
             'dpv_max_current': float(self.config['dpv_max_current']),
+            'swv_initial_voltage': float(self.config['swv_initial_voltage']),
+            'swv_final_voltage': float(self.config['swv_final_voltage']),
+            'swv_step_size': float(self.config['swv_step_size']),
+            'swv_frequency': float(self.config['swv_frequency']),
+            'swv_pulse_size': float(self.config['swv_pulse_size']),
         }
 
     def _serialize_dataset(self, dataset: Optional[xr.Dataset]) -> Optional[Dict[str, Any]]:
@@ -1193,14 +1250,14 @@ class GamryDriver(Driver):
         if 'potential' in data:
             plot_data['voltage_v'] = data['potential']
         if 'current' in data:
-            if measurement_type == 'differential_pulse_voltammetry':
+            if measurement_type in {'differential_pulse_voltammetry', 'square_wave_voltammetry'}:
                 plot_data['diff_current_a'] = data['current']
             else:
                 plot_data['current_a'] = data['current']
 
         attrs['plot_source'] = 'dataset'
-        if measurement_type == 'differential_pulse_voltammetry':
-            attrs['plot_variant'] = 'dpv_differential'
+        if measurement_type in {'differential_pulse_voltammetry', 'square_wave_voltammetry'}:
+            attrs['plot_variant'] = 'swv_differential' if measurement_type == 'square_wave_voltammetry' else 'dpv_differential'
 
         return {
             'attrs': attrs,
