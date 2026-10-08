@@ -1343,8 +1343,7 @@ def test_collect_swv_uses_native_signal_curve_and_processing(monkeypatch):
     events = []
     class Signal:
         def acq_ctrl(self):
-            return SimpleNamespace(AcqMode=1, AcqBasePeriod=0.000016666,
-                                   DutyCycle=0.2, SamplePeriod=0.02)
+            raise AssertionError('SWV must not inspect acquisition controls')
     class Pstat:
         def set_ctrl_mode(self, mode): events.append(('mode', mode))
         def signal_sqwv_new(self, *args):
@@ -1360,7 +1359,7 @@ def test_collect_swv_uses_native_signal_curve_and_processing(monkeypatch):
         def running(self): return False
         def acq_data(self):
             # Native Idif deliberately differs from Ifwd - Irev to verify
-            # it reaches the output unchanged, excluding the final endpoint.
+            # all rows reach the output unchanged, including the final endpoint.
             data = np.zeros(501, dtype=[('vstep', 'f4'), ('ifwd', 'f4'),
                                         ('irev', 'f4'), ('idif', 'f4')])
             data['vstep'] = np.linspace(-1, 0, 501)
@@ -1374,23 +1373,24 @@ def test_collect_swv_uses_native_signal_curve_and_processing(monkeypatch):
                                    dict(SWV_DEFAULTS, current_range_mode='auto', max_current=1))
     assert ('signal', (-1.0, 0.0, 0.002, 0.025, 0.02, 1)) in events
     assert ('init', ('fixed', 0.0003)) in events
-    assert ('curve', 1501) in events
+    assert ('curve', 100000) in events
+    assert events.index(('curve', 100000)) < events.index(('signal', (-1.0, 0.0, 0.002, 0.025, 0.02, 1)))
     assert events[-2:] == [('cell', False), ('close',)]
     assert result['measurement_type'] == 'square_wave_voltammetry'
     assert set(result['data']) == {'potential', 'current'}
-    assert len(result['data']['current']) == 500
-    assert result['data']['potential'][-1] == pytest.approx(-0.002)
-    assert result['data']['current'] == pytest.approx([-4e-5] * 500)
+    assert len(result['data']['current']) == 501
+    assert result['data']['potential'][-1] == 0.0
+    assert result['data']['current'] == pytest.approx([-4e-5] * 501)
     assert result['parameters']['current_source'] == 'idif'
-    assert result['parameters']['native_acquisition_control']['DutyCycle'] == 0.2
+    assert 'native_acquisition_control' not in result['parameters']
+    assert 'expected_duration' not in result['parameters']
     assert result['parameters']['acquisition_processing'] == 'toolkitpy_native'
 
 
 @pytest.mark.parametrize('overrides', [
     {'frequency': 0}, {'frequency': float('nan')}, {'pulse_size': -0.01},
-    {'step_size': 0}, {'step_size': -0.002}, {'step_size': 0.003},
+    {'step_size': 0}, {'step_size': -0.002},
     {'final_voltage': -1.0}, {'initial_voltage': -2.0},
-    {'step_size': 0.000001},
 ])
 def test_swv_rejects_invalid_parameters(overrides):
     from AFL.automation.instrument.Gamry.gamry_worker import _normalize_swv_parameters
@@ -1401,21 +1401,19 @@ def test_swv_rejects_invalid_parameters(overrides):
 @pytest.mark.parametrize('data', [
     {}, {'vstep': [], 'idif': []},
     {'vstep': [-1], 'idif': [1, 2]},
-    {'vstep': [0], 'idif': [1]},
     {'vstep': [-1], 'idif': [float('nan')]},
     {'vstep': [-1], 'ifwd': [1], 'irev': [0]},
 ])
 def test_swv_rejects_invalid_native_data(data):
     from AFL.automation.instrument.Gamry.gamry_worker import _process_swv_data
     with pytest.raises(ValueError):
-        _process_swv_data(data, SWV_DEFAULTS)
+        _process_swv_data(data)
 
 
 def test_swv_descending_scan_accepts_capitalized_columns():
     from AFL.automation.instrument.Gamry.gamry_worker import _process_swv_data
-    parameters = dict(SWV_DEFAULTS, initial_voltage=0, final_voltage=-1, step_size=-0.002)
-    result = _process_swv_data({'Vstep': [0, -0.002, -1], 'Idif': [-2, 1, 3]}, parameters)
-    assert result == {'potential': [0.0, -0.002], 'current': [-2.0, 1.0]}
+    result = _process_swv_data({'Vstep': [0, -0.002, -1], 'Idif': [-2, 1, 3]})
+    assert result == {'potential': [0.0, -0.002, -1.0], 'current': [-2.0, 1.0, 3.0]}
 
 
 def test_run_swv_builds_differential_dataset(monkeypatch, driver):
@@ -1436,7 +1434,7 @@ def test_run_swv_builds_differential_dataset(monkeypatch, driver):
     assert panel['plot_data']['diff_current_a'] == [1e-5, 2e-5]
 
 
-@pytest.mark.parametrize('failure', ['data', 'timeout', 'invalid_instrument'])
+@pytest.mark.parametrize('failure', ['data', 'invalid_instrument'])
 def test_swv_acquisition_failures_disable_cell(monkeypatch, failure):
     from AFL.automation.instrument.Gamry import gamry_worker as worker
     events = []
@@ -1450,16 +1448,30 @@ def test_swv_acquisition_failures_disable_cell(monkeypatch, failure):
         set_cell=lambda enabled: events.append(('cell', enabled)),
         close=lambda: events.append(('close',)),
     )
-    curve = SimpleNamespace(run=lambda auto: None, running=lambda: failure == 'timeout',
+    curve = SimpleNamespace(run=lambda auto: None, running=lambda: False,
                             acq_data=lambda: np.zeros(1, dtype=[('unexpected', 'f4')]))
     toolkit = SimpleNamespace(Pstat=lambda name: pstat, SqwvCurve=lambda *args: curve,
                               PSTATMODE=1,
                               pstat_is_valid=lambda obj: failure != 'invalid_instrument')
     monkeypatch.setattr(worker, 'initialize_pstat', lambda *args: None)
     monkeypatch.setattr(worker.time, 'sleep', lambda seconds: None)
-    ticks = iter([0.0, 1000.0])
-    monkeypatch.setattr(worker.time, 'monotonic', lambda: next(ticks))
     result = worker.run_measurement(toolkit, 'PSTAT', 'test', 'swv', SWV_DEFAULTS)
-    assert result['error']['type'] == {'data': 'ValueError', 'timeout': 'TimeoutError',
+    assert result['error']['type'] == {'data': 'ValueError',
                                       'invalid_instrument': 'RuntimeError'}[failure]
     assert events[-2:] == [('cell', False), ('close',)]
+
+
+def test_bridge_reset_reports_worker_exit_and_log_paths(monkeypatch, driver):
+    def reset_connection():
+        raise EOFError('connection reset')
+    monkeypatch.setattr(driver, '_ensure_service', lambda: None)
+    monkeypatch.setattr(driver, '_get_bridge_connection', reset_connection)
+    monkeypatch.setattr(driver, '_close_bridge_connection', lambda: None)
+    driver._service_process = SimpleNamespace(poll=lambda: -1073741819)
+    try:
+        with pytest.raises(RuntimeError) as error:
+            driver._invoke_bridge('run_measurement', {'measurement_mode': 'swv', 'parameters': {}})
+        assert '0xC0000005' in str(error.value)
+        assert 'gamry_worker.log.fault.log' in str(error.value)
+    finally:
+        driver._service_process = None

@@ -540,8 +540,7 @@ class GamryDriver(Driver):
     def runSWV(self, instrument_name: Optional[str] = None, **kwargs):
         """Run native SWV; pulse size is amplitude about the staircase voltage.
 
-        The returned current is ToolkitPy's native idif, with the final
-        staircase boundary excluded.
+        All native vstep/idif rows are returned without endpoint filtering.
         The current range is always fixed using 0.0003 A.
         """
         return self.runMeasurement(
@@ -902,7 +901,16 @@ class GamryDriver(Driver):
             response = self._coerce_bridge_value(response)
         except Exception as exc:
             self._close_bridge_connection()
-            raise RuntimeError(f'Gamry bridge request failed: {exc}') from exc
+            details = ''
+            process = self._service_process
+            if process is not None:
+                exit_code = process.poll()
+                if exit_code is not None:
+                    details += f' Worker exited with code {exit_code} (0x{exit_code & 0xFFFFFFFF:08X}).'
+            if isinstance(exc, (EOFError, ConnectionError)):
+                log_path = self._worker_log_path()
+                details += f' Worker event log: {log_path}; native fault log: {log_path}.fault.log.'
+            raise RuntimeError(f'Gamry bridge request failed: {exc}.{details}') from exc
 
         if response.get('status') != 'ok':
             error = response.get('error', {})

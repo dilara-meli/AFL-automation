@@ -1,5 +1,6 @@
 import csv
 import datetime
+import faulthandler
 import json
 import math
 import os
@@ -980,35 +981,21 @@ def _normalize_swv_parameters(parameters):
     step = normalized['step_size']
     if step == 0 or span == 0 or span / step <= 0:
         raise ValueError('SWV step size must be nonzero and point toward the final voltage')
-    steps = span / step
-    if not math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-6):
-        raise ValueError('SWV voltage span must contain an integer number of steps')
-    cycle_count = int(round(steps))
-    if cycle_count < 1:
-        raise ValueError('SWV voltage span must contain at least one step')
-    max_curve_points = 262144
-    # Allow the native curve to include both endpoints, plus buffer headroom.
-    buffer_points = cycle_count + 1 + 1000
-    if buffer_points > max_curve_points:
-        raise ValueError('SWV experiment would exceed the acquisition buffer size')
     for voltage in (normalized['initial_voltage'], normalized['final_voltage']):
         _validate_voltage_limit(voltage - normalized['pulse_size'], voltage + normalized['pulse_size'])
-    cycle_time = 1.0 / normalized['frequency']
-    step_time = cycle_time / 2.0
-    expected_duration = (cycle_count + 1) * cycle_time
-    if not all(math.isfinite(value) and value > 0 for value in (cycle_time, step_time, expected_duration)):
+    step_time = 0.5 / normalized['frequency']
+    if not math.isfinite(step_time) or step_time <= 0:
         raise ValueError('SWV frequency produces invalid timing')
     normalized.update(
         current_range_mode='fixed', max_current=0.0003,
-        cycle_count=cycle_count, cycle_time=cycle_time, step_time=step_time,
-        expected_duration=expected_duration, buffer_points=buffer_points,
+        step_time=step_time, buffer_points=100000,
         acquisition_processing='toolkitpy_native', current_source='idif',
-        voltage_axis='staircase', final_voltage_included=False,
+        voltage_axis='staircase',
     )
     return normalized
 
 
-def _process_swv_data(data, parameters):
+def _process_swv_data(data):
     # ToolkitPy versions may capitalize the documented NumPy column names.
     columns = {str(key).lower(): value for key, value in data.items()}
     required = ('vstep', 'idif')
@@ -1017,68 +1004,52 @@ def _process_swv_data(data, parameters):
     lengths = [len(columns[key]) for key in required]
     if not lengths[0] or len(set(lengths)) != 1:
         raise ValueError('SWV native columns must be nonempty and have matching lengths')
-    initial = parameters['initial_voltage']
-    final = parameters['final_voltage']
-    direction = 1 if parameters['step_size'] > 0 else -1
-    # Native float32 voltages can differ slightly from configured boundaries.
-    tolerance = min(1e-6, abs(parameters['step_size']) * 0.01)
-    potential, current = [], []
-    for voltage, differential in zip(*(columns[key] for key in required)):
-        voltage, differential = float(voltage), float(differential)
-        if not all(math.isfinite(value) for value in (voltage, differential)):
-            raise ValueError('SWV native data contains non-finite values')
-        if direction * (voltage - initial) < -tolerance:
-            continue
-        if direction * (final - voltage) <= tolerance:
-            continue
-        potential.append(voltage)
-        current.append(differential)
-    if not potential:
-        raise ValueError('SWV acquisition returned no points within the scan boundaries')
+    potential = [float(value) for value in columns['vstep']]
+    current = [float(value) for value in columns['idif']]
+    if not all(math.isfinite(value) for value in potential + current):
+        raise ValueError('SWV native data contains non-finite values')
     return {'potential': potential, 'current': current}
 
 
 def collect_swv(tkp, instrument_name, process_name, parameters):
     normalized = _normalize_swv_parameters(parameters)
+    _log_worker_event('swv_pstat_create_begin', instrument_name=instrument_name)
     pstat = tkp.Pstat(instrument_name)
     curve = None
     signal = None
     try:
         _log_worker_event('swv_start', instrument_name=instrument_name, parameters=normalized)
+        _log_worker_event('swv_initialize_begin')
         pstat.set_ctrl_mode(tkp.PSTATMODE)
         initialize_pstat(tkp, pstat, 'fixed', normalized['max_current'])
+        _log_worker_event('swv_curve_create_begin', buffer_points=normalized['buffer_points'])
+        curve = tkp.SqwvCurve(pstat, normalized['buffer_points'])
+        _log_worker_event('swv_signal_create_begin')
         signal = pstat.signal_sqwv_new(
             normalized['initial_voltage'], normalized['final_voltage'],
             normalized['step_size'], normalized['pulse_size'],
             normalized['step_time'], tkp.PSTATMODE,
         )
-        # Observe native settings without overriding ToolkitPy's processing.
-        if hasattr(signal, 'acq_ctrl'):
-            try:
-                control = signal.acq_ctrl()
-                normalized['native_acquisition_control'] = {
-                    key: (int(getattr(control, key)) if key == 'AcqMode' else float(getattr(control, key)))
-                    for key in ('AcqMode', 'AcqBasePeriod', 'DutyCycle', 'SamplePeriod')
-                    if hasattr(control, key)
-                }
-            except Exception as exc:
-                # Optional metadata must not prevent otherwise supported acquisition.
-                _log_worker_event('swv_acquisition_control_unavailable', message=str(exc))
-        curve = tkp.SqwvCurve(pstat, normalized['buffer_points'])
+        _log_worker_event('swv_signal_created')
+        _log_worker_event('swv_signal_apply_begin')
         pstat.set_signal_sqwv(signal)
+        _log_worker_event('swv_signal_init_begin')
         pstat.init_signal()
+        _log_worker_event('swv_cell_enable_begin')
         pstat.set_cell(True)
         time.sleep(0.25)
+        _log_worker_event('swv_curve_run_begin')
         curve.run(True)
-        deadline = time.monotonic() + max(30.0, normalized['expected_duration'] * 3.0 + 5.0)
+        _log_worker_event('swv_curve_run_returned')
         while tkp.pstat_is_valid(pstat) and curve.running():
-            if time.monotonic() > deadline:
-                raise TimeoutError('SWV acquisition did not complete within the expected time')
             time.sleep(0.1)
         if not tkp.pstat_is_valid(pstat):
             raise RuntimeError('SWV potentiostat became invalid during acquisition')
+        _log_worker_event('swv_data_read_begin')
         raw_data = _curve_data_to_lists(curve.acq_data())
-        processed = _process_swv_data(raw_data, normalized)
+        _log_worker_event('swv_data_read_complete', keys=sorted(raw_data),
+                          lengths={key: len(value) for key, value in raw_data.items()})
+        processed = _process_swv_data(raw_data)
         normalized['native_point_count'] = len(next(iter(raw_data.values())))
         normalized['output_point_count'] = len(processed['current'])
         _log_worker_event('swv_complete', parameters=normalized)
@@ -1092,15 +1063,18 @@ def collect_swv(tkp, instrument_name, process_name, parameters):
             'parameters': normalized, 'data': processed,
         }
     except Exception as exc:
-        _log_worker_event('swv_exception', error_type=exc.__class__.__name__, message=str(exc))
+        _log_worker_event('swv_exception', error_type=exc.__class__.__name__, message=str(exc),
+                          traceback=traceback.format_exc())
         raise
     finally:
-        release_pstat(tkp, pstat)
-        if curve is not None:
-            del curve
+        _log_worker_event('swv_cleanup_begin')
         if signal is not None:
             del signal
+        if curve is not None:
+            del curve
+        release_pstat(tkp, pstat)
         del pstat
+        _log_worker_event('swv_cleanup_complete')
 
 
 def run_measurement(tkp, instrument_name, process_name, measurement_mode, parameters):
@@ -1290,6 +1264,15 @@ class GamryBridgeService(_RpycServiceBase):
 
 def serve(host, port, process_name):
     _, threaded_server_cls = _require_rpyc()
+    # Keep the file open for the worker lifetime. Native ToolkitPy faults can
+    # terminate Python before ordinary exception handling or event logging runs.
+    fault_log = None
+    if WORKER_LOG_PATH:
+        try:
+            fault_log = open(WORKER_LOG_PATH + '.fault.log', 'a', encoding='utf-8')
+            faulthandler.enable(file=fault_log, all_threads=True)
+        except Exception as exc:
+            _log_worker_event('worker_fault_logging_unavailable', message=str(exc))
     tkp = _require_toolkitpy()
 
     _log_worker_event('worker_serve_start', host=host, port=port, process_name=process_name, python_executable=sys.executable)
