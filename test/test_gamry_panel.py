@@ -294,10 +294,13 @@ def test_run_measurement_persists_dataset_to_data_backend():
 def test_swv_panel_defaults_and_saved_parameters():
     driver = _PanelTestGamryDriver()
     config = driver.getPanelState()['config']
+    assert config['extended_data'] is False
     assert config['swv_frequency'] == 25.0
     assert config['swv_initial_voltage'] == -1.0
     result = driver.updatePanelConfig(measurement_mode='swv', swv_frequency=50.0,
-                                     swv_pulse_size=0.03)
+                                     swv_pulse_size=0.03, extended_data=True)
+    assert result['config']['extended_data'] is True
+    assert driver._measurement_parameters('swv', {})['extended_data'] is True
     assert result['config']['swv_frequency'] == 50.0
     assert driver._measurement_parameters('swv', {})['pulse_size'] == 0.03
     html = driver.gamry_panel()

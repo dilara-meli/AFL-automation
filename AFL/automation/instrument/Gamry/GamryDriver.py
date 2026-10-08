@@ -122,6 +122,7 @@ class GamryDriver(Driver):
     defaults['swv_step_size'] = 0.002
     defaults['swv_frequency'] = 25.0
     defaults['swv_pulse_size'] = 0.025
+    defaults['extended_data'] = False
     static_dirs = {
         'gamry_panel_assets': pathlib.Path(__file__).parent.parent.parent / 'apps' / 'gamry_panel',
     }
@@ -198,6 +199,7 @@ class GamryDriver(Driver):
                 'step_size': cls._quickbar_param('Step Size (V)', 'float', config['swv_step_size']),
                 'frequency': cls._quickbar_param('Frequency (Hz)', 'float', config['swv_frequency']),
                 'pulse_size': cls._quickbar_param('Pulse Amplitude (V)', 'float', config['swv_pulse_size']),
+                'extended_data': cls._quickbar_param('Extended Data', 'bool', config['extended_data']),
             }
         raise ValueError(f'Unsupported quickbar mode: {mode}')
 
@@ -540,7 +542,8 @@ class GamryDriver(Driver):
     def runSWV(self, instrument_name: Optional[str] = None, **kwargs):
         """Run native SWV; pulse size is amplitude about the staircase voltage.
 
-        All native vstep/idif rows are returned without endpoint filtering.
+        Native vsig/idif/time rows are returned without endpoint filtering.
+        Set extended_data=True to include every native column.
         The current range is always fixed using 0.0003 A.
         """
         return self.runMeasurement(
@@ -628,6 +631,7 @@ class GamryDriver(Driver):
         swv_step_size: Optional[float] = None,
         swv_frequency: Optional[float] = None,
         swv_pulse_size: Optional[float] = None,
+        extended_data: Optional[bool] = None,
         **kwargs,
     ):
         updates = {}
@@ -683,6 +687,8 @@ class GamryDriver(Driver):
         for key, value in integer_fields.items():
             if value is not None:
                 updates[key] = int(value)
+        if extended_data is not None:
+            updates['extended_data'] = str(extended_data).strip().lower() in {'true', '1', 'yes', 'on'}
         if dpv_noise_rejection is not None:
             updates['dpv_noise_rejection'] = bool(dpv_noise_rejection)
         if dpv_drop_knock_enabled is not None:
@@ -1019,7 +1025,7 @@ class GamryDriver(Driver):
                 ds[source_name] = ('point', array[:point_count])
 
         if measurement_type == 'square_wave_voltammetry':
-            ds['potential'].attrs['units'] = 'V'
+            ds['potential'].attrs.update(units='V', source='vsig')
             ds['current'].attrs.update(units='A', long_name='Native SWV differential current', source='idif')
             for name in ('vstep', 'vfwd', 'vrev', 'vsig'):
                 if name in ds:
@@ -1112,6 +1118,7 @@ class GamryDriver(Driver):
                 'step_size': float(self.config['swv_step_size'] if overrides.get('swv_step_size') is None else overrides['swv_step_size']),
                 'frequency': float(self.config['swv_frequency'] if overrides.get('swv_frequency') is None else overrides['swv_frequency']),
                 'pulse_size': float(self.config['swv_pulse_size'] if overrides.get('swv_pulse_size') is None else overrides['swv_pulse_size']),
+                'extended_data': str(self.config['extended_data'] if overrides.get('extended_data') is None else overrides['extended_data']).strip().lower() in {'true', '1', 'yes', 'on'},
             }
         raise ValueError(f'Unsupported measurement mode: {mode}')
 
@@ -1234,6 +1241,7 @@ class GamryDriver(Driver):
             'swv_step_size': float(self.config['swv_step_size']),
             'swv_frequency': float(self.config['swv_frequency']),
             'swv_pulse_size': float(self.config['swv_pulse_size']),
+            'extended_data': bool(self.config['extended_data']),
         }
 
     def _serialize_dataset(self, dataset: Optional[xr.Dataset]) -> Optional[Dict[str, Any]]:

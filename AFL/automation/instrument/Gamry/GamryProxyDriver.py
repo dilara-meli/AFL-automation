@@ -96,6 +96,7 @@ class GamryProxyDriver(ProxyDriver):
     defaults['swv_step_size'] = 0.002
     defaults['swv_frequency'] = 25.0
     defaults['swv_pulse_size'] = 0.025
+    defaults['extended_data'] = False
 
     @staticmethod
     def _quickbar_param(label: str, param_type: str, default: Any) -> Dict[str, Any]:
@@ -163,6 +164,7 @@ class GamryProxyDriver(ProxyDriver):
                 'swv_step_size': cls._quickbar_param('Step Size (V)', 'float', config['swv_step_size']),
                 'swv_frequency': cls._quickbar_param('Frequency (Hz)', 'float', config['swv_frequency']),
                 'swv_pulse_size': cls._quickbar_param('Pulse Amplitude (V)', 'float', config['swv_pulse_size']),
+                'extended_data': cls._quickbar_param('Extended Data', 'bool', config['extended_data']),
             }
         raise ValueError(f'Unsupported quickbar mode: {mode}')
 
@@ -290,6 +292,7 @@ class GamryProxyDriver(ProxyDriver):
                 'swv_step_size': float(self.config['swv_step_size'] if overrides.get('swv_step_size') is None else overrides['swv_step_size']),
                 'swv_frequency': float(self.config['swv_frequency'] if overrides.get('swv_frequency') is None else overrides['swv_frequency']),
                 'swv_pulse_size': float(self.config['swv_pulse_size'] if overrides.get('swv_pulse_size') is None else overrides['swv_pulse_size']),
+                'extended_data': str(self.config['extended_data'] if overrides.get('extended_data') is None else overrides['extended_data']).strip().lower() in {'true', '1', 'yes', 'on'},
             }
         raise ValueError(f'Unsupported measurement mode: {mode}')
 

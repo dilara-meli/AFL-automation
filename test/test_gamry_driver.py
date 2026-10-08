@@ -711,7 +711,8 @@ def test_enqueue_panel_measurement_stamps_mode_specific_metadata(monkeypatch, dr
 
 
 @pytest.mark.parametrize('mode, measurement_type', [('dpv', 'differential_pulse_voltammetry'), ('swv', 'square_wave_voltammetry')])
-def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver, mode, measurement_type):
+@pytest.mark.parametrize('extended_data', [False, True])
+def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver, mode, measurement_type, extended_data):
     root = FakeBridgeRoot(
         responses={
             'run_measurement': {
@@ -743,19 +744,19 @@ def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver, mode, measur
         'point': [10, 11], 'time': [0.04, 0.08], 'vstep': [0.025, 0.03],
         'idif': [0.06, 0.08], 'im': [0.01, 0.02], 'ifwd': [0.1, 0.2],
         'irev': [0.04, 0.12], 'ach': [0.0, 0.0], 'vfwd': [0.05, 0.055],
-        'vrev': [0.0, 0.005], 'vsig': [0.025, 0.03], 'ie_range': [3, 3],
+        'vrev': [0.0, 0.005], 'vsig': [-1.025, -1.023], 'ie_range': [3, 3],
         'overload': [0, 0], 'stop_test': [0, 0], 'temp': [25.0, 25.1],
     }
     if mode == 'swv':
         from AFL.automation.instrument.Gamry.gamry_worker import _process_swv_data
-        root.responses['run_measurement']['result']['data'] = _process_swv_data(native)
+        root.responses['run_measurement']['result']['data'] = _process_swv_data(native, extended_data=extended_data)
     connection = FakeBridgeConnection(root)
 
     monkeypatch.setattr(driver, '_ensure_service', lambda: None)
     monkeypatch.setattr(driver, '_get_bridge_connection', lambda: connection)
     driver.data = DataPacket()
     driver.set_sample('electrode-sample', sample_uuid='SAM-ECHEM-003')
-    dataset = driver.runSWV() if mode == 'swv' else driver.runDPV()
+    dataset = driver.runSWV(extended_data=extended_data) if mode == 'swv' else driver.runDPV()
 
     class MockTiledContainer:
         def __init__(self, key, metadata=None):
@@ -804,15 +805,20 @@ def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver, mode, measur
 
 
     written = captured['dataset']
-    if mode == 'swv':
+    if mode == 'swv' and extended_data:
         assert set(written.data_vars) == {'potential', 'current'} | (set(native) - {'point'})
         for name, values in native.items():
             assert written[name].values.tolist() == values
         assert written['current'].values.tolist() == native['idif']
+        assert written['potential'].values.tolist() == native['vsig']
         assert written['im'].values.tolist() != native['idif']
         assert written['ie_range'].dtype.kind == 'i'
         assert written['vfwd'].attrs['units'] == 'V'
         assert written['ifwd'].attrs['units'] == 'A'
+    elif mode == 'swv':
+        assert set(written.data_vars) == {'potential', 'current', 'time'}
+        assert written['potential'].values.tolist() == native['vsig']
+        assert written['current'].values.tolist() == native['idif']
     else:
         assert set(written.data_vars) == {'potential', 'current'}
 
@@ -1360,7 +1366,8 @@ SWV_DEFAULTS = {'initial_voltage': -1.0, 'final_voltage': 0.0,
                 'step_size': 0.002, 'frequency': 25.0, 'pulse_size': 0.025}
 
 
-def test_collect_swv_uses_native_signal_curve_and_processing(monkeypatch):
+@pytest.mark.parametrize('extended_data', [False, True])
+def test_collect_swv_uses_native_signal_curve_and_processing(monkeypatch, extended_data):
     from AFL.automation.instrument.Gamry import gamry_worker as worker
     events = []
     class Signal:
@@ -1383,8 +1390,10 @@ def test_collect_swv_uses_native_signal_curve_and_processing(monkeypatch):
             # Native Idif deliberately differs from Ifwd - Irev to verify
             # all rows reach the output unchanged, including the final endpoint.
             data = np.zeros(501, dtype=[('vstep', 'f4'), ('ifwd', 'f4'),
-                                        ('irev', 'f4'), ('idif', 'f4')])
+                                        ('irev', 'f4'), ('idif', 'f4'), ('vsig', 'f4'), ('time', 'f4')])
             data['vstep'] = np.linspace(-1, 0, 501)
+            data['vsig'] = data['vstep'] - 0.025
+            data['time'] = np.arange(1, 502) * 0.04
             data['ifwd'], data['irev'], data['idif'] = 3e-5, 1e-5, -4e-5
             return data
     toolkit = SimpleNamespace(Pstat=lambda name: Pstat(), SqwvCurve=Curve,
@@ -1392,16 +1401,17 @@ def test_collect_swv_uses_native_signal_curve_and_processing(monkeypatch):
     monkeypatch.setattr(worker, 'initialize_pstat', lambda *args: events.append(('init', args[2:])))
     monkeypatch.setattr(worker.time, 'sleep', lambda seconds: None)
     result = worker.run_measurement(toolkit, 'PSTAT', 'test', 'swv',
-                                   dict(SWV_DEFAULTS, current_range_mode='auto', max_current=1))
-    assert ('signal', (-1.0, 0.0, 0.002, 0.025, 0.02, 1)) in events
+                                   dict(SWV_DEFAULTS, current_range_mode='auto', max_current=1, extended_data=extended_data))
+    assert ('signal', (-1.0, 0.0, 0.002, 0.025, 0.04, 1)) in events
     assert ('init', ('fixed', 0.0003)) in events
     assert ('curve', 100000) in events
-    assert events.index(('curve', 100000)) < events.index(('signal', (-1.0, 0.0, 0.002, 0.025, 0.02, 1)))
+    assert events.index(('curve', 100000)) < events.index(('signal', (-1.0, 0.0, 0.002, 0.025, 0.04, 1)))
     assert events[-2:] == [('cell', False), ('close',)]
     assert result['measurement_type'] == 'square_wave_voltammetry'
-    assert set(result['data']) == {'potential', 'current', 'vstep', 'ifwd', 'irev', 'idif'}
+    assert set(result['data']) == ({'potential', 'current', 'time', 'vstep', 'ifwd', 'irev', 'idif', 'vsig'} if extended_data else {'potential', 'current', 'time'})
     assert len(result['data']['current']) == 501
-    assert result['data']['potential'][-1] == 0.0
+    assert result['data']['potential'][-1] == pytest.approx(-0.025)
+    assert result['data']['time'][-1] == pytest.approx(20.04)
     assert result['data']['current'] == pytest.approx([-4e-5] * 501)
     assert result['parameters']['current_source'] == 'idif'
     assert 'native_acquisition_control' not in result['parameters']
@@ -1421,11 +1431,10 @@ def test_swv_rejects_invalid_parameters(overrides):
 
 
 @pytest.mark.parametrize('data', [
-    {}, {'vstep': [], 'idif': []},
-    {'vstep': [-1], 'idif': [1, 2]},
-    {'vstep': [-1], 'idif': [float('nan')]},
-    {'vstep': [-1], 'ifwd': [1], 'irev': [0]},
-    {'vstep': [-1], 'idif': [1], 'ach': [0, 0]},
+    {}, {'vsig': [], 'idif': [], 'time': []},
+    {'vsig': [-1], 'idif': [1, 2], 'time': [0.04]},
+    {'vsig': [-1], 'idif': [float('nan')], 'time': [0.04]},
+    {'vstep': [-1], 'idif': [1], 'time': [0.04]},
 ])
 def test_swv_rejects_invalid_native_data(data):
     from AFL.automation.instrument.Gamry.gamry_worker import _process_swv_data
@@ -1435,10 +1444,8 @@ def test_swv_rejects_invalid_native_data(data):
 
 def test_swv_descending_scan_accepts_capitalized_columns():
     from AFL.automation.instrument.Gamry.gamry_worker import _process_swv_data
-    result = _process_swv_data({'Vstep': [0, -0.002, -1], 'Idif': [-2, 1, 3]})
-    assert result['potential'] == [0.0, -0.002, -1.0]
-    assert result['current'] == result['idif'] == [-2, 1, 3]
-    assert result['vstep'] == [0, -0.002, -1]
+    result = _process_swv_data({'Vsig': [0, -0.002, -1], 'Idif': [-2, 1, 3], 'Time': [0.04, 0.08, 0.12]})
+    assert result == {'potential': [0.0, -0.002, -1.0], 'current': [-2.0, 1.0, 3.0], 'time': [0.04, 0.08, 0.12]}
 
 
 def test_run_swv_builds_differential_dataset(monkeypatch, driver):
@@ -1448,9 +1455,10 @@ def test_run_swv_builds_differential_dataset(monkeypatch, driver):
     }}})
     monkeypatch.setattr(driver, '_ensure_service', lambda: None)
     monkeypatch.setattr(driver, '_get_bridge_connection', lambda: FakeBridgeConnection(root))
-    dataset = driver.runSWV(swv_frequency=50.0)
+    dataset = driver.runSWV(swv_frequency=50.0, extended_data=True)
     assert root.calls[0][3] == 'swv'
     assert root.calls[0][4]['frequency'] == 50.0
+    assert root.calls[0][4]['extended_data'] is True
     assert dataset.attrs['task_name'] == 'runSWV'
     assert dataset['current'].attrs['units'] == 'A'
     assert dataset['potential'].attrs['units'] == 'V'
@@ -1500,3 +1508,12 @@ def test_bridge_reset_reports_worker_exit_and_log_paths(monkeypatch, driver):
         assert 'gamry_worker.log.fault.log' in str(error.value)
     finally:
         driver._service_process = None
+
+
+@pytest.mark.parametrize('flag, expected', [('False', False), ('true', True), (False, False)])
+def test_swv_extended_data_defaults_and_boolean_strings(flag, expected):
+    from AFL.automation.instrument.Gamry.gamry_worker import _normalize_swv_parameters
+    parameters = _normalize_swv_parameters(dict(SWV_DEFAULTS, extended_data=flag))
+    assert parameters['extended_data'] is expected
+    assert parameters['step_time'] == 0.04
+    assert _normalize_swv_parameters(SWV_DEFAULTS)['extended_data'] is False

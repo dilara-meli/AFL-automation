@@ -983,32 +983,35 @@ def _normalize_swv_parameters(parameters):
         raise ValueError('SWV step size must be nonzero and point toward the final voltage')
     for voltage in (normalized['initial_voltage'], normalized['final_voltage']):
         _validate_voltage_limit(voltage - normalized['pulse_size'], voltage + normalized['pulse_size'])
-    step_time = 0.5 / normalized['frequency']
+    step_time = 1.0 / normalized['frequency']
     if not math.isfinite(step_time) or step_time <= 0:
         raise ValueError('SWV frequency produces invalid timing')
     normalized.update(
         current_range_mode='fixed', max_current=0.0003,
         step_time=step_time, buffer_points=100000,
         acquisition_processing='toolkitpy_native', current_source='idif',
-        voltage_axis='staircase',
+        voltage_axis='vsig', extended_data=str(parameters.get('extended_data', False)).strip().lower() in {'true', '1', 'yes', 'on'},
     )
     return normalized
 
 
-def _process_swv_data(data):
+def _process_swv_data(data, extended_data=False):
     # ToolkitPy versions may capitalize the documented NumPy column names.
     columns = {str(key).lower(): value for key, value in data.items()}
-    required = ('vstep', 'idif')
+    required = ('vsig', 'idif', 'time')
     if any(key not in columns for key in required):
-        raise ValueError('SWV native data must contain vstep and idif columns')
-    lengths = [len(values) for values in columns.values()]
+        raise ValueError('SWV native data must contain vsig, idif, and time columns')
+    lengths = [len(values) for values in columns.values()] if extended_data else [len(columns[key]) for key in required]
     if not lengths[0] or len(set(lengths)) != 1:
         raise ValueError('SWV native columns must be nonempty and have matching lengths')
-    potential = [float(value) for value in columns['vstep']]
+    potential = [float(value) for value in columns['vsig']]
     current = [float(value) for value in columns['idif']]
-    if not all(math.isfinite(value) for value in potential + current):
+    times = [float(value) for value in columns['time']]
+    if not all(math.isfinite(value) for value in potential + current + times):
         raise ValueError('SWV native data contains non-finite values')
-    return {**columns, 'potential': potential, 'current': current}
+    output = dict(columns) if extended_data else {}
+    output.update(potential=potential, current=current, time=times)
+    return output
 
 
 def collect_swv(tkp, instrument_name, process_name, parameters):
@@ -1049,7 +1052,7 @@ def collect_swv(tkp, instrument_name, process_name, parameters):
         raw_data = _curve_data_to_lists(curve.acq_data())
         _log_worker_event('swv_data_read_complete', keys=sorted(raw_data),
                           lengths={key: len(value) for key, value in raw_data.items()})
-        processed = _process_swv_data(raw_data)
+        processed = _process_swv_data(raw_data, normalized['extended_data'])
         normalized['native_point_count'] = len(next(iter(raw_data.values())))
         normalized['output_point_count'] = len(processed['current'])
         _log_worker_event('swv_complete', parameters=normalized)
@@ -1099,7 +1102,7 @@ def run_measurement(tkp, instrument_name, process_name, measurement_mode, parame
             'max_current', 'current_range_mode',
             'drop_knock_enabled', 'drop_knock_duration', 'drop_knock_polarity',
         ],
-        'swv': ['initial_voltage', 'final_voltage', 'step_size', 'frequency', 'pulse_size'],
+        'swv': ['initial_voltage', 'final_voltage', 'step_size', 'frequency', 'pulse_size', 'extended_data'],
     }
     if mode not in expected_keys_by_mode:
         raise ValueError(f'Unsupported measurement mode: {measurement_mode}')

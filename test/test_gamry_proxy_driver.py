@@ -175,10 +175,11 @@ def test_run_dpv_forwards_explicit_drop_knock_controls(monkeypatch):
 def test_run_swv_forwards_defaults_and_overrides(monkeypatch):
     monkeypatch.setattr('AFL.automation.instrument.Gamry.GamryProxyDriver.Client', FakeClient)
     driver = GamryProxyDriver(overrides={'server_ip': 'gamry-win', 'server_port': '5051'})
-    driver.runSWV(swv_frequency=50.0)
+    driver.runSWV(swv_frequency=50.0, extended_data=True)
     payload = next(kwargs for name, kwargs, _ in driver._get_gamry_client().calls if name == 'enqueue')
     assert payload['task_name'] == 'runSWV'
     assert payload['swv_frequency'] == 50.0
+    assert payload['extended_data'] is True
     assert payload['swv_initial_voltage'] == -1.0
     assert payload['swv_step_size'] == 0.002
     assert payload['swv_pulse_size'] == 0.025
