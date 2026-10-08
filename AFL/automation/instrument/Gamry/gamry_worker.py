@@ -1001,14 +1001,14 @@ def _process_swv_data(data):
     required = ('vstep', 'idif')
     if any(key not in columns for key in required):
         raise ValueError('SWV native data must contain vstep and idif columns')
-    lengths = [len(columns[key]) for key in required]
+    lengths = [len(values) for values in columns.values()]
     if not lengths[0] or len(set(lengths)) != 1:
         raise ValueError('SWV native columns must be nonempty and have matching lengths')
     potential = [float(value) for value in columns['vstep']]
     current = [float(value) for value in columns['idif']]
     if not all(math.isfinite(value) for value in potential + current):
         raise ValueError('SWV native data contains non-finite values')
-    return {'potential': potential, 'current': current}
+    return {**columns, 'potential': potential, 'current': current}
 
 
 def collect_swv(tkp, instrument_name, process_name, parameters):

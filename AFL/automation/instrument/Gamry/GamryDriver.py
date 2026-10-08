@@ -981,6 +981,8 @@ class GamryDriver(Driver):
 
         ds = xr.Dataset(attrs=self._sanitize_dataset_attrs(attrs))
         ds['point'] = ('point', point_index)
+        if measurement_type == 'square_wave_voltammetry' and 'point' in data:
+            ds['point'] = ('point', np.asarray(data['point']))
         if x_values.size:
             ds[x_key] = ('point', x_values[:point_count])
         if y_values.size:
@@ -995,6 +997,9 @@ class GamryDriver(Driver):
             ('im', 'current'),
             ('current', 'current'),
         ):
+            if measurement_type == 'square_wave_voltammetry' and source_name in {'vf', 'im'}:
+                # Preserve native channels separately from the vstep/idif aliases.
+                continue
             values = data.get(source_name)
             if values is None:
                 continue
@@ -1007,7 +1012,7 @@ class GamryDriver(Driver):
             if source_name in reserved_names:
                 continue
             try:
-                array = np.asarray(values, dtype=float)
+                array = np.asarray(values, dtype=None if measurement_type == 'square_wave_voltammetry' else float)
             except (TypeError, ValueError):
                 continue
             if array.size == point_count:
@@ -1016,6 +1021,14 @@ class GamryDriver(Driver):
         if measurement_type == 'square_wave_voltammetry':
             ds['potential'].attrs['units'] = 'V'
             ds['current'].attrs.update(units='A', long_name='Native SWV differential current', source='idif')
+            for name in ('vstep', 'vfwd', 'vrev', 'vsig'):
+                if name in ds:
+                    ds[name].attrs['units'] = 'V'
+            for name in ('idif', 'ifwd', 'irev', 'im'):
+                if name in ds:
+                    ds[name].attrs['units'] = 'A'
+            if 'time' in ds:
+                ds['time'].attrs['units'] = 's'
         return ds
 
     def _quickbar_snapshot(self) -> Dict[str, Dict[str, Dict[str, Any]]]:

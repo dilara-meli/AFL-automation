@@ -739,6 +739,16 @@ def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver, mode, measur
             }
         }
     )
+    native = {
+        'point': [10, 11], 'time': [0.04, 0.08], 'vstep': [0.025, 0.03],
+        'idif': [0.06, 0.08], 'im': [0.01, 0.02], 'ifwd': [0.1, 0.2],
+        'irev': [0.04, 0.12], 'ach': [0.0, 0.0], 'vfwd': [0.05, 0.055],
+        'vrev': [0.0, 0.005], 'vsig': [0.025, 0.03], 'ie_range': [3, 3],
+        'overload': [0, 0], 'stop_test': [0, 0], 'temp': [25.0, 25.1],
+    }
+    if mode == 'swv':
+        from AFL.automation.instrument.Gamry.gamry_worker import _process_swv_data
+        root.responses['run_measurement']['result']['data'] = _process_swv_data(native)
     connection = FakeBridgeConnection(root)
 
     monkeypatch.setattr(driver, '_ensure_service', lambda: None)
@@ -793,7 +803,19 @@ def test_gamry_dataset_can_be_written_to_tiled(monkeypatch, driver, mode, measur
     assert captured['dataset'].attrs['meta']['return_val'] == 'xarray.Dataset'
 
 
-    assert set(captured['dataset'].data_vars) == {'potential', 'current'}
+    written = captured['dataset']
+    if mode == 'swv':
+        assert set(written.data_vars) == {'potential', 'current'} | (set(native) - {'point'})
+        for name, values in native.items():
+            assert written[name].values.tolist() == values
+        assert written['current'].values.tolist() == native['idif']
+        assert written['im'].values.tolist() != native['idif']
+        assert written['ie_range'].dtype.kind == 'i'
+        assert written['vfwd'].attrs['units'] == 'V'
+        assert written['ifwd'].attrs['units'] == 'A'
+    else:
+        assert set(written.data_vars) == {'potential', 'current'}
+
 
 def test_run_measurement_now_serializes_non_cv_result(monkeypatch, driver):
     root = FakeBridgeRoot(
@@ -1377,7 +1399,7 @@ def test_collect_swv_uses_native_signal_curve_and_processing(monkeypatch):
     assert events.index(('curve', 100000)) < events.index(('signal', (-1.0, 0.0, 0.002, 0.025, 0.02, 1)))
     assert events[-2:] == [('cell', False), ('close',)]
     assert result['measurement_type'] == 'square_wave_voltammetry'
-    assert set(result['data']) == {'potential', 'current'}
+    assert set(result['data']) == {'potential', 'current', 'vstep', 'ifwd', 'irev', 'idif'}
     assert len(result['data']['current']) == 501
     assert result['data']['potential'][-1] == 0.0
     assert result['data']['current'] == pytest.approx([-4e-5] * 501)
@@ -1403,6 +1425,7 @@ def test_swv_rejects_invalid_parameters(overrides):
     {'vstep': [-1], 'idif': [1, 2]},
     {'vstep': [-1], 'idif': [float('nan')]},
     {'vstep': [-1], 'ifwd': [1], 'irev': [0]},
+    {'vstep': [-1], 'idif': [1], 'ach': [0, 0]},
 ])
 def test_swv_rejects_invalid_native_data(data):
     from AFL.automation.instrument.Gamry.gamry_worker import _process_swv_data
@@ -1413,7 +1436,9 @@ def test_swv_rejects_invalid_native_data(data):
 def test_swv_descending_scan_accepts_capitalized_columns():
     from AFL.automation.instrument.Gamry.gamry_worker import _process_swv_data
     result = _process_swv_data({'Vstep': [0, -0.002, -1], 'Idif': [-2, 1, 3]})
-    assert result == {'potential': [0.0, -0.002, -1.0], 'current': [-2.0, 1.0, 3.0]}
+    assert result['potential'] == [0.0, -0.002, -1.0]
+    assert result['current'] == result['idif'] == [-2, 1, 3]
+    assert result['vstep'] == [0, -0.002, -1]
 
 
 def test_run_swv_builds_differential_dataset(monkeypatch, driver):
