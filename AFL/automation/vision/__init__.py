@@ -1,10 +1,14 @@
 """Vision drivers and reusable image-processing helpers."""
 
-__all__ = ["ImageProcessing", "PiCameraDriver", "OT2RidingCam", "RGBCamera"]
+__all__ = ["ImageProcessing", "PiCameraDriver", "OT2RidingCam", "RGBCamera", "USBWebcam"]
 
 
 def __getattr__(name):
     """Load drivers on demand so ``python -m`` can execute them cleanly."""
+    if name == "USBWebcam":
+        from .USBWebcam import USBWebcam
+
+        return USBWebcam
     if name == "PiCameraDriver":
         from .PiCameraDriver import PiCameraDriver
 

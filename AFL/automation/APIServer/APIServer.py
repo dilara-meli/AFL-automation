@@ -1,4 +1,4 @@
-from flask import Flask, redirect, render_template, request, jsonify, send_file, send_from_directory
+from flask import Flask, Response, redirect, render_template, request, jsonify, send_file, send_from_directory
 
 from flask_cors import CORS
 from jinja2 import ChoiceLoader, FileSystemLoader
@@ -187,7 +187,9 @@ class APIServer:
             if use_waitress:
                 if not _HAVE_WAITRESS:
                     raise RuntimeError("waitress is not installed")
-                kwargs.setdefault('threads', 1)
+                kwargs.setdefault('threads', self.driver.config.get('server_threads', 1))
+                if hasattr(self.driver, 'validate_server_threads'):
+                    self.driver.validate_server_threads(kwargs['threads'])
                 wsgi_serve(self.app, **kwargs)
             else:
                 kwargs.setdefault('use_debugger', False)
@@ -211,7 +213,9 @@ class APIServer:
         if use_waitress:
             if not _HAVE_WAITRESS:
                 raise RuntimeError("waitress is not installed")
-            kwargs.setdefault('threads', 1)
+            kwargs.setdefault('threads', self.driver.config.get('server_threads', 1))
+            if hasattr(self.driver, 'validate_server_threads'):
+                self.driver.validate_server_threads(kwargs['threads'])
             target = functools.partial(wsgi_serve,self.app)
         else:
             kwargs.setdefault('use_debugger', False)
@@ -404,6 +408,8 @@ class APIServer:
                 call_kwargs.pop('r', None)
                 try:
                     result = getattr(self.driver, fn_name)(**call_kwargs)
+                    if isinstance(result, Response):
+                        return result
                     return self._make_json_safe(result),200
                 except Exception as exc:
                     self.app.logger.exception('Driver query failed for %s', fn_name)
@@ -527,7 +533,9 @@ class APIServer:
             else:
                 #don't do complicated rendering
                 render_hint='raw'
-        if render_hint == '1d_plot':
+        if render_hint == 'response':
+            return self.app.make_response(result)
+        elif render_hint == '1d_plot':
             return self.send_1d_plot(result,**kwargs) #lambda:
         elif render_hint == '2d_img':
             return self.send_array_as_jpg(result,**kwargs) #lambda:
